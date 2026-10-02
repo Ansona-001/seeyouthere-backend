@@ -118,7 +118,7 @@ func newEventTestFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client) ev
 		q:       q,
 		rdb:     rdb,
 		limiter: ratelimit.New(rdb),
-		cfg:     config.Config{SiteURL: "https://seeuthere.at"},
+		cfg:     config.Config{SiteURL: "https://seeyouthere.at"},
 	}
 	return eventTestFixture{s: s, ownerID: owner, editorID: editor, viewerID: viewer, strangerID: stranger, eventID: event.ID}
 }

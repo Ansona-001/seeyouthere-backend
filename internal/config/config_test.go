@@ -32,7 +32,7 @@ func TestLoad_RSVPSMTP_PartiallySet_Errors(t *testing.T) {
 	cases := map[string]func(t *testing.T){
 		"only user":     func(t *testing.T) { t.Setenv("RSVP_SMTP_USER", "u") },
 		"only pass":     func(t *testing.T) { t.Setenv("RSVP_SMTP_PASS", "p") },
-		"only from":     func(t *testing.T) { t.Setenv("RSVP_MAIL_FROM", "RSVP <rsvp@seeuthere.at>") },
+		"only from":     func(t *testing.T) { t.Setenv("RSVP_MAIL_FROM", "RSVP <rsvp@seeyouthere.at>") },
 		"user and pass": func(t *testing.T) { t.Setenv("RSVP_SMTP_USER", "u"); t.Setenv("RSVP_SMTP_PASS", "p") },
 	}
 	for name, setEnv := range cases {
@@ -51,7 +51,7 @@ func TestLoad_RSVPSMTP_AllSet_DefaultsAddr(t *testing.T) {
 	setBaseEnv(t)
 	t.Setenv("RSVP_SMTP_USER", "u")
 	t.Setenv("RSVP_SMTP_PASS", "p")
-	t.Setenv("RSVP_MAIL_FROM", "RSVP <rsvp@seeuthere.at>")
+	t.Setenv("RSVP_MAIL_FROM", "RSVP <rsvp@seeyouthere.at>")
 
 	c, err := Load()
 	if err != nil {
@@ -66,7 +66,7 @@ func TestLoad_RSVPSMTP_ExplicitAddrKept(t *testing.T) {
 	setBaseEnv(t)
 	t.Setenv("RSVP_SMTP_USER", "u")
 	t.Setenv("RSVP_SMTP_PASS", "p")
-	t.Setenv("RSVP_MAIL_FROM", "RSVP <rsvp@seeuthere.at>")
+	t.Setenv("RSVP_MAIL_FROM", "RSVP <rsvp@seeyouthere.at>")
 	t.Setenv("RSVP_SMTP_ADDR", "smtp.zoho.eu:587")
 
 	c, err := Load()

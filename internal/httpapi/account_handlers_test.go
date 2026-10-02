@@ -112,7 +112,7 @@ func newAccountTestFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client) 
 		rdb:      rdb,
 		limiter:  ratelimit.New(rdb),
 		sessions: auth.NewSessions(q, rdb, time.Hour),
-		cfg:      config.Config{SiteURL: "https://seeuthere.at"},
+		cfg:      config.Config{SiteURL: "https://seeyouthere.at"},
 	}
 	return &accountTestFixture{
 		s: s, userA: userA, userB: userB, emailA: emailA, emailB: emailB,

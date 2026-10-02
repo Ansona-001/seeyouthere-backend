@@ -20,9 +20,9 @@ type Config struct {
 	DatabaseURL string
 	ValkeyURL   string
 
-	// Browser origins allowed to call the API with credentials, e.g. https://seeuthere.at.
+	// Browser origins allowed to call the API with credentials, e.g. https://seeyouthere.at.
 	AppOrigins []string
-	// Cookie domain, e.g. ".seeuthere.at" so the web app and API share the session. Empty for host-only.
+	// Cookie domain, e.g. ".seeyouthere.at" so the web app and API share the session. Empty for host-only.
 	CookieDomain string
 	CookieSecure bool
 	SessionTTL   time.Duration
@@ -47,7 +47,7 @@ type Config struct {
 	RSVPSMTPPass string
 	RSVPMailFrom string
 
-	// SiteURL is the public web origin (e.g. https://seeuthere.at), used to
+	// SiteURL is the public web origin (e.g. https://seeyouthere.at), used to
 	// build links in emails and event `url` fields.
 	SiteURL string
 	// MediaRoot is the filesystem root for uploaded/processed images (see
@@ -75,7 +75,7 @@ func Load() (Config, error) {
 		SMTPAddr:     os.Getenv("SMTP_ADDR"),
 		SMTPUser:     os.Getenv("SMTP_USER"),
 		SMTPPass:     os.Getenv("SMTP_PASS"),
-		MailFrom:     env("MAIL_FROM", "See You There <hello@seeuthere.at>"),
+		MailFrom:     env("MAIL_FROM", "See You There <hello@seeyouthere.at>"),
 		AuthSecret:   []byte(os.Getenv("AUTH_SECRET")),
 
 		RSVPSMTPAddr: os.Getenv("RSVP_SMTP_ADDR"),

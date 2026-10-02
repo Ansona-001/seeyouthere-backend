@@ -68,7 +68,7 @@ func build(summary string, start, end time.Time, location string, now time.Time,
 func newUID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
-	return hex.EncodeToString(b) + "@seeuthere.at"
+	return hex.EncodeToString(b) + "@seeyouthere.at"
 }
 
 // formatUTC renders t as RFC 5545's UTC "floating" form, YYYYMMDDTHHMMSSZ.

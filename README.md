@@ -1,6 +1,6 @@
 # See You There — API
 
-Go API for seeuthere.at: chi + sqlc + pgx on PostgreSQL 16, Valkey for sessions and rate limits, River for background jobs.
+Go API for seeyouthere.at: chi + sqlc + pgx on PostgreSQL 16, Valkey for sessions and rate limits, River for background jobs.
 
 ## Run locally
 

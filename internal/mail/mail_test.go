@@ -21,7 +21,7 @@ func addr(t *testing.T, s string) *mail.Address {
 }
 
 func TestBuild_NoAttachmentsUnchanged(t *testing.T) {
-	from := addr(t, "See You There <hello@seeuthere.at>")
+	from := addr(t, "See You There <hello@seeyouthere.at>")
 	to := addr(t, "Guest <guest@example.com>")
 	m := Message{To: to.Address, Subject: "Hello", Text: "line one\nline two"}
 
@@ -62,7 +62,7 @@ func TestBuild_NoAttachmentsUnchanged(t *testing.T) {
 }
 
 func TestBuild_WithAttachmentRoundTrips(t *testing.T) {
-	from := addr(t, "See You There <hello@seeuthere.at>")
+	from := addr(t, "See You There <hello@seeyouthere.at>")
 	to := addr(t, "Guest <guest@example.com>")
 	icsContent := []byte("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")
 	m := Message{

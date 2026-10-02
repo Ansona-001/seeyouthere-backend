@@ -315,7 +315,7 @@ func TestHandleRotateGuestToken_ChangesLink(t *testing.T) {
 	if strings.Contains(rec.Body.String(), firstLink) {
 		t.Errorf("body still contains the pre-rotation link: %s", rec.Body.String())
 	}
-	if !containsAll(rec.Body.String(), `"invite_url":"https://seeuthere.at/`+slug+`/invite#`) {
+	if !containsAll(rec.Body.String(), `"invite_url":"https://seeyouthere.at/`+slug+`/invite#`) {
 		t.Errorf("body = %s, want a fresh invite_url", rec.Body.String())
 	}
 }

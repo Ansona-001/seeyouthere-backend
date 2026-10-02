@@ -129,7 +129,7 @@ func newAdminHandlerFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client)
 		t.Fatalf("new token keys: %v", err)
 	}
 	limiter := ratelimit.New(rdb)
-	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, tokens, limiter, "", "https://seeuthere.at")
+	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, tokens, limiter, "", "https://seeyouthere.at")
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}
@@ -140,7 +140,7 @@ func newAdminHandlerFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client)
 		jobs:     jobClient,
 		totp:     sealer,
 		media:    mediaStore,
-		cfg:      config.Config{SiteURL: "https://seeuthere.at", AdminMFATTL: 12 * time.Hour},
+		cfg:      config.Config{SiteURL: "https://seeyouthere.at", AdminMFATTL: 12 * time.Hour},
 	}
 	return adminHandlerFixture{
 		s: s, superAdminID: superAdminID, superAdminSessID: superAdminSessID,

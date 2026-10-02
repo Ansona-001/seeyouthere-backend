@@ -188,7 +188,7 @@ func newWorker(f rsvpConfirmationFixture, sender, calendarSender mail.Sender) *S
 		CalendarSender: calendarSender,
 		Tokens:         keys,
 		Limiter:        nil, // set per test via rdb-backed limiter
-		SiteURL:        "https://seeuthere.at",
+		SiteURL:        "https://seeyouthere.at",
 	}
 }
 

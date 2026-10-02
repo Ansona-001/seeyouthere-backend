@@ -13,7 +13,7 @@ var (
 )
 
 func TestBuild_WellFormed(t *testing.T) {
-	doc := build("Priya & Arjun's Wedding", start, end, "The Grand Hall, Mumbai", now, "test-uid@seeuthere.at")
+	doc := build("Priya & Arjun's Wedding", start, end, "The Grand Hall, Mumbai", now, "test-uid@seeyouthere.at")
 	text := string(doc)
 	lines := strings.Split(text, "\r\n")
 
@@ -28,7 +28,7 @@ func TestBuild_WellFormed(t *testing.T) {
 		"CALSCALE:GREGORIAN",
 		"METHOD:PUBLISH",
 		"BEGIN:VEVENT",
-		"UID:test-uid@seeuthere.at",
+		"UID:test-uid@seeyouthere.at",
 		"DTSTAMP:20260115T100000Z",
 		"DTSTART:20260620T163000Z",
 		"DTEND:20260620T200000Z",

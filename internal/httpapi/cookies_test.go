@@ -13,7 +13,7 @@ import (
 )
 
 func TestSetEventCookie(t *testing.T) {
-	s := &Server{cfg: config.Config{CookieDomain: ".seeuthere.at", CookieSecure: true}}
+	s := &Server{cfg: config.Config{CookieDomain: ".seeyouthere.at", CookieSecure: true}}
 	eventID := uuid.Must(uuid.NewV7())
 	rec := httptest.NewRecorder()
 
@@ -31,7 +31,7 @@ func TestSetEventCookie(t *testing.T) {
 	// Go's http.Cookie strips a leading "." from Domain when serialising
 	// the header (RFC 6265bis treats it as equivalent); re-parsing the
 	// Set-Cookie header back therefore yields the dot-less form.
-	if c.Value != "the-value" || !c.HttpOnly || !c.Secure || c.Domain != "seeuthere.at" {
+	if c.Value != "the-value" || !c.HttpOnly || !c.Secure || c.Domain != "seeyouthere.at" {
 		t.Errorf("unexpected cookie: %+v", c)
 	}
 }

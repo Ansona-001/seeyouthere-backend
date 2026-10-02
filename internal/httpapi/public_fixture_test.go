@@ -214,7 +214,7 @@ func newPublicEventFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, 
 
 	s := &Server{
 		pool: pool, q: q, rdb: rdb, limiter: ratelimit.New(rdb),
-		cfg:    config.Config{SiteURL: "https://seeuthere.at"},
+		cfg:    config.Config{SiteURL: "https://seeyouthere.at"},
 		tokens: tokens, hasher: hasher, media: mediaStore, images: media.NewProcessor(1),
 	}
 	return &publicEventFixture{s: s, ownerID: ownerID, eventID: event.ID, slug: slug}
