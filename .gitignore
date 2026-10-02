@@ -1,0 +1,7 @@
+.env
+/bin/
+/data/
+deploy/.env
+
+# graphify code graph (local)
+graphify-out/

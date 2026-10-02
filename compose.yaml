@@ -1,0 +1,27 @@
+# Local development services. Run the API with `go run ./cmd/api` and the web app with `npm run dev`.
+name: seeyouthere-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: seeyouthere
+      POSTGRES_PASSWORD: seeyouthere
+      POSTGRES_DB: seeyouthere
+    ports: ["5433:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seeyouthere"]
+      interval: 2s
+      retries: 20
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports: ["6380:6379"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      retries: 20
+
+volumes:
+  pgdata:

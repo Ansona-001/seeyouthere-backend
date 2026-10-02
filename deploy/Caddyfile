@@ -1,0 +1,42 @@
+{
+	email {$ACME_EMAIL}
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy same-origin
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+		-Server
+	}
+}
+
+{$SITE_DOMAIN} {
+	import security_headers
+	encode zstd gzip
+
+	@media path_regexp ^/media/([0-9a-f-]{36}/[0-9a-f-]{36}|templates/[0-9a-f-]{36}/[0-9]+/background)/(480|1080|1920)\.jpg$
+	handle @media {
+		root * /srv/media/public
+		uri strip_prefix /media
+		file_server
+		header Cache-Control "public, max-age=31536000, immutable"
+		header Content-Security-Policy "default-src 'none'"
+	}
+	handle /media/* {
+		respond 404
+	}
+	handle {
+		reverse_proxy web:3000
+	}
+}
+
+api.{$SITE_DOMAIN} {
+	import security_headers
+	encode zstd gzip
+	request_body {
+		max_size 12MB
+	}
+	reverse_proxy api:8080
+}
