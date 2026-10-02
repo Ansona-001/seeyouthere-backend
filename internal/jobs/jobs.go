@@ -1,0 +1,393 @@
+// Package jobs defines River background jobs: email delivery, periodic
+// cleanup, and moving event media between visibility areas.
+package jobs
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+
+	"github.com/ansonarose/seeyouthere-backend/internal/mail"
+	"github.com/ansonarose/seeyouthere-backend/internal/media"
+	"github.com/ansonarose/seeyouthere-backend/internal/ratelimit"
+	"github.com/ansonarose/seeyouthere-backend/internal/store"
+	"github.com/ansonarose/seeyouthere-backend/internal/token"
+)
+
+// stripCRLF removes CR and LF from s, so a user-controlled string (an
+// event title) can never inject extra header lines into an outgoing
+// email's subject.
+func stripCRLF(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+type Client = river.Client[pgx.Tx]
+
+// SendEmailArgs delivers one email. Retried with backoff by River on failure.
+type SendEmailArgs struct {
+	mail.Message
+}
+
+func (SendEmailArgs) Kind() string { return "send_email" }
+
+func (SendEmailArgs) InsertOpts() river.InsertOpts {
+	// Login codes are useless after 10 minutes, so don't keep retrying for days.
+	return river.InsertOpts{MaxAttempts: 5, Queue: "email"}
+}
+
+type SendEmailWorker struct {
+	river.WorkerDefaults[SendEmailArgs]
+	Sender mail.Sender
+}
+
+func (w *SendEmailWorker) Work(ctx context.Context, job *river.Job[SendEmailArgs]) error {
+	return w.Sender.Send(ctx, job.Args.Message)
+}
+
+func (w *SendEmailWorker) Timeout(*river.Job[SendEmailArgs]) time.Duration { return 30 * time.Second }
+
+// CleanupArgs deletes expired sessions and expired, unclaimed anonymous
+// drafts. Runs hourly.
+type CleanupArgs struct{}
+
+func (CleanupArgs) Kind() string { return "cleanup" }
+
+// anonDraftBatchSize matches the LIMIT inside DeleteExpiredAnonDraftEvents.
+const anonDraftBatchSize = 500
+
+// maxAnonDraftBatchesPerRun bounds how many batches one cleanup run
+// processes, so a large backlog can't turn an hourly job into an unbounded
+// loop; any remainder is picked up on the next run.
+const maxAnonDraftBatchesPerRun = 20
+
+// mediaCleanupBatchSize matches the LIMIT baked into DeleteDetachedMedia and
+// DeleteRejectedMedia; mediaCleanupBatchesPerRun bounds how many batches of
+// each this job processes per run, same reasoning as anonDraftBatchSize.
+const mediaCleanupBatchSize = 500
+const mediaCleanupBatchesPerRun = 10
+
+type CleanupWorker struct {
+	river.WorkerDefaults[CleanupArgs]
+	Queries *store.Queries
+	Media   *media.Store
+}
+
+func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) error {
+	n, err := w.Queries.DeleteExpiredSessions(ctx)
+	if err != nil {
+		return err
+	}
+	slog.Info("cleanup", "expired_sessions", n)
+
+	var totalDrafts int64
+	for i := 0; i < maxAnonDraftBatchesPerRun; i++ {
+		batch, err := w.Queries.DeleteExpiredAnonDraftEvents(ctx)
+		if err != nil {
+			return fmt.Errorf("delete expired anon drafts: %w", err)
+		}
+		totalDrafts += batch
+		if batch < anonDraftBatchSize {
+			break
+		}
+	}
+	slog.Info("cleanup", "expired_anon_drafts", totalDrafts)
+
+	// Host media detached from an event's content for 7+ days: the row is
+	// deleted first, then its files (every delete path in this codebase is
+	// DB first, files second, so a crash here just leaves an orphan
+	// media_reconcile removes later).
+	var totalDetached int64
+	for i := 0; i < mediaCleanupBatchesPerRun; i++ {
+		rows, err := w.Queries.DeleteDetachedMedia(ctx)
+		if err != nil {
+			return fmt.Errorf("delete detached media: %w", err)
+		}
+		for _, row := range rows {
+			if err := w.Media.DeleteMedia(row.EventID, row.ID); err != nil {
+				return fmt.Errorf("delete detached media files: %w", err)
+			}
+		}
+		totalDetached += int64(len(rows))
+		if len(rows) < mediaCleanupBatchSize {
+			break
+		}
+	}
+	slog.Info("cleanup", "detached_media", totalDetached)
+
+	// Rejected guest photos: their files were already deleted at reject
+	// time, so this only needs to purge the rows.
+	var totalRejected int64
+	for i := 0; i < mediaCleanupBatchesPerRun; i++ {
+		n, err := w.Queries.DeleteRejectedMedia(ctx)
+		if err != nil {
+			return fmt.Errorf("delete rejected media: %w", err)
+		}
+		totalRejected += n
+		if n < mediaCleanupBatchSize {
+			break
+		}
+	}
+	slog.Info("cleanup", "rejected_media_rows", totalRejected)
+
+	// Soft-deleted events older than 30 days (media files go via
+	// media_reconcile, which removes any directory with no matching row).
+	var totalPurged int64
+	for i := 0; i < mediaCleanupBatchesPerRun; i++ {
+		n, err := w.Queries.PurgeDeletedEvents(ctx)
+		if err != nil {
+			return fmt.Errorf("purge deleted events: %w", err)
+		}
+		totalPurged += n
+		if n < mediaCleanupBatchSize {
+			break
+		}
+	}
+	slog.Info("cleanup", "purged_events", totalPurged)
+	return nil
+}
+
+// MediaVisibilityArgs moves an event's media files between areas (public,
+// pending, quarantine) to match its current status. It's enqueued in the
+// same transaction as anything that changes an event's visibility: host
+// delete and anonymous-draft delete (this phase); takedown/restore/
+// account-delete/ban land in later phases and reuse the same worker.
+type MediaVisibilityArgs struct {
+	EventID uuid.UUID `json:"event_id"`
+}
+
+func (MediaVisibilityArgs) Kind() string { return "media_visibility" }
+
+// MediaVisibilityWorker re-reads an event's current status/deleted_at and
+// moves its media to match: taken-down or (soft-)deleted moves every file
+// into quarantine in bulk, regardless of moderation state. Otherwise
+// (draft, hidden or published) each file is placed individually by its own
+// moderation_status — approved in public/, pending in pending/, rejected
+// deleted — so an unapproved or rejected guest upload is never exposed
+// through a host's own event just because the rest of its media is public,
+// and a host's own approved uploads are never hidden by draft/hidden
+// status. MoveMedia/MoveEvent are called from every other area into the
+// target, which makes this idempotent and safe to retry regardless of
+// which area the files actually started in. A missing event row (already
+// hard-deleted, e.g. an expired anon draft purged before this job ran) is
+// not an error: Reconcile cleans up any orphaned directory later.
+type MediaVisibilityWorker struct {
+	river.WorkerDefaults[MediaVisibilityArgs]
+	Queries *store.Queries
+	Media   *media.Store
+}
+
+func (w *MediaVisibilityWorker) Work(ctx context.Context, job *river.Job[MediaVisibilityArgs]) error {
+	state, err := w.Queries.GetEventMediaState(ctx, job.Args.EventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("media visibility: get event state: %w", err)
+	}
+
+	if state.DeletedAt != nil || state.Status == "taken_down" {
+		for _, from := range []media.Area{media.AreaPublic, media.AreaPending} {
+			if err := w.Media.MoveEvent(from, media.AreaQuarantine, job.Args.EventID); err != nil {
+				return fmt.Errorf("media visibility: move %s to quarantine: %w", from, err)
+			}
+		}
+		return nil
+	}
+
+	rows, err := w.Queries.ListMediaModerationByEvent(ctx, job.Args.EventID)
+	if err != nil {
+		return fmt.Errorf("media visibility: list media: %w", err)
+	}
+	for _, row := range rows {
+		if row.ModerationStatus == "rejected" {
+			// Files for a rejected row are deleted synchronously when it's
+			// rejected; this only cleans up a straggler left by a crash or
+			// an earlier inconsistent state.
+			if err := w.Media.DeleteMedia(job.Args.EventID, row.ID); err != nil {
+				return fmt.Errorf("media visibility: delete rejected %s: %w", row.ID, err)
+			}
+			continue
+		}
+		target := media.AreaPending
+		if row.ModerationStatus == "approved" {
+			target = media.AreaPublic
+		}
+		for _, from := range []media.Area{media.AreaPublic, media.AreaPending, media.AreaQuarantine} {
+			if from == target {
+				continue
+			}
+			if err := w.Media.MoveMedia(from, target, job.Args.EventID, row.ID); err != nil {
+				return fmt.Errorf("media visibility: move %s to %s: %w", row.ID, target, err)
+			}
+		}
+	}
+	return nil
+}
+
+// MediaReconcileArgs periodically runs internal/media's Reconcile: it
+// removes media directories that have no matching database row (a crash
+// between Store.Commit and the row insert, or an event/media row that was
+// hard-deleted) across public/, pending/ and quarantine/, plus stale tmp/
+// entries. Never enqueued manually.
+type MediaReconcileArgs struct{}
+
+func (MediaReconcileArgs) Kind() string { return "media_reconcile" }
+
+func (MediaReconcileArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{Queue: "maintenance"}
+}
+
+type MediaReconcileWorker struct {
+	river.WorkerDefaults[MediaReconcileArgs]
+	Queries *store.Queries
+	Media   *media.Store
+}
+
+func (w *MediaReconcileWorker) Timeout(*river.Job[MediaReconcileArgs]) time.Duration {
+	return 10 * time.Minute
+}
+
+func (w *MediaReconcileWorker) Work(ctx context.Context, _ *river.Job[MediaReconcileArgs]) error {
+	eventExists := func(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]bool, error) {
+		existing, err := w.Queries.ExistingEventIDs(ctx, ids)
+		if err != nil {
+			return nil, fmt.Errorf("existing event ids: %w", err)
+		}
+		out := make(map[uuid.UUID]bool, len(existing))
+		for _, id := range existing {
+			out[id] = true
+		}
+		return out, nil
+	}
+	eventMedia := func(ctx context.Context, eventID uuid.UUID) (map[uuid.UUID]bool, error) {
+		ids, err := w.Queries.MediaIDsForEvent(ctx, eventID)
+		if err != nil {
+			return nil, fmt.Errorf("media ids for event %s: %w", eventID, err)
+		}
+		out := make(map[uuid.UUID]bool, len(ids))
+		for _, id := range ids {
+			out[id] = true
+		}
+		return out, nil
+	}
+	if err := w.Media.Reconcile(ctx, eventExists, eventMedia); err != nil {
+		return fmt.Errorf("media reconcile: %w", err)
+	}
+	return nil
+}
+
+// NotifyReportArgs alerts an admin that a visitor reported an event page.
+// Enqueued (InsertTx, in the same transaction as the write) only when
+// CreateReport actually inserted a row: a duplicate report from the same
+// reporter while one is already open is silently ignored, so it never
+// re-triggers this job either. Unique by event id within a 1-hour period,
+// so a burst of reports against the same event sends one alert, not one
+// per report.
+type NotifyReportArgs struct {
+	EventID uuid.UUID `json:"event_id"`
+}
+
+func (NotifyReportArgs) Kind() string { return "notify_report" }
+
+func (NotifyReportArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue:      "email",
+		UniqueOpts: river.UniqueOpts{ByArgs: true, ByPeriod: time.Hour},
+	}
+}
+
+// NotifyReportWorker emails ADMIN_ALERT_EMAIL with a link into the admin
+// moderation queue. It never includes reporter data (not even which reason
+// was chosen): the reporter's IP is only ever stored as a keyed hash, and
+// this job's args carry nothing more than the event id. A missing event
+// (deleted since the report was filed) or an unset AdminAlertEmail are both
+// treated as done, not an error.
+type NotifyReportWorker struct {
+	river.WorkerDefaults[NotifyReportArgs]
+	Queries         *store.Queries
+	Sender          mail.Sender
+	AdminAlertEmail string
+	SiteURL         string
+}
+
+func (w *NotifyReportWorker) Work(ctx context.Context, job *river.Job[NotifyReportArgs]) error {
+	if w.AdminAlertEmail == "" {
+		return nil
+	}
+	event, err := w.Queries.GetEventForNotify(ctx, job.Args.EventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("notify report: get event: %w", err)
+	}
+	title := stripCRLF(event.Title)
+	return w.Sender.Send(ctx, mail.Message{
+		To:      w.AdminAlertEmail,
+		Subject: "New report: " + title,
+		Text: fmt.Sprintf("A visitor reported \"%s\".\n\n"+
+			"Review it in the admin moderation queue:\n%s/admin/reports\n\n"+
+			"See You There\n", title, w.SiteURL),
+	})
+}
+
+func (w *NotifyReportWorker) Timeout(*river.Job[NotifyReportArgs]) time.Duration {
+	return 30 * time.Second
+}
+
+// calendarSender sends the calendar-invite variant of send_rsvp_confirmation
+// (an attending="yes" response); pass the same value as sender to reuse the
+// primary SMTP identity.
+func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *store.Queries, mediaStore *media.Store, tokens *token.Keys, limiter *ratelimit.Limiter, adminAlertEmail, siteURL string) (*Client, error) {
+	workers := river.NewWorkers()
+	river.AddWorker(workers, &SendEmailWorker{Sender: sender})
+	river.AddWorker(workers, &CleanupWorker{Queries: queries, Media: mediaStore})
+	river.AddWorker(workers, &MediaVisibilityWorker{Queries: queries, Media: mediaStore})
+	river.AddWorker(workers, &MediaReconcileWorker{Queries: queries, Media: mediaStore})
+	river.AddWorker(workers, &NotifyReportWorker{Queries: queries, Sender: sender, AdminAlertEmail: adminAlertEmail, SiteURL: siteURL})
+	river.AddWorker(workers, &SendInviteWorker{Queries: queries, Sender: sender, Tokens: tokens, Limiter: limiter, SiteURL: siteURL})
+	river.AddWorker(workers, &NotifyCohostAddedWorker{Queries: queries, Sender: sender, SiteURL: siteURL})
+	river.AddWorker(workers, &NotifyTakedownWorker{Queries: queries, Sender: sender, SiteURL: siteURL})
+	river.AddWorker(workers, &SendRSVPConfirmationWorker{Queries: queries, Sender: sender, CalendarSender: calendarSender, Tokens: tokens, Limiter: limiter, SiteURL: siteURL})
+	river.AddWorker(workers, &NotifyRSVPsWorker{Queries: queries, Sender: sender, SiteURL: siteURL})
+
+	return river.NewClient(riverpgxv5.New(pool), &river.Config{
+		Logger: slog.Default(),
+		Queues: map[string]river.QueueConfig{
+			// Worker counts are deliberately small (§7 of the build-out
+			// plan): this shares a 1 vCPU host with the API's own request
+			// handling, and email queue capacity is bounded by SMTP
+			// throughput, not memory we'd gain from more workers.
+			river.QueueDefault: {MaxWorkers: 2},
+			"email":            {MaxWorkers: 3},
+			"maintenance":      {MaxWorkers: 1},
+		},
+		Workers: workers,
+		PeriodicJobs: []*river.PeriodicJob{
+			river.NewPeriodicJob(
+				river.PeriodicInterval(time.Hour),
+				func() (river.JobArgs, *river.InsertOpts) { return CleanupArgs{}, nil },
+				&river.PeriodicJobOpts{RunOnStart: true},
+			),
+			river.NewPeriodicJob(
+				river.PeriodicInterval(24*time.Hour),
+				func() (river.JobArgs, *river.InsertOpts) { return MediaReconcileArgs{}, nil },
+				&river.PeriodicJobOpts{RunOnStart: false},
+			),
+		},
+	})
+}
