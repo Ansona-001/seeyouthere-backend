@@ -45,9 +45,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # go.mod says 1.26.0; the checks must run on the latest 1.26 patch release,
+      # which carries the standard-library security fixes govulncheck looks for.
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: "1.26"
+          check-latest: true
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
