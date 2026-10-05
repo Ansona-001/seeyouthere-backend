@@ -1,11 +1,21 @@
 # Single-server production stack. Copy deploy/.env.example to deploy/.env first.
+# api and web are prebuilt by GitHub Actions and pulled from GHCR; deploy.sh retags
+# the wanted build as :deployed and restarts the service. Never `up --build` here.
 # Email is sent through Zoho Mail SMTP (set SMTP_* in .env).
 name: seeyouthere
+
+# Rotate container logs; the disk is tiny.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
 
 services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *logging
     mem_limit: 48m
     ports: ["80:80", "443:443", "443:443/udp"]
     environment:
@@ -19,8 +29,10 @@ services:
     depends_on: [web, api]
 
   api:
-    build: ..
+    image: ghcr.io/ansona-001/seeyouthere-api:deployed
+    pull_policy: never
     restart: unless-stopped
+    logging: *logging
     mem_limit: 200m
     environment:
       APP_ENV: production
@@ -48,11 +60,10 @@ services:
       valkey: { condition: service_healthy }
 
   web:
-    build:
-      context: ../../seeyouthere-frontend
-      args:
-        NEXT_PUBLIC_API_URL: https://api.${SITE_DOMAIN}
+    image: ghcr.io/ansona-001/seeyouthere-web:deployed
+    pull_policy: never
     restart: unless-stopped
+    logging: *logging
     mem_limit: 220m
     environment:
       API_INTERNAL_URL: http://api:8080
@@ -62,6 +73,7 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *logging
     mem_limit: 256m
     command:
       - "-c"
@@ -87,6 +99,7 @@ services:
   valkey:
     image: valkey/valkey:8-alpine
     restart: unless-stopped
+    logging: *logging
     mem_limit: 48m
     command: ["valkey-server", "--save", "60", "1000", "--maxmemory", "32mb", "--maxmemory-policy", "volatile-lru"]
     volumes: [valkeydata:/data]
