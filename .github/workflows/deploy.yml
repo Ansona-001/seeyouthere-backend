@@ -47,7 +47,7 @@ jobs:
           persist-credentials: false
       # go.mod says 1.26.0; the checks must run on the latest 1.26 patch release,
       # which carries the standard-library security fixes govulncheck looks for.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
           check-latest: true
