@@ -7,9 +7,13 @@
 
 -- name: CreateEvent :one
 -- No row when the template pin is not selectable; the caller maps pgx.ErrNoRows to a validation error.
-INSERT INTO events (id, owner_id, occasion_slug, title, content, template_id, template_version, overrides, starts_at)
+-- retention_from is the retention clock: greatest(ends_at, now()), so a past end starts a full
+-- retention window now (greatest ignores NULL, hence the CASE).
+INSERT INTO events (id, owner_id, occasion_slug, title, content, template_id, template_version, overrides,
+                    starts_at, ends_at, retention_from)
 SELECT @id::uuid, sqlc.narg(owner_id)::uuid, @occasion_slug::text, @title::text, @content::jsonb,
-       t.id, tv.version, @overrides::jsonb, sqlc.narg(starts_at)::timestamptz
+       t.id, tv.version, @overrides::jsonb, sqlc.narg(starts_at)::timestamptz, sqlc.narg(ends_at)::timestamptz,
+       CASE WHEN sqlc.narg(ends_at)::timestamptz IS NOT NULL THEN greatest(sqlc.narg(ends_at)::timestamptz, now()) END
 FROM templates t
 JOIN template_versions tv ON tv.template_id = t.id
 WHERE t.id = @template_id::uuid
@@ -105,13 +109,29 @@ GROUP BY r.event_id;
 
 -- name: UpdateEventContent :one
 -- Editor save for owners and editors. NULL content/overrides/template leave that part unchanged;
--- title and starts_at are derived from content and only change with it. A template change must
+-- title, starts_at and ends_at are derived from content and only change with it. Moving ends_at
+-- restarts retention from greatest(new end, now()) (so back-dating never shortens an event's life)
+-- and clears the reminder so the new end gets its own. A template change must
 -- resolve (with the unchanged half) to a selectable pin; leaving both NULL keeps an existing pin even
 -- if that template has since become premium or retired. An unselectable pin updates no row.
 UPDATE events e
 SET content = coalesce(sqlc.narg(content), e.content),
     title = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.title ELSE @title::text END,
     starts_at = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.starts_at ELSE sqlc.narg(starts_at)::timestamptz END,
+    ends_at = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.ends_at ELSE sqlc.narg(ends_at)::timestamptz END,
+    retention_from = CASE
+        WHEN sqlc.narg(content)::jsonb IS NULL
+          OR sqlc.narg(ends_at)::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_from
+        WHEN sqlc.narg(ends_at)::timestamptz IS NOT NULL THEN greatest(sqlc.narg(ends_at)::timestamptz, now())
+    END,
+    retention_reminded_at = CASE
+        WHEN sqlc.narg(content)::jsonb IS NULL
+          OR sqlc.narg(ends_at)::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_reminded_at
+    END,
+    retention_reminder_sent_at = CASE
+        WHEN sqlc.narg(content)::jsonb IS NULL
+          OR sqlc.narg(ends_at)::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_reminder_sent_at
+    END,
     overrides = coalesce(sqlc.narg(overrides), e.overrides),
     template_id = coalesce(sqlc.narg(template_id), e.template_id),
     template_version = coalesce(sqlc.narg(template_version), e.template_version),
@@ -133,11 +153,25 @@ WHERE e.id = @event_id
 RETURNING e.version, e.updated_at;
 
 -- name: UpdateAnonDraftContent :one
--- Same template-pin rule as UpdateEventContent.
+-- Same derived-field and template-pin rules as UpdateEventContent.
 UPDATE events e
 SET content = coalesce(sqlc.narg(content), e.content),
     title = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.title ELSE @title::text END,
     starts_at = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.starts_at ELSE sqlc.narg(starts_at)::timestamptz END,
+    ends_at = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.ends_at ELSE sqlc.narg(ends_at)::timestamptz END,
+    retention_from = CASE
+        WHEN sqlc.narg(content)::jsonb IS NULL
+          OR sqlc.narg(ends_at)::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_from
+        WHEN sqlc.narg(ends_at)::timestamptz IS NOT NULL THEN greatest(sqlc.narg(ends_at)::timestamptz, now())
+    END,
+    retention_reminded_at = CASE
+        WHEN sqlc.narg(content)::jsonb IS NULL
+          OR sqlc.narg(ends_at)::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_reminded_at
+    END,
+    retention_reminder_sent_at = CASE
+        WHEN sqlc.narg(content)::jsonb IS NULL
+          OR sqlc.narg(ends_at)::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_reminder_sent_at
+    END,
     overrides = coalesce(sqlc.narg(overrides), e.overrides),
     template_id = coalesce(sqlc.narg(template_id), e.template_id),
     template_version = coalesce(sqlc.narg(template_version), e.template_version),
@@ -246,13 +280,18 @@ RETURNING e.id;
 -- name: ClaimAnonDrafts :many
 -- At login: hands every unexpired draft of this browser to the user. Soft-deleted drafts are
 -- claimed too, so the 30-day purge removes them instead of leaving ownerless rows behind.
+-- A past-dated draft claimed late gets a full retention window from now; its reminder state is
+-- cleared only when the anchor actually moves.
 WITH claimed AS (
     DELETE FROM anon_drafts a
     WHERE a.cookie_hash = @cookie_hash AND a.expires_at > now()
     RETURNING a.event_id
 )
 UPDATE events e
-SET owner_id = @user_id::uuid, updated_at = now()
+SET owner_id = @user_id::uuid, updated_at = now(),
+    retention_from = CASE WHEN e.retention_from IS NOT NULL THEN greatest(e.retention_from, now()) END,
+    retention_reminded_at = CASE WHEN e.retention_from < now() THEN NULL ELSE e.retention_reminded_at END,
+    retention_reminder_sent_at = CASE WHEN e.retention_from < now() THEN NULL ELSE e.retention_reminder_sent_at END
 FROM claimed c
 WHERE e.id = c.event_id AND e.owner_id IS NULL
 RETURNING e.id;
@@ -339,20 +378,140 @@ WHERE owner_id = @owner_id::uuid
   AND slug IS NOT NULL
 RETURNING id;
 
--- name: DeleteExpiredAnonDraftEvents :execrows
--- Hard-deletes expired, unclaimed drafts in batches (anon_drafts and media rows cascade; files go via reconcile).
-DELETE FROM events
-WHERE id IN (SELECT a.event_id FROM anon_drafts a WHERE a.expires_at <= now() LIMIT 500)
-  AND owner_id IS NULL;
+-- name: ListExpiredAnonDraftEvents :many
+-- Expired, unclaimed anonymous drafts, oldest first (anon_drafts_expires_at_idx). The caller deletes
+-- them with DeleteExpiredAnonDraftEvents, then their media files.
+SELECT a.event_id
+FROM anon_drafts a
+JOIN events e ON e.id = a.event_id
+WHERE a.expires_at <= now() AND e.owner_id IS NULL
+ORDER BY a.expires_at
+LIMIT sqlc.arg(lim)::int;
 
--- name: PurgeDeletedEvents :execrows
--- Taken-down events are kept as moderation evidence.
-DELETE FROM events
-WHERE id IN (
+-- name: DeleteExpiredAnonDraftEvents :execrows
+-- Hard-deletes listed drafts that are still expired and unclaimed (anon_drafts and media rows
+-- cascade). A draft claimed since the list is skipped.
+DELETE FROM events e
+WHERE e.id = ANY(@event_ids::uuid[])
+  AND e.owner_id IS NULL
+  AND EXISTS (SELECT 1 FROM anon_drafts a WHERE a.event_id = e.id AND a.expires_at <= now());
+
+-- name: ClaimRetentionReminders :many
+-- Retention job: claims owned events whose retention_from is before ended_before and that were not
+-- yet reminded, oldest first (events_retention_remind_idx), and returns each claim stamp (the job
+-- args carry it so only the current claim sends). Events with an open report are skipped: moderation
+-- decides those. SKIP LOCKED lets concurrent runs take disjoint batches and never waits on an
+-- editor save. The claim is the dedupe: each id gets one reminder.
+-- ANY(ARRAY(...)) runs the batch once as an InitPlan, so the outer update is a pkey lookup even in
+-- a generic plan (an IN semi-join assumes LIMIT $n is 10% of the table and seq-scans events).
+UPDATE events e
+SET retention_reminded_at = now()
+WHERE e.id = ANY(ARRAY(
     SELECT x.id FROM events x
-    WHERE x.deleted_at < now() - interval '30 days' AND x.status <> 'taken_down'
-    LIMIT 500
-);
+    WHERE x.deleted_at IS NULL
+      AND x.status <> 'taken_down'
+      AND x.retention_from < @ended_before::timestamptz
+      AND x.retention_reminded_at IS NULL
+      AND x.owner_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = x.id AND r.status IN ('open', 'reviewing'))
+    ORDER BY x.retention_from
+    LIMIT sqlc.arg(lim)::int
+    FOR NO KEY UPDATE SKIP LOCKED))
+  AND e.deleted_at IS NULL
+  AND e.retention_reminded_at IS NULL
+  AND e.retention_from < @ended_before::timestamptz
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'))
+RETURNING e.id, e.retention_reminded_at::timestamptz AS claimed_at;
+
+-- name: GetEventForRetentionReminder :one
+-- Reminder email data for one claim. No row once the event was deleted, taken down, re-dated
+-- (claim cleared or replaced: retention_reminded_at must equal the stamp in the job args), already
+-- sent, or its owner removed; the job then sends nothing.
+-- timezone is the datetime block's IANA zone, '' if missing (the caller falls back to UTC).
+SELECT e.owner_id::uuid AS owner_id, e.title, e.retention_from::timestamptz AS retention_from,
+       e.retention_reminded_at::timestamptz AS retention_reminded_at,
+       u.email AS owner_email,
+       coalesce(CASE WHEN jsonb_typeof(e.content) = 'array' THEN
+           (SELECT b->>'timezone' FROM jsonb_array_elements(e.content) b WHERE b->>'type' = 'datetime' LIMIT 1)
+       END, '')::text AS timezone
+FROM events e
+JOIN users u ON u.id = e.owner_id
+WHERE e.id = @event_id
+  AND e.retention_reminded_at = @claimed_at::timestamptz
+  AND e.retention_reminder_sent_at IS NULL
+  AND e.deleted_at IS NULL
+  AND e.status <> 'taken_down'
+  AND e.retention_from IS NOT NULL
+  AND u.deleted_at IS NULL;
+
+-- name: MarkRetentionReminderSent :execrows
+-- Stamps the claim as delivered. Zero rows: the claim was replaced or cleared by a re-date, or the
+-- reminder was already marked; the caller sends nothing.
+UPDATE events
+SET retention_reminder_sent_at = now()
+WHERE id = @event_id
+  AND retention_reminded_at = @claimed_at::timestamptz
+  AND retention_reminder_sent_at IS NULL;
+
+-- name: UnmarkRetentionReminderSent :execrows
+-- Undoes MarkRetentionReminderSent after the send failed, so the job's retry can send again.
+UPDATE events
+SET retention_reminder_sent_at = NULL
+WHERE id = @event_id AND retention_reminded_at = @claimed_at::timestamptz;
+
+-- name: ExpireEndedEvents :many
+-- Retention job: soft-deletes events whose retention_from is before ended_before and whose reminder
+-- was delivered before reminded_before, or (undeliverable address) claimed before fallback_before
+-- (events_retention_expire_idx; the redundant IS NOT NULL lets the planner prove that partial
+-- index's predicate through the OR). Events with an open report are skipped. Slug release as in
+-- SoftDeleteEvent; batch shape as in ClaimRetentionReminders.
+UPDATE events e
+SET deleted_at = now(), updated_at = now(),
+    slug = CASE WHEN e.published_at IS NULL AND e.status = 'draft' THEN NULL ELSE e.slug END
+WHERE e.id = ANY(ARRAY(
+    SELECT x.id FROM events x
+    WHERE x.deleted_at IS NULL
+      AND x.status <> 'taken_down'
+      AND x.retention_from < @ended_before::timestamptz
+      AND x.retention_reminded_at IS NOT NULL
+      AND (x.retention_reminder_sent_at < @reminded_before::timestamptz
+           OR x.retention_reminded_at < @fallback_before::timestamptz)
+      AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = x.id AND r.status IN ('open', 'reviewing'))
+    ORDER BY x.retention_from
+    LIMIT sqlc.arg(lim)::int
+    FOR NO KEY UPDATE SKIP LOCKED))
+  AND e.deleted_at IS NULL
+  AND e.status <> 'taken_down'
+  AND e.retention_from < @ended_before::timestamptz
+  AND (e.retention_reminder_sent_at < @reminded_before::timestamptz
+       OR e.retention_reminded_at < @fallback_before::timestamptz)
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'))
+RETURNING e.id;
+
+-- name: ListPurgeableEvents :many
+-- Soft-deleted events due for hard delete: deleted before deleted_before (the normal grace for an
+-- owner's delete), or expired by retention (reminded before reminded_before and retention_from
+-- before ended_before; those skip the grace because the owner already had the full window).
+-- Taken-down events are kept as moderation evidence, and so is any event with an open report
+-- (deleting the event cascades its reports). The caller deletes rows with PurgeEvents, then files.
+SELECT id
+FROM events
+WHERE deleted_at IS NOT NULL
+  AND status <> 'taken_down'
+  AND (deleted_at < @deleted_before::timestamptz
+       OR (retention_reminded_at IS NOT NULL
+           AND retention_reminded_at < @reminded_before::timestamptz
+           AND retention_from < @ended_before::timestamptz))
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = events.id AND r.status IN ('open', 'reviewing'))
+ORDER BY deleted_at
+LIMIT sqlc.arg(lim)::int;
+
+-- name: PurgeEvents :execrows
+-- Hard-deletes listed soft-deleted events; child rows cascade. Re-checks the state ListPurgeableEvents
+-- saw, including that no report is open.
+DELETE FROM events e
+WHERE e.id = ANY(@event_ids::uuid[]) AND e.deleted_at IS NOT NULL AND e.status <> 'taken_down'
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'));
 
 -- name: ExistingEventIDs :many
 -- Media reconcile: which of these directory names still have an event row (deleted or not).

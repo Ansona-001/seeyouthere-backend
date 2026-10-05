@@ -1,6 +1,8 @@
 package media
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -252,4 +254,75 @@ func TestStore_CheckFree(t *testing.T) {
 	if err := s.CheckFree(); err != nil {
 		t.Errorf("CheckFree: %v", err)
 	}
+}
+
+func TestStore_DeleteEventFiles(t *testing.T) {
+	s := newTestStore(t)
+	eventA, eventB := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	templateID := uuid.Must(uuid.NewV7())
+
+	put := func(area Area, eventID uuid.UUID) string {
+		t.Helper()
+		dir := filepath.Join(s.root, string(area), eventID.String(), uuid.Must(uuid.NewV7()).String())
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		writeRendition(t, dir, Widths[0])
+		return filepath.Dir(dir)
+	}
+	areas := []Area{AreaPublic, AreaPending, AreaQuarantine}
+	var aDirs, bDirs []string
+	for _, a := range areas {
+		aDirs = append(aDirs, put(a, eventA))
+		bDirs = append(bDirs, put(a, eventB))
+	}
+	templateFile := filepath.Join(s.root, "public", "templates", templateID.String(), "1", "background")
+	if err := os.MkdirAll(templateFile, 0o755); err != nil {
+		t.Fatalf("mkdir template: %v", err)
+	}
+
+	exists := func(path string) bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+
+	if err := s.DeleteEventFiles(context.Background(), eventA); err != nil {
+		t.Fatalf("DeleteEventFiles: %v", err)
+	}
+	for _, d := range aDirs {
+		if exists(d) {
+			t.Errorf("%s still exists after delete", d)
+		}
+	}
+	for _, d := range bDirs {
+		if !exists(d) {
+			t.Errorf("%s of another event was removed", d)
+		}
+	}
+	if !exists(templateFile) {
+		t.Error("public/templates was removed")
+	}
+
+	t.Run("second call and never-existing event", func(t *testing.T) {
+		if err := s.DeleteEventFiles(context.Background(), eventA); err != nil {
+			t.Errorf("second call: %v", err)
+		}
+		if err := s.DeleteEventFiles(context.Background(), uuid.Must(uuid.NewV7())); err != nil {
+			t.Errorf("missing event: %v", err)
+		}
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := s.DeleteEventFiles(ctx, eventB)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+		for _, d := range bDirs {
+			if !exists(d) {
+				t.Errorf("%s removed despite cancelled context", d)
+			}
+		}
+	})
 }

@@ -482,7 +482,7 @@ func TestHandleDeleteEventMedia_InUseIsBlocked(t *testing.T) {
 		t.Fatalf("validate content: %v", err)
 	}
 	if _, err := f.s.q.UpdateEventContent(ctx, store.UpdateEventContentParams{
-		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt, EventID: f.eventID, Version: 1, UserID: f.ownerID,
+		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(), EventID: f.eventID, Version: 1, UserID: f.ownerID,
 	}); err != nil {
 		t.Fatalf("update content: %v", err)
 	}

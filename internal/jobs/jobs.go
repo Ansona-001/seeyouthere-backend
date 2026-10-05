@@ -60,13 +60,21 @@ func (w *SendEmailWorker) Work(ctx context.Context, job *river.Job[SendEmailArgs
 
 func (w *SendEmailWorker) Timeout(*river.Job[SendEmailArgs]) time.Duration { return 30 * time.Second }
 
-// CleanupArgs deletes expired sessions and expired, unclaimed anonymous
-// drafts. Runs hourly.
+// CleanupArgs runs the hourly housekeeping: expired sessions, expired
+// anonymous drafts, orphaned media rows, and event retention (reminders,
+// expiry and hard deletes).
 type CleanupArgs struct{}
 
 func (CleanupArgs) Kind() string { return "cleanup" }
 
-// anonDraftBatchSize matches the LIMIT inside DeleteExpiredAnonDraftEvents.
+// InsertOpts puts cleanup on the single-worker maintenance queue, so two runs
+// (a slow one plus the next hourly tick) never overlap.
+func (CleanupArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{Queue: "maintenance"}
+}
+
+// anonDraftBatchSize is how many expired anonymous drafts one batch removes
+// (files, then rows).
 const anonDraftBatchSize = 500
 
 // maxAnonDraftBatchesPerRun bounds how many batches one cleanup run
@@ -83,32 +91,47 @@ const mediaCleanupBatchesPerRun = 10
 type CleanupWorker struct {
 	river.WorkerDefaults[CleanupArgs]
 	Queries *store.Queries
-	Media   *media.Store
+	Pool    *pgxpool.Pool
+	Jobs    jobInserter
+	Media   mediaDeleter
 }
 
+// Timeout is well above River's 1 minute default: a purge batch removes
+// directory trees and can be slow on a busy disk.
+func (w *CleanupWorker) Timeout(*river.Job[CleanupArgs]) time.Duration { return 10 * time.Minute }
+
 func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) error {
+	now := time.Now()
+
 	n, err := w.Queries.DeleteExpiredSessions(ctx)
 	if err != nil {
 		return err
 	}
-	slog.Info("cleanup", "expired_sessions", n)
+	slog.InfoContext(ctx, "cleanup", "expired_sessions", n)
 
+	// Expired anonymous drafts: media files first, then the rows (a failed
+	// file delete keeps the row so the next run retries).
 	var totalDrafts int64
+	var draftFailures int
 	for i := 0; i < maxAnonDraftBatchesPerRun; i++ {
-		batch, err := w.Queries.DeleteExpiredAnonDraftEvents(ctx)
+		ids, err := w.Queries.ListExpiredAnonDraftEvents(ctx, anonDraftBatchSize)
+		if err != nil {
+			return fmt.Errorf("list expired anon drafts: %w", err)
+		}
+		purged, failed, err := w.purgeWithFiles(ctx, ids, w.Queries.DeleteExpiredAnonDraftEvents)
+		totalDrafts += purged
+		draftFailures += failed
 		if err != nil {
 			return fmt.Errorf("delete expired anon drafts: %w", err)
 		}
-		totalDrafts += batch
-		if batch < anonDraftBatchSize {
+		if failed > 0 || len(ids) < anonDraftBatchSize {
 			break
 		}
 	}
-	slog.Info("cleanup", "expired_anon_drafts", totalDrafts)
+	slog.InfoContext(ctx, "cleanup", "expired_anon_drafts", totalDrafts, "anon_draft_file_failures", draftFailures)
 
 	// Host media detached from an event's content for 7+ days: the row is
-	// deleted first, then its files (every delete path in this codebase is
-	// DB first, files second, so a crash here just leaves an orphan
+	// deleted first, then its files (a crash here just leaves an orphan
 	// media_reconcile removes later).
 	var totalDetached int64
 	for i := 0; i < mediaCleanupBatchesPerRun; i++ {
@@ -126,7 +149,7 @@ func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) err
 			break
 		}
 	}
-	slog.Info("cleanup", "detached_media", totalDetached)
+	slog.InfoContext(ctx, "cleanup", "detached_media", totalDetached)
 
 	// Rejected guest photos: their files were already deleted at reject
 	// time, so this only needs to purge the rows.
@@ -141,22 +164,49 @@ func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) err
 			break
 		}
 	}
-	slog.Info("cleanup", "rejected_media_rows", totalRejected)
+	slog.InfoContext(ctx, "cleanup", "rejected_media_rows", totalRejected)
 
-	// Soft-deleted events older than 30 days (media files go via
-	// media_reconcile, which removes any directory with no matching row).
+	// Event retention, on events.retention_from (the end, but never earlier
+	// than the last edit that moved it): remind owners 27+ days after it,
+	// soft-delete 30+ days after it once the reminder was delivered 3+ days
+	// ago (or claimed 10+ days ago), then hard-delete (files first) events
+	// soft-deleted 30+ days ago, or retention-expired ones right away.
+	reminded, err := w.remindRetention(ctx, now)
+	if err != nil {
+		return err
+	}
+	expired, err := w.expireEndedEvents(ctx, now)
+	if err != nil {
+		return err
+	}
+	for _, id := range expired {
+		slog.InfoContext(ctx, "event expired", "event_id", id)
+	}
+
 	var totalPurged int64
-	for i := 0; i < mediaCleanupBatchesPerRun; i++ {
-		n, err := w.Queries.PurgeDeletedEvents(ctx)
+	var purgeFailures int
+	for i := 0; i < eventPurgeBatchesPerRun; i++ {
+		ids, err := w.Queries.ListPurgeableEvents(ctx, store.ListPurgeableEventsParams{
+			DeletedBefore:  now.Add(-deletedEventGrace),
+			RemindedBefore: now.Add(-retentionReminderLead),
+			EndedBefore:    now.Add(-retentionAfterEnd),
+			Lim:            eventPurgeBatchSize,
+		})
 		if err != nil {
-			return fmt.Errorf("purge deleted events: %w", err)
+			return fmt.Errorf("list purgeable events: %w", err)
 		}
-		totalPurged += n
-		if n < mediaCleanupBatchSize {
+		purged, failed, err := w.purgeWithFiles(ctx, ids, w.Queries.PurgeEvents)
+		totalPurged += purged
+		purgeFailures += failed
+		if err != nil {
+			return fmt.Errorf("purge events: %w", err)
+		}
+		if failed > 0 || len(ids) < eventPurgeBatchSize {
 			break
 		}
 	}
-	slog.Info("cleanup", "purged_events", totalPurged)
+	slog.InfoContext(ctx, "cleanup", "retention_reminders", reminded, "expired_events", len(expired),
+		"purged_events", totalPurged, "purge_file_failures", purgeFailures)
 	return nil
 }
 
@@ -242,7 +292,9 @@ func (w *MediaVisibilityWorker) Work(ctx context.Context, job *river.Job[MediaVi
 // removes media directories that have no matching database row (a crash
 // between Store.Commit and the row insert, or an event/media row that was
 // hard-deleted) across public/, pending/ and quarantine/, plus stale tmp/
-// entries. Never enqueued manually.
+// entries. Event purges and anonymous-draft deletes remove files before rows,
+// so this is the safety net for crashes and older leftovers, not the primary
+// cleanup. Never enqueued manually.
 type MediaReconcileArgs struct{}
 
 func (MediaReconcileArgs) Kind() string { return "media_reconcile" }
@@ -354,8 +406,10 @@ func (w *NotifyReportWorker) Timeout(*river.Job[NotifyReportArgs]) time.Duration
 // primary SMTP identity.
 func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *store.Queries, mediaStore *media.Store, tokens *token.Keys, limiter *ratelimit.Limiter, adminAlertEmail, siteURL string) (*Client, error) {
 	workers := river.NewWorkers()
+	cleanup := &CleanupWorker{Queries: queries, Pool: pool, Media: mediaStore}
 	river.AddWorker(workers, &SendEmailWorker{Sender: sender})
-	river.AddWorker(workers, &CleanupWorker{Queries: queries, Media: mediaStore})
+	river.AddWorker(workers, cleanup)
+	river.AddWorker(workers, &RetentionReminderWorker{Queries: queries, Sender: sender, Limiter: limiter, SiteURL: siteURL})
 	river.AddWorker(workers, &MediaVisibilityWorker{Queries: queries, Media: mediaStore})
 	river.AddWorker(workers, &MediaReconcileWorker{Queries: queries, Media: mediaStore})
 	river.AddWorker(workers, &NotifyReportWorker{Queries: queries, Sender: sender, AdminAlertEmail: adminAlertEmail, SiteURL: siteURL})
@@ -365,7 +419,7 @@ func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *
 	river.AddWorker(workers, &SendRSVPConfirmationWorker{Queries: queries, Sender: sender, CalendarSender: calendarSender, Tokens: tokens, Limiter: limiter, SiteURL: siteURL})
 	river.AddWorker(workers, &NotifyRSVPsWorker{Queries: queries, Sender: sender, SiteURL: siteURL})
 
-	return river.NewClient(riverpgxv5.New(pool), &river.Config{
+	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
 		Logger: slog.Default(),
 		Queues: map[string]river.QueueConfig{
 			// Worker counts are deliberately small (§7 of the build-out
@@ -390,4 +444,11 @@ func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *
 			),
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+	// The cleanup worker enqueues reminder jobs through the client that runs
+	// it, so it is wired once the client exists (before Start).
+	cleanup.Jobs = client
+	return client, nil
 }

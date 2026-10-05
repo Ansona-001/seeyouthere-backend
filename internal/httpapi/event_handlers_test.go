@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -152,7 +153,7 @@ func createTestEvent(t *testing.T, ctx context.Context, q *store.Queries, occasi
 	}
 	event, err := q.CreateEvent(ctx, store.CreateEventParams{
 		ID: uuid.Must(uuid.NewV7()), OwnerID: ownerID, OccasionSlug: occasionSlug, Title: saved.Title,
-		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt,
+		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		TemplateID: tmpl.ID, TemplateVersion: tmpl.Version,
 	})
 	if err != nil {
@@ -341,7 +342,7 @@ func TestHandlePublishEvent_NotReadyThenSucceeds(t *testing.T) {
 		t.Fatalf("validate content: %v", err)
 	}
 	if _, err := q.UpdateEventContent(ctx, store.UpdateEventContentParams{
-		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt,
+		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		EventID: f.eventID, Version: 1, UserID: f.ownerID,
 	}); err != nil {
 		t.Fatalf("update content: %v", err)
@@ -571,4 +572,87 @@ func TestHandleDeleteEvent_EnqueuesMediaVisibilityJob(t *testing.T) {
 			t.Errorf("media_visibility jobs for %s = %d, want 1", draft.ID, n)
 		}
 	})
+}
+
+// TestHandlePatchEvent_EndsAt covers events.ends_at being derived from the
+// content's datetime block on every content save: the end when set, the
+// start when end_local is empty or before the start, untouched by a PATCH
+// without content, and NULL once the datetime block is removed (the DB CHECK
+// requires ends_at NULL exactly when starts_at is NULL). It also covers
+// events.retention_from: the end for a future end, "now" for a back-dated one
+// (so back-dating cannot shorten an event's life), kept when a save does not
+// change the end, and NULL with ends_at.
+func TestHandlePatchEvent_EndsAt(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	f := newEventTestFixture(t, pool, rdb)
+	ctx := context.Background()
+
+	hero := `{"id":"hero1","type":"hero","title":"Sam's Party","subtitle":""}`
+	dt := func(start, end string) string {
+		return `{"id":"dt1","type":"datetime","heading":"","start_local":"` + start + `","end_local":"` + end +
+			`","timezone":"UTC","all_day":false}`
+	}
+	ts := func(s string) *time.Time {
+		v, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatalf("parse %s: %v", s, err)
+		}
+		return &v
+	}
+
+	steps := []struct {
+		name     string
+		body     string // PATCH body without the version
+		wantEnds *time.Time
+		// wantRetention: "end" = retention_from equals ends_at, "now" =
+		// about the time of the save, "keep" = unchanged from the previous
+		// step, "null" = NULL.
+		wantRetention string
+	}{
+		{"with end", `"content":[` + hero + `,` + dt("2027-06-01T18:00", "2027-06-01T22:00") + `]`, ts("2027-06-01T22:00:00Z"), "end"},
+		{"without end", `"content":[` + hero + `,` + dt("2027-06-02T18:00", "") + `]`, ts("2027-06-02T18:00:00Z"), "end"},
+		{"no content leaves ends_at", `"overrides":{}`, ts("2027-06-02T18:00:00Z"), "keep"},
+		{"back-dated end", `"content":[` + hero + `,` + dt("2020-01-01T18:00", "2020-01-01T22:00") + `]`, ts("2020-01-01T22:00:00Z"), "now"},
+		{"same end saved again", `"content":[` + hero + `,` + dt("2020-01-01T18:00", "2020-01-01T22:00") + `,{"id":"t1","type":"text","body":"x"}]`, ts("2020-01-01T22:00:00Z"), "keep"},
+		{"datetime removed", `"content":[` + hero + `]`, nil, "null"},
+	}
+	version := 1
+	var prevRetention *time.Time
+	for _, st := range steps {
+		req := requestAs(http.MethodPatch, "/", f.ownerID)
+		req = withRouteID(req, f.eventID)
+		req.Header.Set("Content-Type", "application/json")
+		req.Body = newJSONBody(`{"version":` + strconv.Itoa(version) + `,` + st.body + `}`)
+		rec := httptest.NewRecorder()
+		f.s.handlePatchEvent(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200; body = %s", st.name, rec.Code, rec.Body.String())
+		}
+		version++
+
+		var starts, ends, retention *time.Time
+		if err := pool.QueryRow(ctx, "SELECT starts_at, ends_at, retention_from FROM events WHERE id = $1", f.eventID).Scan(&starts, &ends, &retention); err != nil {
+			t.Fatalf("%s: read event: %v", st.name, err)
+		}
+		switch {
+		case st.wantRetention == "null" && retention != nil:
+			t.Errorf("%s: retention_from = %v, want NULL", st.name, retention)
+		case st.wantRetention != "null" && retention == nil:
+			t.Fatalf("%s: retention_from is NULL", st.name)
+		case st.wantRetention == "end" && !retention.Equal(*ends):
+			t.Errorf("%s: retention_from = %v, want ends_at %v", st.name, retention, ends)
+		case st.wantRetention == "now" && time.Since(*retention).Abs() > time.Minute:
+			t.Errorf("%s: retention_from = %v, want about now", st.name, retention)
+		case st.wantRetention == "keep" && !retention.Equal(*prevRetention):
+			t.Errorf("%s: retention_from = %v, want unchanged %v", st.name, retention, prevRetention)
+		}
+		prevRetention = retention
+		switch {
+		case st.wantEnds == nil && (ends != nil || starts != nil):
+			t.Errorf("%s: starts_at = %v, ends_at = %v, want both NULL", st.name, starts, ends)
+		case st.wantEnds != nil && (ends == nil || !ends.Equal(*st.wantEnds)):
+			t.Errorf("%s: ends_at = %v, want %v", st.name, ends, st.wantEnds)
+		}
+	}
 }

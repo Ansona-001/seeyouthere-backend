@@ -437,7 +437,7 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 
 	createParams := store.CreateEventParams{
 		ID: uuid.Must(uuid.NewV7()), OccasionSlug: occasionSlug, Title: saved.Title,
-		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt,
+		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		TemplateID: tmpl.ID, TemplateVersion: tmpl.Version,
 	}
 
@@ -724,7 +724,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 
 	var contentJSON []byte
 	var title string
-	var startsAt *time.Time
+	var startsAt, endsAt *time.Time
 	var mediaIDs []uuid.UUID
 	contentChanged := len(body.Content) > 0
 	if contentChanged {
@@ -751,7 +751,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		contentJSON, title, startsAt, mediaIDs = saved.JSON, saved.Title, saved.StartsAt, saved.MediaIDs
+		contentJSON, title, startsAt, endsAt, mediaIDs = saved.JSON, saved.Title, saved.StartsAt, saved.EffectiveEnd(), saved.MediaIDs
 	}
 
 	var overridesJSON []byte
@@ -772,7 +772,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 	err = s.inTx(ctx, func(tx pgx.Tx, q *store.Queries) error {
 		if authed {
 			_, err := q.UpdateEventContent(ctx, store.UpdateEventContentParams{
-				Content: contentJSON, Title: title, StartsAt: startsAt, Overrides: overridesJSON,
+				Content: contentJSON, Title: title, StartsAt: startsAt, EndsAt: endsAt, Overrides: overridesJSON,
 				TemplateID: templateID, TemplateVersion: templateVersion,
 				EventID: eventID, Version: body.Version, UserID: userID,
 			})
@@ -781,7 +781,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			_, err := q.UpdateAnonDraftContent(ctx, store.UpdateAnonDraftContentParams{
-				Content: contentJSON, Title: title, StartsAt: startsAt, Overrides: overridesJSON,
+				Content: contentJSON, Title: title, StartsAt: startsAt, EndsAt: endsAt, Overrides: overridesJSON,
 				TemplateID: templateID, TemplateVersion: templateVersion,
 				EventID: eventID, Version: body.Version, CookieHash: cookieHash,
 			})

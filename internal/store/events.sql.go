@@ -35,7 +35,10 @@ WITH claimed AS (
     RETURNING a.event_id
 )
 UPDATE events e
-SET owner_id = $1::uuid, updated_at = now()
+SET owner_id = $1::uuid, updated_at = now(),
+    retention_from = CASE WHEN e.retention_from IS NOT NULL THEN greatest(e.retention_from, now()) END,
+    retention_reminded_at = CASE WHEN e.retention_from < now() THEN NULL ELSE e.retention_reminded_at END,
+    retention_reminder_sent_at = CASE WHEN e.retention_from < now() THEN NULL ELSE e.retention_reminder_sent_at END
 FROM claimed c
 WHERE e.id = c.event_id AND e.owner_id IS NULL
 RETURNING e.id
@@ -48,6 +51,8 @@ type ClaimAnonDraftsParams struct {
 
 // At login: hands every unexpired draft of this browser to the user. Soft-deleted drafts are
 // claimed too, so the 30-day purge removes them instead of leaving ownerless rows behind.
+// A past-dated draft claimed late gets a full retention window from now; its reminder state is
+// cleared only when the anchor actually moves.
 func (q *Queries) ClaimAnonDrafts(ctx context.Context, arg ClaimAnonDraftsParams) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, claimAnonDrafts, arg.UserID, arg.CookieHash)
 	if err != nil {
@@ -92,6 +97,64 @@ func (q *Queries) ClaimRSVPWatermark(ctx context.Context, eventID uuid.UUID) (Cl
 	var i ClaimRSVPWatermarkRow
 	err := row.Scan(&i.PreviousNotifiedAt, &i.NotifiedAt)
 	return i, err
+}
+
+const claimRetentionReminders = `-- name: ClaimRetentionReminders :many
+UPDATE events e
+SET retention_reminded_at = now()
+WHERE e.id = ANY(ARRAY(
+    SELECT x.id FROM events x
+    WHERE x.deleted_at IS NULL
+      AND x.status <> 'taken_down'
+      AND x.retention_from < $1::timestamptz
+      AND x.retention_reminded_at IS NULL
+      AND x.owner_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = x.id AND r.status IN ('open', 'reviewing'))
+    ORDER BY x.retention_from
+    LIMIT $2::int
+    FOR NO KEY UPDATE SKIP LOCKED))
+  AND e.deleted_at IS NULL
+  AND e.retention_reminded_at IS NULL
+  AND e.retention_from < $1::timestamptz
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'))
+RETURNING e.id, e.retention_reminded_at::timestamptz AS claimed_at
+`
+
+type ClaimRetentionRemindersParams struct {
+	EndedBefore time.Time `json:"ended_before"`
+	Lim         int32     `json:"lim"`
+}
+
+type ClaimRetentionRemindersRow struct {
+	ID        uuid.UUID `json:"id"`
+	ClaimedAt time.Time `json:"claimed_at"`
+}
+
+// Retention job: claims owned events whose retention_from is before ended_before and that were not
+// yet reminded, oldest first (events_retention_remind_idx), and returns each claim stamp (the job
+// args carry it so only the current claim sends). Events with an open report are skipped: moderation
+// decides those. SKIP LOCKED lets concurrent runs take disjoint batches and never waits on an
+// editor save. The claim is the dedupe: each id gets one reminder.
+// ANY(ARRAY(...)) runs the batch once as an InitPlan, so the outer update is a pkey lookup even in
+// a generic plan (an IN semi-join assumes LIMIT $n is 10% of the table and seq-scans events).
+func (q *Queries) ClaimRetentionReminders(ctx context.Context, arg ClaimRetentionRemindersParams) ([]ClaimRetentionRemindersRow, error) {
+	rows, err := q.db.Query(ctx, claimRetentionReminders, arg.EndedBefore, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimRetentionRemindersRow{}
+	for rows.Next() {
+		var i ClaimRetentionRemindersRow
+		if err := rows.Scan(&i.ID, &i.ClaimedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const countAnonDraftsByCookie = `-- name: CountAnonDraftsByCookie :one
@@ -143,17 +206,19 @@ func (q *Queries) CreateAnonDraft(ctx context.Context, arg CreateAnonDraftParams
 const createEvent = `-- name: CreateEvent :one
 
 
-INSERT INTO events (id, owner_id, occasion_slug, title, content, template_id, template_version, overrides, starts_at)
+INSERT INTO events (id, owner_id, occasion_slug, title, content, template_id, template_version, overrides,
+                    starts_at, ends_at, retention_from)
 SELECT $1::uuid, $2::uuid, $3::text, $4::text, $5::jsonb,
-       t.id, tv.version, $6::jsonb, $7::timestamptz
+       t.id, tv.version, $6::jsonb, $7::timestamptz, $8::timestamptz,
+       CASE WHEN $8::timestamptz IS NOT NULL THEN greatest($8::timestamptz, now()) END
 FROM templates t
 JOIN template_versions tv ON tv.template_id = t.id
-WHERE t.id = $8::uuid
-  AND tv.version = $9::int
+WHERE t.id = $9::uuid
+  AND tv.version = $10::int
   AND tv.published_at IS NOT NULL
   AND t.status = 'published'
   AND NOT t.is_premium
-RETURNING id, owner_id, occasion_slug, slug, title, content, template_id, template_version, overrides, visibility, password_hash, rsvp_mode, status, remove_branding, starts_at, published_at, created_at, updated_at, deleted_at, version, notify_rsvps, rsvp_notified_at
+RETURNING id, owner_id, occasion_slug, slug, title, content, template_id, template_version, overrides, visibility, password_hash, rsvp_mode, status, remove_branding, starts_at, published_at, created_at, updated_at, deleted_at, version, notify_rsvps, rsvp_notified_at, ends_at, retention_from, retention_reminded_at, retention_reminder_sent_at
 `
 
 type CreateEventParams struct {
@@ -164,6 +229,7 @@ type CreateEventParams struct {
 	Content         []byte     `json:"content"`
 	Overrides       []byte     `json:"overrides"`
 	StartsAt        *time.Time `json:"starts_at"`
+	EndsAt          *time.Time `json:"ends_at"`
 	TemplateID      uuid.UUID  `json:"template_id"`
 	TemplateVersion int32      `json:"template_version"`
 }
@@ -174,6 +240,8 @@ type CreateEventParams struct {
 // Template pins set by hosts must name a published version of a published, non-premium template.
 // Admin changes go through SetEventFlags instead.
 // No row when the template pin is not selectable; the caller maps pgx.ErrNoRows to a validation error.
+// retention_from is the retention clock: greatest(ends_at, now()), so a past end starts a full
+// retention window now (greatest ignores NULL, hence the CASE).
 func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error) {
 	row := q.db.QueryRow(ctx, createEvent,
 		arg.ID,
@@ -183,6 +251,7 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 		arg.Content,
 		arg.Overrides,
 		arg.StartsAt,
+		arg.EndsAt,
 		arg.TemplateID,
 		arg.TemplateVersion,
 	)
@@ -210,19 +279,25 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 		&i.Version,
 		&i.NotifyRsvps,
 		&i.RsvpNotifiedAt,
+		&i.EndsAt,
+		&i.RetentionFrom,
+		&i.RetentionRemindedAt,
+		&i.RetentionReminderSentAt,
 	)
 	return i, err
 }
 
 const deleteExpiredAnonDraftEvents = `-- name: DeleteExpiredAnonDraftEvents :execrows
-DELETE FROM events
-WHERE id IN (SELECT a.event_id FROM anon_drafts a WHERE a.expires_at <= now() LIMIT 500)
-  AND owner_id IS NULL
+DELETE FROM events e
+WHERE e.id = ANY($1::uuid[])
+  AND e.owner_id IS NULL
+  AND EXISTS (SELECT 1 FROM anon_drafts a WHERE a.event_id = e.id AND a.expires_at <= now())
 `
 
-// Hard-deletes expired, unclaimed drafts in batches (anon_drafts and media rows cascade; files go via reconcile).
-func (q *Queries) DeleteExpiredAnonDraftEvents(ctx context.Context) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteExpiredAnonDraftEvents)
+// Hard-deletes listed drafts that are still expired and unclaimed (anon_drafts and media rows
+// cascade). A draft claimed since the list is skipped.
+func (q *Queries) DeleteExpiredAnonDraftEvents(ctx context.Context, eventIds []uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredAnonDraftEvents, eventIds)
 	if err != nil {
 		return 0, err
 	}
@@ -254,8 +329,70 @@ func (q *Queries) ExistingEventIDs(ctx context.Context, eventIds []uuid.UUID) ([
 	return items, nil
 }
 
+const expireEndedEvents = `-- name: ExpireEndedEvents :many
+UPDATE events e
+SET deleted_at = now(), updated_at = now(),
+    slug = CASE WHEN e.published_at IS NULL AND e.status = 'draft' THEN NULL ELSE e.slug END
+WHERE e.id = ANY(ARRAY(
+    SELECT x.id FROM events x
+    WHERE x.deleted_at IS NULL
+      AND x.status <> 'taken_down'
+      AND x.retention_from < $1::timestamptz
+      AND x.retention_reminded_at IS NOT NULL
+      AND (x.retention_reminder_sent_at < $2::timestamptz
+           OR x.retention_reminded_at < $3::timestamptz)
+      AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = x.id AND r.status IN ('open', 'reviewing'))
+    ORDER BY x.retention_from
+    LIMIT $4::int
+    FOR NO KEY UPDATE SKIP LOCKED))
+  AND e.deleted_at IS NULL
+  AND e.status <> 'taken_down'
+  AND e.retention_from < $1::timestamptz
+  AND (e.retention_reminder_sent_at < $2::timestamptz
+       OR e.retention_reminded_at < $3::timestamptz)
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'))
+RETURNING e.id
+`
+
+type ExpireEndedEventsParams struct {
+	EndedBefore    time.Time `json:"ended_before"`
+	RemindedBefore time.Time `json:"reminded_before"`
+	FallbackBefore time.Time `json:"fallback_before"`
+	Lim            int32     `json:"lim"`
+}
+
+// Retention job: soft-deletes events whose retention_from is before ended_before and whose reminder
+// was delivered before reminded_before, or (undeliverable address) claimed before fallback_before
+// (events_retention_expire_idx; the redundant IS NOT NULL lets the planner prove that partial
+// index's predicate through the OR). Events with an open report are skipped. Slug release as in
+// SoftDeleteEvent; batch shape as in ClaimRetentionReminders.
+func (q *Queries) ExpireEndedEvents(ctx context.Context, arg ExpireEndedEventsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, expireEndedEvents,
+		arg.EndedBefore,
+		arg.RemindedBefore,
+		arg.FallbackBefore,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getAnonDraftEvent = `-- name: GetAnonDraftEvent :one
-SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, 'anon'::text AS role,
+SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, 'anon'::text AS role,
        t.slug AS template_slug, t.name AS template_name,
        tv.manifest, tv.assets_path,
        coalesce((SELECT max(v.version) FROM template_versions v
@@ -313,6 +450,10 @@ func (q *Queries) GetAnonDraftEvent(ctx context.Context, arg GetAnonDraftEventPa
 		&i.Event.Version,
 		&i.Event.NotifyRsvps,
 		&i.Event.RsvpNotifiedAt,
+		&i.Event.EndsAt,
+		&i.Event.RetentionFrom,
+		&i.Event.RetentionRemindedAt,
+		&i.Event.RetentionReminderSentAt,
 		&i.Role,
 		&i.TemplateSlug,
 		&i.TemplateName,
@@ -351,7 +492,7 @@ func (q *Queries) GetAnonDraftWriteState(ctx context.Context, arg GetAnonDraftWr
 }
 
 const getEventAdmin = `-- name: GetEventAdmin :one
-SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at,
+SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at,
        u.email AS owner_email,
        t.slug AS template_slug, t.name AS template_name, tv.manifest, tv.assets_path,
        (SELECT count(*) FROM rsvps r WHERE r.event_id = e.id) AS rsvp_count,
@@ -404,6 +545,10 @@ func (q *Queries) GetEventAdmin(ctx context.Context, eventID uuid.UUID) (GetEven
 		&i.Event.Version,
 		&i.Event.NotifyRsvps,
 		&i.Event.RsvpNotifiedAt,
+		&i.Event.EndsAt,
+		&i.Event.RetentionFrom,
+		&i.Event.RetentionRemindedAt,
+		&i.Event.RetentionReminderSentAt,
 		&i.OwnerEmail,
 		&i.TemplateSlug,
 		&i.TemplateName,
@@ -449,8 +594,58 @@ func (q *Queries) GetEventForNotify(ctx context.Context, eventID uuid.UUID) (Get
 	return i, err
 }
 
+const getEventForRetentionReminder = `-- name: GetEventForRetentionReminder :one
+SELECT e.owner_id::uuid AS owner_id, e.title, e.retention_from::timestamptz AS retention_from,
+       e.retention_reminded_at::timestamptz AS retention_reminded_at,
+       u.email AS owner_email,
+       coalesce(CASE WHEN jsonb_typeof(e.content) = 'array' THEN
+           (SELECT b->>'timezone' FROM jsonb_array_elements(e.content) b WHERE b->>'type' = 'datetime' LIMIT 1)
+       END, '')::text AS timezone
+FROM events e
+JOIN users u ON u.id = e.owner_id
+WHERE e.id = $1
+  AND e.retention_reminded_at = $2::timestamptz
+  AND e.retention_reminder_sent_at IS NULL
+  AND e.deleted_at IS NULL
+  AND e.status <> 'taken_down'
+  AND e.retention_from IS NOT NULL
+  AND u.deleted_at IS NULL
+`
+
+type GetEventForRetentionReminderParams struct {
+	EventID   uuid.UUID `json:"event_id"`
+	ClaimedAt time.Time `json:"claimed_at"`
+}
+
+type GetEventForRetentionReminderRow struct {
+	OwnerID             uuid.UUID `json:"owner_id"`
+	Title               string    `json:"title"`
+	RetentionFrom       time.Time `json:"retention_from"`
+	RetentionRemindedAt time.Time `json:"retention_reminded_at"`
+	OwnerEmail          string    `json:"owner_email"`
+	Timezone            string    `json:"timezone"`
+}
+
+// Reminder email data for one claim. No row once the event was deleted, taken down, re-dated
+// (claim cleared or replaced: retention_reminded_at must equal the stamp in the job args), already
+// sent, or its owner removed; the job then sends nothing.
+// timezone is the datetime block's IANA zone, ” if missing (the caller falls back to UTC).
+func (q *Queries) GetEventForRetentionReminder(ctx context.Context, arg GetEventForRetentionReminderParams) (GetEventForRetentionReminderRow, error) {
+	row := q.db.QueryRow(ctx, getEventForRetentionReminder, arg.EventID, arg.ClaimedAt)
+	var i GetEventForRetentionReminderRow
+	err := row.Scan(
+		&i.OwnerID,
+		&i.Title,
+		&i.RetentionFrom,
+		&i.RetentionRemindedAt,
+		&i.OwnerEmail,
+		&i.Timezone,
+	)
+	return i, err
+}
+
 const getEventForUser = `-- name: GetEventForUser :one
-SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, r.role::text AS role,
+SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, r.role::text AS role,
        t.slug AS template_slug, t.name AS template_name,
        tv.manifest, tv.assets_path,
        coalesce((SELECT max(v.version) FROM template_versions v
@@ -506,6 +701,10 @@ func (q *Queries) GetEventForUser(ctx context.Context, arg GetEventForUserParams
 		&i.Event.Version,
 		&i.Event.NotifyRsvps,
 		&i.Event.RsvpNotifiedAt,
+		&i.Event.EndsAt,
+		&i.Event.RetentionFrom,
+		&i.Event.RetentionRemindedAt,
+		&i.Event.RetentionReminderSentAt,
 		&i.Role,
 		&i.TemplateSlug,
 		&i.TemplateName,
@@ -702,6 +901,88 @@ func (q *Queries) ListEventsForUser(ctx context.Context, arg ListEventsForUserPa
 	return items, nil
 }
 
+const listExpiredAnonDraftEvents = `-- name: ListExpiredAnonDraftEvents :many
+SELECT a.event_id
+FROM anon_drafts a
+JOIN events e ON e.id = a.event_id
+WHERE a.expires_at <= now() AND e.owner_id IS NULL
+ORDER BY a.expires_at
+LIMIT $1::int
+`
+
+// Expired, unclaimed anonymous drafts, oldest first (anon_drafts_expires_at_idx). The caller deletes
+// them with DeleteExpiredAnonDraftEvents, then their media files.
+func (q *Queries) ListExpiredAnonDraftEvents(ctx context.Context, lim int32) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listExpiredAnonDraftEvents, lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var event_id uuid.UUID
+		if err := rows.Scan(&event_id); err != nil {
+			return nil, err
+		}
+		items = append(items, event_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPurgeableEvents = `-- name: ListPurgeableEvents :many
+SELECT id
+FROM events
+WHERE deleted_at IS NOT NULL
+  AND status <> 'taken_down'
+  AND (deleted_at < $1::timestamptz
+       OR (retention_reminded_at IS NOT NULL
+           AND retention_reminded_at < $2::timestamptz
+           AND retention_from < $3::timestamptz))
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = events.id AND r.status IN ('open', 'reviewing'))
+ORDER BY deleted_at
+LIMIT $4::int
+`
+
+type ListPurgeableEventsParams struct {
+	DeletedBefore  time.Time `json:"deleted_before"`
+	RemindedBefore time.Time `json:"reminded_before"`
+	EndedBefore    time.Time `json:"ended_before"`
+	Lim            int32     `json:"lim"`
+}
+
+// Soft-deleted events due for hard delete: deleted before deleted_before (the normal grace for an
+// owner's delete), or expired by retention (reminded before reminded_before and retention_from
+// before ended_before; those skip the grace because the owner already had the full window).
+// Taken-down events are kept as moderation evidence, and so is any event with an open report
+// (deleting the event cascades its reports). The caller deletes rows with PurgeEvents, then files.
+func (q *Queries) ListPurgeableEvents(ctx context.Context, arg ListPurgeableEventsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listPurgeableEvents,
+		arg.DeletedBefore,
+		arg.RemindedBefore,
+		arg.EndedBefore,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockAnonDraftEvent = `-- name: LockAnonDraftEvent :one
 SELECT e.id
 FROM events e
@@ -798,6 +1079,29 @@ func (q *Queries) LockEventForRSVP(ctx context.Context, eventID uuid.UUID) (Lock
 	return i, err
 }
 
+const markRetentionReminderSent = `-- name: MarkRetentionReminderSent :execrows
+UPDATE events
+SET retention_reminder_sent_at = now()
+WHERE id = $1
+  AND retention_reminded_at = $2::timestamptz
+  AND retention_reminder_sent_at IS NULL
+`
+
+type MarkRetentionReminderSentParams struct {
+	EventID   uuid.UUID `json:"event_id"`
+	ClaimedAt time.Time `json:"claimed_at"`
+}
+
+// Stamps the claim as delivered. Zero rows: the claim was replaced or cleared by a re-date, or the
+// reminder was already marked; the caller sends nothing.
+func (q *Queries) MarkRetentionReminderSent(ctx context.Context, arg MarkRetentionReminderSentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markRetentionReminderSent, arg.EventID, arg.ClaimedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const publishEvent = `-- name: PublishEvent :one
 UPDATE events e
 SET status = 'published',
@@ -833,18 +1137,16 @@ func (q *Queries) PublishEvent(ctx context.Context, arg PublishEventParams) (Pub
 	return i, err
 }
 
-const purgeDeletedEvents = `-- name: PurgeDeletedEvents :execrows
-DELETE FROM events
-WHERE id IN (
-    SELECT x.id FROM events x
-    WHERE x.deleted_at < now() - interval '30 days' AND x.status <> 'taken_down'
-    LIMIT 500
-)
+const purgeEvents = `-- name: PurgeEvents :execrows
+DELETE FROM events e
+WHERE e.id = ANY($1::uuid[]) AND e.deleted_at IS NOT NULL AND e.status <> 'taken_down'
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'))
 `
 
-// Taken-down events are kept as moderation evidence.
-func (q *Queries) PurgeDeletedEvents(ctx context.Context) (int64, error) {
-	result, err := q.db.Exec(ctx, purgeDeletedEvents)
+// Hard-deletes listed soft-deleted events; child rows cascade. Re-checks the state ListPurgeableEvents
+// saw, including that no report is open.
+func (q *Queries) PurgeEvents(ctx context.Context, eventIds []uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeEvents, eventIds)
 	if err != nil {
 		return 0, err
 	}
@@ -1351,6 +1653,26 @@ func (q *Queries) TakeDownEventsByOwner(ctx context.Context, ownerID uuid.UUID) 
 	return items, nil
 }
 
+const unmarkRetentionReminderSent = `-- name: UnmarkRetentionReminderSent :execrows
+UPDATE events
+SET retention_reminder_sent_at = NULL
+WHERE id = $1 AND retention_reminded_at = $2::timestamptz
+`
+
+type UnmarkRetentionReminderSentParams struct {
+	EventID   uuid.UUID `json:"event_id"`
+	ClaimedAt time.Time `json:"claimed_at"`
+}
+
+// Undoes MarkRetentionReminderSent after the send failed, so the job's retry can send again.
+func (q *Queries) UnmarkRetentionReminderSent(ctx context.Context, arg UnmarkRetentionReminderSentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, unmarkRetentionReminderSent, arg.EventID, arg.ClaimedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const unpublishEvent = `-- name: UnpublishEvent :one
 UPDATE events e
 SET status = 'hidden', version = e.version + 1, updated_at = now()
@@ -1385,22 +1707,36 @@ UPDATE events e
 SET content = coalesce($1, e.content),
     title = CASE WHEN $1::jsonb IS NULL THEN e.title ELSE $2::text END,
     starts_at = CASE WHEN $1::jsonb IS NULL THEN e.starts_at ELSE $3::timestamptz END,
-    overrides = coalesce($4, e.overrides),
-    template_id = coalesce($5, e.template_id),
-    template_version = coalesce($6, e.template_version),
+    ends_at = CASE WHEN $1::jsonb IS NULL THEN e.ends_at ELSE $4::timestamptz END,
+    retention_from = CASE
+        WHEN $1::jsonb IS NULL
+          OR $4::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_from
+        WHEN $4::timestamptz IS NOT NULL THEN greatest($4::timestamptz, now())
+    END,
+    retention_reminded_at = CASE
+        WHEN $1::jsonb IS NULL
+          OR $4::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_reminded_at
+    END,
+    retention_reminder_sent_at = CASE
+        WHEN $1::jsonb IS NULL
+          OR $4::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_reminder_sent_at
+    END,
+    overrides = coalesce($5, e.overrides),
+    template_id = coalesce($6, e.template_id),
+    template_version = coalesce($7, e.template_version),
     version = e.version + 1,
     updated_at = now()
-WHERE e.id = $7
+WHERE e.id = $8
   AND e.deleted_at IS NULL
-  AND e.version = $8
+  AND e.version = $9
   AND e.owner_id IS NULL
   AND EXISTS (SELECT 1 FROM anon_drafts a
-              WHERE a.event_id = e.id AND a.cookie_hash = $9 AND a.expires_at > now())
-  AND (($5::uuid IS NULL AND $6::int IS NULL)
+              WHERE a.event_id = e.id AND a.cookie_hash = $10 AND a.expires_at > now())
+  AND (($6::uuid IS NULL AND $7::int IS NULL)
        OR EXISTS (SELECT 1 FROM templates t
                   JOIN template_versions tv ON tv.template_id = t.id
-                  WHERE t.id = coalesce($5::uuid, e.template_id)
-                    AND tv.version = coalesce($6::int, e.template_version)
+                  WHERE t.id = coalesce($6::uuid, e.template_id)
+                    AND tv.version = coalesce($7::int, e.template_version)
                     AND tv.published_at IS NOT NULL
                     AND t.status = 'published'
                     AND NOT t.is_premium))
@@ -1411,6 +1747,7 @@ type UpdateAnonDraftContentParams struct {
 	Content         []byte     `json:"content"`
 	Title           string     `json:"title"`
 	StartsAt        *time.Time `json:"starts_at"`
+	EndsAt          *time.Time `json:"ends_at"`
 	Overrides       []byte     `json:"overrides"`
 	TemplateID      *uuid.UUID `json:"template_id"`
 	TemplateVersion *int32     `json:"template_version"`
@@ -1424,12 +1761,13 @@ type UpdateAnonDraftContentRow struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Same template-pin rule as UpdateEventContent.
+// Same derived-field and template-pin rules as UpdateEventContent.
 func (q *Queries) UpdateAnonDraftContent(ctx context.Context, arg UpdateAnonDraftContentParams) (UpdateAnonDraftContentRow, error) {
 	row := q.db.QueryRow(ctx, updateAnonDraftContent,
 		arg.Content,
 		arg.Title,
 		arg.StartsAt,
+		arg.EndsAt,
 		arg.Overrides,
 		arg.TemplateID,
 		arg.TemplateVersion,
@@ -1447,21 +1785,35 @@ UPDATE events e
 SET content = coalesce($1, e.content),
     title = CASE WHEN $1::jsonb IS NULL THEN e.title ELSE $2::text END,
     starts_at = CASE WHEN $1::jsonb IS NULL THEN e.starts_at ELSE $3::timestamptz END,
-    overrides = coalesce($4, e.overrides),
-    template_id = coalesce($5, e.template_id),
-    template_version = coalesce($6, e.template_version),
+    ends_at = CASE WHEN $1::jsonb IS NULL THEN e.ends_at ELSE $4::timestamptz END,
+    retention_from = CASE
+        WHEN $1::jsonb IS NULL
+          OR $4::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_from
+        WHEN $4::timestamptz IS NOT NULL THEN greatest($4::timestamptz, now())
+    END,
+    retention_reminded_at = CASE
+        WHEN $1::jsonb IS NULL
+          OR $4::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_reminded_at
+    END,
+    retention_reminder_sent_at = CASE
+        WHEN $1::jsonb IS NULL
+          OR $4::timestamptz IS NOT DISTINCT FROM e.ends_at THEN e.retention_reminder_sent_at
+    END,
+    overrides = coalesce($5, e.overrides),
+    template_id = coalesce($6, e.template_id),
+    template_version = coalesce($7, e.template_version),
     version = e.version + 1,
     updated_at = now()
-WHERE e.id = $7
+WHERE e.id = $8
   AND e.deleted_at IS NULL
-  AND e.version = $8
+  AND e.version = $9
   AND e.status <> 'taken_down'
-  AND event_role($7, $9::uuid) IN ('owner', 'editor')
-  AND (($5::uuid IS NULL AND $6::int IS NULL)
+  AND event_role($8, $10::uuid) IN ('owner', 'editor')
+  AND (($6::uuid IS NULL AND $7::int IS NULL)
        OR EXISTS (SELECT 1 FROM templates t
                   JOIN template_versions tv ON tv.template_id = t.id
-                  WHERE t.id = coalesce($5::uuid, e.template_id)
-                    AND tv.version = coalesce($6::int, e.template_version)
+                  WHERE t.id = coalesce($6::uuid, e.template_id)
+                    AND tv.version = coalesce($7::int, e.template_version)
                     AND tv.published_at IS NOT NULL
                     AND t.status = 'published'
                     AND NOT t.is_premium))
@@ -1472,6 +1824,7 @@ type UpdateEventContentParams struct {
 	Content         []byte     `json:"content"`
 	Title           string     `json:"title"`
 	StartsAt        *time.Time `json:"starts_at"`
+	EndsAt          *time.Time `json:"ends_at"`
 	Overrides       []byte     `json:"overrides"`
 	TemplateID      *uuid.UUID `json:"template_id"`
 	TemplateVersion *int32     `json:"template_version"`
@@ -1486,7 +1839,9 @@ type UpdateEventContentRow struct {
 }
 
 // Editor save for owners and editors. NULL content/overrides/template leave that part unchanged;
-// title and starts_at are derived from content and only change with it. A template change must
+// title, starts_at and ends_at are derived from content and only change with it. Moving ends_at
+// restarts retention from greatest(new end, now()) (so back-dating never shortens an event's life)
+// and clears the reminder so the new end gets its own. A template change must
 // resolve (with the unchanged half) to a selectable pin; leaving both NULL keeps an existing pin even
 // if that template has since become premium or retired. An unselectable pin updates no row.
 func (q *Queries) UpdateEventContent(ctx context.Context, arg UpdateEventContentParams) (UpdateEventContentRow, error) {
@@ -1494,6 +1849,7 @@ func (q *Queries) UpdateEventContent(ctx context.Context, arg UpdateEventContent
 		arg.Content,
 		arg.Title,
 		arg.StartsAt,
+		arg.EndsAt,
 		arg.Overrides,
 		arg.TemplateID,
 		arg.TemplateVersion,

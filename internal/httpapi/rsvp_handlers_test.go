@@ -54,7 +54,7 @@ func (f *publicEventFixture) setRSVPContent(t *testing.T, capacity *int, deadlin
 		t.Fatalf("validate content: %v", err)
 	}
 	row, err := f.s.q.UpdateEventContent(ctx, store.UpdateEventContentParams{
-		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt,
+		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		EventID: f.eventID, Version: version, UserID: f.ownerID,
 	})
 	if err != nil {
@@ -638,7 +638,7 @@ func TestHandleExportRSVPsCSV_HeaderLabelEscaping(t *testing.T) {
 		t.Fatalf("validate content: %v", err)
 	}
 	if _, err := f.s.q.UpdateEventContent(ctx, store.UpdateEventContentParams{
-		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt,
+		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		EventID: f.eventID, Version: 4, UserID: f.ownerID,
 	}); err != nil {
 		t.Fatalf("update content: %v", err)

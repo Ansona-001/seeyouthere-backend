@@ -65,6 +65,19 @@ type Saved struct {
 	Photos   *GuestPhotosBlock
 }
 
+// EffectiveEnd is the instant the event is over for retention purposes: nil
+// when the content has no datetime, else EndsAt when it is not before
+// StartsAt, else StartsAt. Saved.EndsAt keeps its API meaning unchanged.
+func (s Saved) EffectiveEnd() *time.Time {
+	if s.StartsAt == nil {
+		return nil
+	}
+	if s.EndsAt != nil && !s.EndsAt.Before(*s.StartsAt) {
+		return s.EndsAt
+	}
+	return s.StartsAt
+}
+
 // RSVPFieldRef enables one occasion field within an event's rsvp block.
 type RSVPFieldRef struct {
 	Key      string `json:"key"`

@@ -54,6 +54,12 @@ type Event struct {
 	Version         int32      `json:"version"`
 	NotifyRsvps     bool       `json:"notify_rsvps"`
 	RsvpNotifiedAt  *time.Time `json:"rsvp_notified_at"`
+	// Effective end: the datetime block end, else its start. NULL exactly when starts_at is NULL.
+	EndsAt *time.Time `json:"ends_at"`
+	// Retention anchor: greatest(ends_at, now()) when ends_at was set or last changed. NULL exactly when ends_at is NULL.
+	RetentionFrom           *time.Time `json:"retention_from"`
+	RetentionRemindedAt     *time.Time `json:"retention_reminded_at"`
+	RetentionReminderSentAt *time.Time `json:"retention_reminder_sent_at"`
 }
 
 type EventMember struct {

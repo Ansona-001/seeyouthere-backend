@@ -151,7 +151,7 @@ func newPublicEventFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, 
 		t.Fatalf("validate content: %v", err)
 	}
 	if _, err := q.UpdateEventContent(ctx, store.UpdateEventContentParams{
-		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt,
+		Content: saved.JSON, Title: saved.Title, StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		EventID: event.ID, Version: 1, UserID: ownerID,
 	}); err != nil {
 		t.Fatalf("update content: %v", err)

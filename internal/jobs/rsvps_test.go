@@ -148,7 +148,7 @@ func newRSVPConfirmationFixture(t *testing.T, ctx context.Context) rsvpConfirmat
 	eventID := uuid.Must(uuid.NewV7())
 	event, err := q.CreateEvent(ctx, store.CreateEventParams{
 		ID: eventID, OwnerID: &ownerID, OccasionSlug: "birthday", Title: saved.Title,
-		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt,
+		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		TemplateID: tmpl.ID, TemplateVersion: tmpl.Version,
 	})
 	if err != nil {

@@ -1,6 +1,7 @@
 package media
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -215,6 +216,24 @@ func (s *Store) DeleteMedia(eventID, mediaID uuid.UUID) error {
 	for _, area := range []Area{AreaPublic, AreaPending, AreaQuarantine} {
 		if err := os.RemoveAll(s.areaDir(area, eventID, mediaID)); err != nil {
 			return fmt.Errorf("media: delete %s: %w", area, err)
+		}
+	}
+	return nil
+}
+
+// DeleteEventFiles removes every media file of an event from public/,
+// pending/ and quarantine/. Missing directories are not an error, so it is
+// idempotent. It must run before the event row is deleted: once the row is
+// gone nothing else knows the event id to clean up (Reconcile is only the
+// safety net). A future object-store version lists the event's prefix and
+// batch-deletes it instead.
+func (s *Store) DeleteEventFiles(ctx context.Context, eventID uuid.UUID) error {
+	for _, area := range []Area{AreaPublic, AreaPending, AreaQuarantine} {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("media: delete event files %s: %w", eventID, err)
+		}
+		if err := os.RemoveAll(filepath.Join(s.root, string(area), eventID.String())); err != nil {
+			return fmt.Errorf("media: delete event files %s: %w", eventID, err)
 		}
 	}
 	return nil

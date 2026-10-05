@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func heroBlock(id, title string) map[string]any {
@@ -413,5 +414,34 @@ func TestBuildInitialContent_RequiredAnswerMissing(t *testing.T) {
 	occ := sampleOccasion(t)
 	if _, err := BuildInitialContent(occ, map[string]string{"name_1": "Ada"}); !hasIssueCode(err, "required") {
 		t.Fatalf("expected required, got %v", err)
+	}
+}
+
+func TestSaved_EffectiveEnd(t *testing.T) {
+	start := time.Date(2027, 6, 1, 18, 0, 0, 0, time.UTC)
+	end := start.Add(4 * time.Hour)
+	before := start.Add(-time.Hour)
+	tests := []struct {
+		name  string
+		saved Saved
+		want  *time.Time
+	}{
+		{"no datetime", Saved{}, nil},
+		{"no datetime but stray end", Saved{EndsAt: &end}, nil},
+		{"start only", Saved{StartsAt: &start}, &start},
+		{"start and end", Saved{StartsAt: &start, EndsAt: &end}, &end},
+		{"end equals start", Saved{StartsAt: &start, EndsAt: &start}, &start},
+		{"end before start", Saved{StartsAt: &start, EndsAt: &before}, &start},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.saved.EffectiveEnd()
+			switch {
+			case tt.want == nil && got != nil:
+				t.Fatalf("EffectiveEnd = %v, want nil", got)
+			case tt.want != nil && (got == nil || !got.Equal(*tt.want)):
+				t.Fatalf("EffectiveEnd = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
