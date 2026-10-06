@@ -186,22 +186,13 @@ func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) err
 	var totalPurged int64
 	var purgeFailures int
 	for i := 0; i < eventPurgeBatchesPerRun; i++ {
-		ids, err := w.Queries.ListPurgeableEvents(ctx, store.ListPurgeableEventsParams{
-			DeletedBefore:  now.Add(-deletedEventGrace),
-			RemindedBefore: now.Add(-retentionReminderLead),
-			EndedBefore:    now.Add(-retentionAfterEnd),
-			Lim:            eventPurgeBatchSize,
-		})
-		if err != nil {
-			return fmt.Errorf("list purgeable events: %w", err)
-		}
-		purged, failed, err := w.purgeWithFiles(ctx, ids, w.Queries.PurgeEvents)
+		listed, purged, failed, err := w.purgeEventBatch(ctx, now)
 		totalPurged += purged
 		purgeFailures += failed
 		if err != nil {
 			return fmt.Errorf("purge events: %w", err)
 		}
-		if failed > 0 || len(ids) < eventPurgeBatchSize {
+		if failed > 0 || listed < eventPurgeBatchSize {
 			break
 		}
 	}

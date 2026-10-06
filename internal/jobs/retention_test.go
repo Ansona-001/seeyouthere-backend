@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 
@@ -29,6 +31,9 @@ type fakeDeleter struct {
 	failFor    map[uuid.UUID]bool
 	calls      []uuid.UUID
 	rowPresent map[uuid.UUID]bool
+	// onDelete, when set, runs for every DeleteEventFiles call, while the
+	// purge transaction is open.
+	onDelete func(uuid.UUID)
 }
 
 func (d *fakeDeleter) DeleteMedia(uuid.UUID, uuid.UUID) error { return nil }
@@ -45,6 +50,9 @@ func (d *fakeDeleter) DeleteEventFiles(ctx context.Context, eventID uuid.UUID) e
 		d.rowPresent = map[uuid.UUID]bool{}
 	}
 	d.rowPresent[eventID] = exists
+	if d.onDelete != nil {
+		d.onDelete(eventID)
+	}
 	if d.failFor[eventID] {
 		return errors.New("simulated file delete failure")
 	}
@@ -131,7 +139,7 @@ func (f retentionFixture) newEvent(t *testing.T, e retentionEvent) uuid.UUID {
 		if _, err := f.pool.Exec(bg, "DELETE FROM events WHERE id = $1", id); err != nil {
 			t.Logf("cleanup event %s: %v", id, err)
 		}
-		if _, err := f.pool.Exec(bg, "DELETE FROM river_job WHERE kind = 'retention_reminder' AND args->>'event_id' = $1", id.String()); err != nil {
+		if _, err := f.pool.Exec(bg, "DELETE FROM river_job WHERE kind IN ('retention_reminder', 'media_visibility') AND args->>'event_id' = $1", id.String()); err != nil {
 			t.Logf("cleanup jobs %s: %v", id, err)
 		}
 	})
@@ -392,7 +400,7 @@ func TestPurgeWithFiles(t *testing.T) {
 
 	listed, err := f.q.ListPurgeableEvents(ctx, store.ListPurgeableEventsParams{
 		DeletedBefore: now.Add(-deletedEventGrace), RemindedBefore: now.Add(-retentionReminderLead),
-		EndedBefore: now.Add(-retentionAfterEnd), Lim: 1000,
+		FallbackBefore: now.Add(-retentionReminderFallback), EndedBefore: now.Add(-retentionAfterEnd), Lim: 1000,
 	})
 	if err != nil {
 		t.Fatalf("ListPurgeableEvents: %v", err)
@@ -520,30 +528,36 @@ func TestRetentionReminderWorker(t *testing.T) {
 	t.Cleanup(func() { rdb.Del(context.Background(), globalKey) })
 	owner, ownerEmail := f.newUser(t)
 
-	endsAt := time.Date(2026, 1, 10, 23, 30, 0, 0, time.UTC)
-	// reminded 26 days after the end: deletion is ended+30d.
-	remindedOnTime := endsAt.Add(26 * day)
-	// reminded 29 days after the end: deletion is reminded+3d.
-	remindedLate := endsAt.Add(29 * day)
+	// An event that ended long ago: its end+30d is in the past, so the
+	// stated deletion date is the clamp, retentionReminderLead from now.
+	endsAt := time.Now().Add(-50 * day)
+	remindedOnTime := time.Now().Add(-3 * day)
+	remindedLate := remindedOnTime.Add(day)
 	sentAt := remindedOnTime.Add(time.Minute)
+	// An event that ended 10 days ago is deleted on end+30d, which is later
+	// than the clamp.
+	recentEnd := time.Now().Add(-10 * day)
 
 	tests := []struct {
 		name     string
 		tz       string
 		title    string
+		endsAt   time.Time // default endsAt
 		reminded *time.Time
 		sent     *time.Time
 		stamp    *time.Time // claim stamp in the job args; default = reminded
 		mutate   string     // optional SQL run with the event id as $1
 		wantSend bool
-		wantDate string
+		// wantAt is the expected deletion date; zero means the clamp,
+		// now+retentionReminderLead, evaluated after the send.
+		wantAt time.Time
 	}{
-		{name: "event timezone", tz: "Pacific/Auckland", reminded: &remindedOnTime, wantSend: true, wantDate: "Tuesday, 10 February 2026"},
-		{name: "no timezone falls back to UTC", tz: "", reminded: &remindedOnTime, wantSend: true, wantDate: "Monday, 9 February 2026"},
-		{name: "unknown timezone falls back to UTC", tz: "Not/AZone", reminded: &remindedOnTime, wantSend: true, wantDate: "Monday, 9 February 2026"},
-		{name: "Local falls back to UTC", tz: "Local", reminded: &remindedOnTime, wantSend: true, wantDate: "Monday, 9 February 2026"},
-		{name: "late reminder pushes the date", tz: "UTC", reminded: &remindedLate, wantSend: true, wantDate: "Wednesday, 11 February 2026"},
-		{name: "CR and LF stripped from title", tz: "UTC", title: "Party\r\nBcc: evil@example.invalid", reminded: &remindedOnTime, wantSend: true, wantDate: "Monday, 9 February 2026"},
+		{name: "event timezone", tz: "Pacific/Auckland", reminded: &remindedOnTime, wantSend: true},
+		{name: "no timezone falls back to UTC", tz: "", reminded: &remindedOnTime, wantSend: true},
+		{name: "unknown timezone falls back to UTC", tz: "Not/AZone", reminded: &remindedOnTime, wantSend: true},
+		{name: "Local falls back to UTC", tz: "Local", reminded: &remindedOnTime, wantSend: true},
+		{name: "date is end plus 30 days when that is later", tz: "UTC", endsAt: recentEnd, reminded: &remindedOnTime, wantSend: true, wantAt: recentEnd.Add(retentionAfterEnd)},
+		{name: "CR and LF stripped from title", tz: "UTC", title: "Party\r\nBcc: evil@example.invalid", reminded: &remindedOnTime, wantSend: true},
 		{name: "not reminded", tz: "UTC", reminded: nil},
 		{name: "stale claim stamp", tz: "UTC", reminded: &remindedOnTime, stamp: &remindedLate},
 		{name: "already sent", tz: "UTC", reminded: &remindedOnTime, sent: &sentAt},
@@ -561,7 +575,11 @@ func TestRetentionReminderWorker(t *testing.T) {
 			if tt.name == "owner deleted" {
 				caseOwner, _ = f.newUser(t)
 			}
-			id := f.newEvent(t, retentionEvent{owner: &caseOwner, tz: tt.tz, title: tt.title, endsAt: endsAt})
+			caseEnd := endsAt
+			if !tt.endsAt.IsZero() {
+				caseEnd = tt.endsAt
+			}
+			id := f.newEvent(t, retentionEvent{owner: &caseOwner, tz: tt.tz, title: tt.title, endsAt: caseEnd})
 			args := RetentionReminderArgs{EventID: id}
 			if tt.reminded != nil {
 				f.remind(t, id, *tt.reminded, tt.sent)
@@ -577,9 +595,11 @@ func TestRetentionReminderWorker(t *testing.T) {
 			sender := &recordingSender{}
 			w := &RetentionReminderWorker{Queries: f.q, Sender: sender, Limiter: limiter, SiteURL: "https://seeyouthere.at"}
 			t.Cleanup(func() { rdb.Del(ctx, "rl:retention:owner:"+caseOwner.String()) })
+			before := time.Now()
 			if err := w.Work(ctx, &river.Job[RetentionReminderArgs]{Args: args}); err != nil {
 				t.Fatalf("Work: %v", err)
 			}
+			after := time.Now()
 			msgs := sender.messages()
 			if !tt.wantSend {
 				if len(msgs) != 0 {
@@ -594,8 +614,27 @@ func TestRetentionReminderWorker(t *testing.T) {
 			if m.To != ownerEmail {
 				t.Errorf("To = %q, want owner %q", m.To, ownerEmail)
 			}
-			if !strings.Contains(m.Text, "on or after "+tt.wantDate+".") {
-				t.Errorf("text = %q, want it to contain %q", m.Text, "on or after "+tt.wantDate+".")
+			// The clamp is evaluated inside Work, so accept the date computed
+			// from either side of the call: a midnight boundary can't flake.
+			wantAts := []time.Time{tt.wantAt}
+			if tt.wantAt.IsZero() {
+				wantAts = []time.Time{before.Add(retentionReminderLead), after.Add(retentionReminderLead)}
+			}
+			loc := time.UTC
+			if tt.tz == "Pacific/Auckland" {
+				loc, _ = time.LoadLocation(tt.tz)
+			}
+			var wantDates []string
+			found := false
+			for _, at := range wantAts {
+				d := at.In(loc).Format("Monday, 2 January 2006")
+				wantDates = append(wantDates, d)
+				if strings.Contains(m.Text, "on or after "+d+".") {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("text = %q, want it to contain a date from %q after %q", m.Text, wantDates, "on or after ")
 			}
 			if strings.ContainsAny(m.Subject, "\r\n") {
 				t.Errorf("subject %q contains CR/LF", m.Subject)
@@ -878,5 +917,243 @@ func TestClaimAnonDrafts_RetentionFrom(t *testing.T) {
 	}
 	if s := f.state(t, futureDraft); s.retentionFrom == nil || !s.retentionFrom.Equal(futureBefore) {
 		t.Errorf("future draft retention_from = %v, want unchanged %v", s.retentionFrom, futureBefore)
+	}
+}
+
+// A reminder delivered late in the fallback window must not let the event be
+// expired or purged the next day: the owner is promised retentionReminderLead
+// from delivery. A reminder that was never delivered still expires through
+// the fallback.
+func TestRetention_LateDeliveredReminderKeepsEvent(t *testing.T) {
+	f := newRetentionFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+	owner, _ := f.newUser(t)
+	ended := now.Add(-40 * day)
+	claimed := now.Add(-10*day - time.Minute)
+	sent := now.Add(-day) // day 9 after the claim
+
+	deliveredLate := f.newEvent(t, retentionEvent{owner: &owner, endsAt: ended})
+	f.remind(t, deliveredLate, claimed, &sent)
+	neverSent := f.newEvent(t, retentionEvent{owner: &owner, endsAt: ended})
+	f.remind(t, neverSent, claimed, nil)
+
+	ids, err := f.worker.expireEndedEvents(ctx, now)
+	if err != nil {
+		t.Fatalf("expireEndedEvents: %v", err)
+	}
+	if slices.Contains(ids, deliveredLate) {
+		t.Error("reminder delivered 1d ago: event expired, want kept")
+	}
+	if !slices.Contains(ids, neverSent) {
+		t.Error("reminder never delivered, claimed 10d ago: event kept, want expired via the fallback")
+	}
+
+	// Same rule for the purge of already soft-deleted events.
+	f.exec(t, "UPDATE events SET deleted_at = now() WHERE id = ANY($1)", []uuid.UUID{deliveredLate, neverSent})
+	listed, err := f.q.ListPurgeableEvents(ctx, store.ListPurgeableEventsParams{
+		DeletedBefore: now.Add(-deletedEventGrace), RemindedBefore: now.Add(-retentionReminderLead),
+		FallbackBefore: now.Add(-retentionReminderFallback), EndedBefore: now.Add(-retentionAfterEnd), Lim: 1000,
+	})
+	if err != nil {
+		t.Fatalf("ListPurgeableEvents: %v", err)
+	}
+	if slices.Contains(listed, deliveredLate) {
+		t.Error("reminder delivered 1d ago: event purgeable, want kept")
+	}
+	if !slices.Contains(listed, neverSent) {
+		t.Error("reminder never delivered, claimed 10d ago: event not purgeable, want purgeable")
+	}
+}
+
+func TestExpireEndedEvents_EnqueuesMediaVisibility(t *testing.T) {
+	f := newRetentionFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+	owner, _ := f.newUser(t)
+	sent := now.Add(-4 * day)
+
+	due := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-31 * day)})
+	f.remind(t, due, now.Add(-4*day), &sent)
+	notDue := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-31 * day)})
+	f.remind(t, notDue, now.Add(-2*day), nil)
+	t.Cleanup(func() {
+		f.pool.Exec(context.Background(), "DELETE FROM river_job WHERE kind = 'media_visibility' AND args->>'event_id' = ANY($1)",
+			[]string{due.String(), notDue.String()})
+	})
+
+	ids, err := f.worker.expireEndedEvents(ctx, now)
+	if err != nil {
+		t.Fatalf("expireEndedEvents: %v", err)
+	}
+	if !slices.Contains(ids, due) || slices.Contains(ids, notDue) {
+		t.Fatalf("expired = %v, want it to contain only the due event %s", ids, due)
+	}
+	count := func(id uuid.UUID) int {
+		var n int
+		if err := f.pool.QueryRow(ctx, "SELECT count(*) FROM river_job WHERE kind = 'media_visibility' AND args->>'event_id' = $1", id.String()).Scan(&n); err != nil {
+			t.Fatalf("count jobs: %v", err)
+		}
+		return n
+	}
+	if n := count(due); n != 1 {
+		t.Errorf("media_visibility jobs for expired event = %d, want 1", n)
+	}
+	if n := count(notDue); n != 0 {
+		t.Errorf("media_visibility jobs for kept event = %d, want 0", n)
+	}
+}
+
+// While a purge batch removes an event's files, its row stays locked: a
+// report filed in that window must wait instead of slipping in, and once the
+// event is gone it fails its foreign key.
+func TestPurgeEventBatch_HoldsRowLocks(t *testing.T) {
+	f := newRetentionFixture(t)
+	ctx := context.Background()
+	// A fixed clock far in the past: only this test's row (deleted on
+	// 2000-01-01, still-future end) is purgeable at it, so purgeEventBatch
+	// can't touch unrelated rows in a dev database. No real row can match the
+	// retention branch either: that needs a reminder stamped before 2000-01-22.
+	now := time.Date(2000, 2, 1, 0, 0, 0, 0, time.UTC)
+	owner, _ := f.newUser(t)
+
+	id := f.newEvent(t, retentionEvent{owner: &owner, endsAt: time.Now().Add(30 * day)})
+	f.exec(t, "UPDATE events SET deleted_at = $2 WHERE id = $1", id, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	insertReport := func() error {
+		return pgx.BeginTxFunc(ctx, f.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '300ms'"); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, "INSERT INTO reports (id, event_id, reporter_ip_hash, reason, status) VALUES ($1, $2, $3, 'spam', 'open')",
+				uuid.Must(uuid.NewV7()), id, []byte(id.String()))
+			return err
+		})
+	}
+	var duringPurge error
+	f.deleter.onDelete = func(got uuid.UUID) {
+		if got == id {
+			duringPurge = insertReport()
+		}
+	}
+
+	if _, _, failed, err := f.worker.purgeEventBatch(ctx, now); err != nil || failed != 0 {
+		t.Fatalf("purgeEventBatch: failed = %d, err = %v", failed, err)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(duringPurge, &pgErr) || pgErr.Code != "55P03" {
+		t.Errorf("report insert during purge: err = %v, want lock_not_available (55P03)", duringPurge)
+	}
+	if f.eventExists(t, id) {
+		t.Error("purgeable event still exists after the batch")
+	}
+	if err := insertReport(); !errors.As(err, &pgErr) || pgErr.Code != "23503" {
+		t.Errorf("report insert after purge: err = %v, want foreign_key_violation (23503)", err)
+	}
+}
+
+// A report committed after ListPurgeableEvents took its snapshot but before
+// the rows were locked is invisible to the list. FilterLockedPurgeable runs
+// under the locks with a fresh snapshot, so that event keeps its files and its
+// row while the rest of the batch is purged.
+func TestPurgeLocked_ReportAfterList(t *testing.T) {
+	f := newRetentionFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+	owner, _ := f.newUser(t)
+	future := now.Add(30 * day)
+
+	plain := f.newEvent(t, retentionEvent{owner: &owner, endsAt: future})
+	reported := f.newEvent(t, retentionEvent{owner: &owner, endsAt: future})
+	reviewing := f.newEvent(t, retentionEvent{owner: &owner, endsAt: future})
+	for _, id := range []uuid.UUID{plain, reported, reviewing} {
+		f.exec(t, "UPDATE events SET deleted_at = $2 WHERE id = $1", id, now.Add(-31*day))
+	}
+
+	// The stale list: all three purgeable, no report yet.
+	ids := []uuid.UUID{plain, reported, reviewing}
+	// Committed after the list, before the (simulated) lock.
+	f.report(t, reported, "open")
+	f.report(t, reviewing, "reviewing")
+
+	var purged int64
+	var failed int
+	err := pgx.BeginTxFunc(ctx, f.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		var err error
+		purged, failed, err = f.worker.purgeLocked(ctx, f.q.WithTx(tx), ids)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("purgeLocked: %v", err)
+	}
+	if purged != 1 || failed != 0 {
+		t.Errorf("purged = %d, failed = %d, want 1 and 0", purged, failed)
+	}
+	if len(f.deleter.calls) != 1 || f.deleter.calls[0] != plain {
+		t.Errorf("DeleteEventFiles calls = %v, want only the event without a report", f.deleter.calls)
+	}
+	for id, want := range map[uuid.UUID]bool{plain: false, reported: true, reviewing: true} {
+		if got := f.eventExists(t, id); got != want {
+			t.Errorf("event %s exists = %v, want %v", id, got, want)
+		}
+	}
+
+	t.Run("empty list does nothing", func(t *testing.T) {
+		before := len(f.deleter.calls)
+		purged, failed, err := f.worker.purgeLocked(ctx, f.q, nil)
+		if purged != 0 || failed != 0 || err != nil || len(f.deleter.calls) != before {
+			t.Errorf("purgeLocked(nil) = %d, %d, %v, want 0, 0, nil and no file deletes", purged, failed, err)
+		}
+	})
+}
+
+// MarkRetentionReminderSent stamps and returns the delivery time, and returns
+// no row once the event was deleted or taken down after the worker loaded it.
+func TestMarkRetentionReminderSent(t *testing.T) {
+	f := newRetentionFixture(t)
+	ctx := context.Background()
+	owner, _ := f.newUser(t)
+	claimed := time.Now().Add(-3 * day).Truncate(time.Microsecond)
+
+	newClaimed := func(t *testing.T) uuid.UUID {
+		t.Helper()
+		id := f.newEvent(t, retentionEvent{owner: &owner, endsAt: time.Now().Add(-28 * day)})
+		f.remind(t, id, claimed, nil)
+		return id
+	}
+	mark := func(id uuid.UUID) (time.Time, error) {
+		return f.q.MarkRetentionReminderSent(ctx, store.MarkRetentionReminderSentParams{EventID: id, ClaimedAt: claimed})
+	}
+
+	t.Run("live event returns the stored stamp once", func(t *testing.T) {
+		id := newClaimed(t)
+		got, err := mark(id)
+		if err != nil {
+			t.Fatalf("mark: %v", err)
+		}
+		if s := f.state(t, id); s.sent == nil || !s.sent.Equal(got) {
+			t.Errorf("returned %v, stored %v, want equal", got, s.sent)
+		}
+		if time.Since(got).Abs() > time.Minute {
+			t.Errorf("stamp %v, want about now", got)
+		}
+		if _, err := mark(id); !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("second mark err = %v, want pgx.ErrNoRows", err)
+		}
+	})
+	for name, sql := range map[string]string{
+		"soft-deleted event": "UPDATE events SET deleted_at = now() WHERE id = $1",
+		"taken-down event":   "UPDATE events SET status = 'taken_down', slug = 'rt-' || id::text WHERE id = $1",
+	} {
+		t.Run(name+" returns no row", func(t *testing.T) {
+			id := newClaimed(t)
+			f.exec(t, sql, id)
+			if _, err := mark(id); !errors.Is(err, pgx.ErrNoRows) {
+				t.Errorf("mark err = %v, want pgx.ErrNoRows", err)
+			}
+			if s := f.state(t, id); s.sent != nil {
+				t.Errorf("retention_reminder_sent_at = %v, want NULL", s.sent)
+			}
+		})
 	}
 }

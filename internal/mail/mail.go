@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -53,7 +54,8 @@ func (s *SMTPSender) Send(ctx context.Context, m Message) error {
 	}
 	to, err := mail.ParseAddress(m.To)
 	if err != nil {
-		return fmt.Errorf("parse to address: %w", err)
+		// The parser's error can quote the input, which is a user's address.
+		return errors.New("parse to address: invalid address")
 	}
 
 	var auth smtp.Auth
@@ -67,10 +69,23 @@ func (s *SMTPSender) Send(ctx context.Context, m Message) error {
 	go func() { done <- smtp.SendMail(s.Addr, auth, from.Address, []string{to.Address}, msg) }()
 	select {
 	case err := <-done:
-		return err
+		return scrubSMTPError(err)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// scrubSMTPError keeps recipient addresses out of errors: servers echo the
+// rejected address in their reply text (e.g. "550 5.1.1 <a@b.c>: Recipient
+// address rejected"), and River and the job workers log whatever Send
+// returns. Only the numeric reply code is kept for a server reply; other
+// errors (dial, TLS, auth) carry host names, not addresses.
+func scrubSMTPError(err error) error {
+	var tpe *textproto.Error
+	if errors.As(err, &tpe) {
+		return fmt.Errorf("smtp reply %d", tpe.Code)
+	}
+	return err
 }
 
 func build(from, to *mail.Address, m Message) []byte {

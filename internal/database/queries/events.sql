@@ -444,14 +444,18 @@ WHERE e.id = @event_id
   AND e.retention_from IS NOT NULL
   AND u.deleted_at IS NULL;
 
--- name: MarkRetentionReminderSent :execrows
--- Stamps the claim as delivered. Zero rows: the claim was replaced or cleared by a re-date, or the
--- reminder was already marked; the caller sends nothing.
+-- name: MarkRetentionReminderSent :one
+-- Stamps the claim as delivered and returns the stamp. No row: the claim was replaced or cleared by
+-- a re-date, the reminder was already marked, or the event was deleted or taken down since the
+-- caller loaded it; the caller sends nothing.
 UPDATE events
 SET retention_reminder_sent_at = now()
 WHERE id = @event_id
   AND retention_reminded_at = @claimed_at::timestamptz
-  AND retention_reminder_sent_at IS NULL;
+  AND retention_reminder_sent_at IS NULL
+  AND deleted_at IS NULL
+  AND status <> 'taken_down'
+RETURNING retention_reminder_sent_at::timestamptz AS sent_at;
 
 -- name: UnmarkRetentionReminderSent :execrows
 -- Undoes MarkRetentionReminderSent after the send failed, so the job's retry can send again.
@@ -461,10 +465,12 @@ WHERE id = @event_id AND retention_reminded_at = @claimed_at::timestamptz;
 
 -- name: ExpireEndedEvents :many
 -- Retention job: soft-deletes events whose retention_from is before ended_before and whose reminder
--- was delivered before reminded_before, or (undeliverable address) claimed before fallback_before
--- (events_retention_expire_idx; the redundant IS NOT NULL lets the planner prove that partial
--- index's predicate through the OR). Events with an open report are skipped. Slug release as in
--- SoftDeleteEvent; batch shape as in ClaimRetentionReminders.
+-- was delivered before reminded_before. Only an event whose reminder was never delivered
+-- (retention_reminder_sent_at NULL: undeliverable address, or the send is still retrying) falls back
+-- to the claim stamp, claimed before fallback_before; a delivered reminder always gets its full lead
+-- time, however late it was sent. Uses events_retention_expire_idx (the redundant IS NOT NULL lets
+-- the planner prove that partial index's predicate through the OR). Events with an open report are
+-- skipped. Slug release as in SoftDeleteEvent; batch shape as in ClaimRetentionReminders.
 UPDATE events e
 SET deleted_at = now(), updated_at = now(),
     slug = CASE WHEN e.published_at IS NULL AND e.status = 'draft' THEN NULL ELSE e.slug END
@@ -475,7 +481,7 @@ WHERE e.id = ANY(ARRAY(
       AND x.retention_from < @ended_before::timestamptz
       AND x.retention_reminded_at IS NOT NULL
       AND (x.retention_reminder_sent_at < @reminded_before::timestamptz
-           OR x.retention_reminded_at < @fallback_before::timestamptz)
+           OR (x.retention_reminder_sent_at IS NULL AND x.retention_reminded_at < @fallback_before::timestamptz))
       AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = x.id AND r.status IN ('open', 'reviewing'))
     ORDER BY x.retention_from
     LIMIT sqlc.arg(lim)::int
@@ -484,27 +490,50 @@ WHERE e.id = ANY(ARRAY(
   AND e.status <> 'taken_down'
   AND e.retention_from < @ended_before::timestamptz
   AND (e.retention_reminder_sent_at < @reminded_before::timestamptz
-       OR e.retention_reminded_at < @fallback_before::timestamptz)
+       OR (e.retention_reminder_sent_at IS NULL AND e.retention_reminded_at < @fallback_before::timestamptz))
   AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'))
 RETURNING e.id;
 
 -- name: ListPurgeableEvents :many
 -- Soft-deleted events due for hard delete: deleted before deleted_before (the normal grace for an
--- owner's delete), or expired by retention (reminded before reminded_before and retention_from
--- before ended_before; those skip the grace because the owner already had the full window).
+-- owner's delete), or expired by retention (reminder delivered before reminded_before, or never
+-- delivered but claimed before fallback_before, and retention_from before ended_before; those skip
+-- the grace because the owner already had the full window).
 -- Taken-down events are kept as moderation evidence, and so is any event with an open report
--- (deleting the event cascades its reports). The caller deletes rows with PurgeEvents, then files.
-SELECT id
-FROM events
-WHERE deleted_at IS NOT NULL
-  AND status <> 'taken_down'
-  AND (deleted_at < @deleted_before::timestamptz
-       OR (retention_reminded_at IS NOT NULL
-           AND retention_reminded_at < @reminded_before::timestamptz
-           AND retention_from < @ended_before::timestamptz))
-  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = events.id AND r.status IN ('open', 'reviewing'))
-ORDER BY deleted_at
-LIMIT sqlc.arg(lim)::int;
+-- (deleting the event cascades its reports).
+-- The batch is row-locked FOR UPDATE SKIP LOCKED: run this, the file deletion and PurgeEvents in ONE
+-- transaction. A report insert takes a KEY SHARE lock on the event through its foreign key, which
+-- conflicts with FOR UPDATE only, so a report filed meanwhile waits for the commit (and then fails
+-- its insert once the row is gone) instead of landing on an event whose files are already deleted.
+-- A row a report insert holds right now is skipped and picked up on the next run. Concurrent runs
+-- take disjoint batches. ANY(ARRAY(...)) as in ClaimRetentionReminders.
+SELECT e.id
+FROM events e
+WHERE e.id = ANY(ARRAY(
+    SELECT x.id FROM events x
+    WHERE x.deleted_at IS NOT NULL
+      AND x.status <> 'taken_down'
+      AND (x.deleted_at < @deleted_before::timestamptz
+           OR (x.retention_reminded_at IS NOT NULL
+               AND (x.retention_reminder_sent_at < @reminded_before::timestamptz
+                    OR (x.retention_reminder_sent_at IS NULL AND x.retention_reminded_at < @fallback_before::timestamptz))
+               AND x.retention_from < @ended_before::timestamptz))
+      AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = x.id AND r.status IN ('open', 'reviewing'))
+    ORDER BY x.deleted_at
+    LIMIT sqlc.arg(lim)::int
+    FOR UPDATE SKIP LOCKED))
+ORDER BY e.deleted_at;
+
+-- name: FilterLockedPurgeable :many
+-- Second half of the purge check, run in the same transaction right after ListPurgeableEvents: that
+-- query's open-report test used the statement snapshot, taken before its row locks, so a report
+-- committed in between would be missed. This statement takes a new snapshot while the locks are
+-- held; a report filed from now on waits on the row lock. Returns the listed ids that are still
+-- purgeable, mirroring the checks PurgeEvents makes; only these may have their files deleted.
+SELECT e.id
+FROM events e
+WHERE e.id = ANY(@event_ids::uuid[]) AND e.deleted_at IS NOT NULL AND e.status <> 'taken_down'
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'));
 
 -- name: PurgeEvents :execrows
 -- Hard-deletes listed soft-deleted events; child rows cascade. Re-checks the state ListPurgeableEvents

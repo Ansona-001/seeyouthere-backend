@@ -2,11 +2,15 @@ package mail
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
 	"net/mail"
+	"net/textproto"
 	"strings"
 	"testing"
 )
@@ -146,5 +150,49 @@ func TestSanitizeFilename(t *testing.T) {
 		if got := sanitizeFilename(in); got != want {
 			t.Errorf("sanitizeFilename(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestScrubSMTPError(t *testing.T) {
+	const addr = "guest@example.com"
+	dialErr := errors.New("dial tcp 127.0.0.1:587: connect: connection refused")
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"server reply", &textproto.Error{Code: 550, Msg: "5.1.1 <" + addr + ">: Recipient address rejected"}, "smtp reply 550"},
+		{"wrapped server reply", fmt.Errorf("rcpt: %w", &textproto.Error{Code: 452, Msg: addr + " mailbox full"}), "smtp reply 452"},
+		{"other error unchanged", dialErr, dialErr.Error()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := scrubSMTPError(tt.err)
+			if tt.err == nil {
+				if got != nil {
+					t.Fatalf("got %v, want nil", got)
+				}
+				return
+			}
+			if got.Error() != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+			if strings.Contains(got.Error(), addr) {
+				t.Errorf("error %q contains the recipient address", got)
+			}
+		})
+	}
+}
+
+func TestSend_InvalidRecipientDoesNotEchoInput(t *testing.T) {
+	s := &SMTPSender{Addr: "127.0.0.1:1", From: "See You There <hello@seeyouthere.at>"}
+	const bad = "secret person <guest@example.com"
+	err := s.Send(context.Background(), Message{To: bad})
+	if err == nil {
+		t.Fatal("want error for invalid recipient")
+	}
+	if strings.Contains(err.Error(), "guest") || strings.Contains(err.Error(), "secret") {
+		t.Errorf("error %q echoes the recipient input", err)
 	}
 }

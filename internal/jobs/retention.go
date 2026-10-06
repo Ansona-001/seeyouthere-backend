@@ -104,10 +104,17 @@ func (w *RetentionReminderWorker) Timeout(*river.Job[RetentionReminderArgs]) tim
 // mark again so the retry can deliver it. A send that ended on a context
 // error (timeout or shutdown) may still have been delivered by the SMTP
 // goroutine, so the mark and the quota stay and the job completes: a possibly
-// lost email is better than up to 12 duplicates. The same goes for a crash
-// between the mark and the send; the event then expires through the fallback
-// instead of being kept forever. Sending first and marking after would
-// double-send whenever the mark fails.
+// lost email is better than up to 12 duplicates. Sending first and marking
+// after would double-send whenever the mark fails.
+//
+// Trade-off: a marked claim counts as delivered, so the event expires
+// retentionReminderLead after the mark (once its 30 days are up), not through
+// the fallback, which only applies to claims that were never marked. A crash
+// between the mark and the send, a context error during the send, or a failed
+// unmark after a failed send can therefore delete the event that long after
+// the mark without the owner ever receiving the email. That window is bounded
+// and rare, and the alternative (leaving the claim unmarked) risks repeated
+// duplicate emails.
 //
 // A rate-limit denial snoozes the job instead of dropping it: River does not
 // count a snooze as an attempt, the claim stays, and the job runs again once
@@ -149,20 +156,31 @@ func (w *RetentionReminderWorker) Work(ctx context.Context, job *river.Job[Reten
 		w.Limiter.Uncount(ctx, ownerKey, 1)
 	}
 
-	marked, err := w.Queries.MarkRetentionReminderSent(ctx, store.MarkRetentionReminderSentParams{
+	// No row means the claim was replaced, already marked, or the event was
+	// deleted or taken down since it was loaded: send nothing.
+	sentAt, err := w.Queries.MarkRetentionReminderSent(ctx, store.MarkRetentionReminderSentParams{
 		EventID: args.EventID, ClaimedAt: args.ClaimedAt,
 	})
-	if err != nil || marked == 0 {
+	if err != nil {
 		refund(ctx)
-		if err != nil {
-			return fmt.Errorf("retention_reminder: mark sent: %w", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
 		}
-		return nil
+		return fmt.Errorf("retention_reminder: mark sent: %w", err)
 	}
 
 	deleteAt := row.RetentionFrom.Add(retentionAfterEnd)
-	if earliest := row.RetentionRemindedAt.Add(retentionReminderLead); earliest.After(deleteAt) {
-		deleteAt = earliest
+	// Never state a date in the past or less than the lead away: expiry waits
+	// retentionReminderLead after the claim and after the mark (sentAt, the
+	// stored stamp expiry compares against), so a delayed send (snooze,
+	// retries) must still promise that long.
+	for _, earliest := range []time.Time{
+		row.RetentionRemindedAt.Add(retentionReminderLead),
+		sentAt.Add(retentionReminderLead),
+	} {
+		if earliest.After(deleteAt) {
+			deleteAt = earliest
+		}
 	}
 	loc := time.UTC
 	if row.Timezone != "" && row.Timezone != "Local" {
@@ -185,7 +203,8 @@ func (w *RetentionReminderWorker) Work(ctx context.Context, job *river.Job[Reten
 	})
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			// The SMTP goroutine may still deliver after the context ends.
+			// The SMTP goroutine may still deliver after the context ends. The
+			// mark stays, so the event expires on the delivered path (see Work).
 			slog.WarnContext(ctx, "retention_reminder: send outcome unknown, not retrying", "event_id", args.EventID, "error", err)
 			return nil
 		}
@@ -197,6 +216,8 @@ func (w *RetentionReminderWorker) Work(ctx context.Context, job *river.Job[Reten
 		if _, uerr := w.Queries.UnmarkRetentionReminderSent(cleanup, store.UnmarkRetentionReminderSentParams{
 			EventID: args.EventID, ClaimedAt: args.ClaimedAt,
 		}); uerr != nil {
+			// The mark stays, so the retry sends nothing and the event expires
+			// retentionReminderLead after the mark without the email (see Work).
 			slog.ErrorContext(ctx, "retention_reminder: unmark after failed send", "event_id", args.EventID, "error", uerr)
 		}
 		refund(cleanup)
@@ -241,17 +262,86 @@ func (w *CleanupWorker) remindRetention(ctx context.Context, now time.Time) (int
 // expireEndedEvents soft-deletes events whose retention clock is 30+ days old
 // and whose reminder was delivered at least retentionReminderLead ago, or
 // claimed at least retentionReminderFallback ago without ever being delivered.
+// A media_visibility job per event is enqueued in the same transaction, so
+// the photos leave public view like they do for a host delete.
 func (w *CleanupWorker) expireEndedEvents(ctx context.Context, now time.Time) ([]uuid.UUID, error) {
-	ids, err := w.Queries.ExpireEndedEvents(ctx, store.ExpireEndedEventsParams{
-		EndedBefore:    now.Add(-retentionAfterEnd),
-		RemindedBefore: now.Add(-retentionReminderLead),
-		FallbackBefore: now.Add(-retentionReminderFallback),
-		Lim:            retentionBatchSize,
+	var ids []uuid.UUID
+	err := pgx.BeginTxFunc(ctx, w.Pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		var err error
+		ids, err = w.Queries.WithTx(tx).ExpireEndedEvents(ctx, store.ExpireEndedEventsParams{
+			EndedBefore:    now.Add(-retentionAfterEnd),
+			RemindedBefore: now.Add(-retentionReminderLead),
+			FallbackBefore: now.Add(-retentionReminderFallback),
+			Lim:            retentionBatchSize,
+		})
+		if err != nil {
+			return fmt.Errorf("expire: %w", err)
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		params := make([]river.InsertManyParams, len(ids))
+		for i, id := range ids {
+			params[i] = river.InsertManyParams{Args: MediaVisibilityArgs{EventID: id}}
+		}
+		if _, err := w.Jobs.InsertManyTx(ctx, tx, params); err != nil {
+			return fmt.Errorf("enqueue: %w", err)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("expire ended events: %w", err)
 	}
 	return ids, nil
+}
+
+// purgeEventBatch hard-deletes one batch of purgeable events. Listing, file
+// removal and row deletion share one transaction: ListPurgeableEvents locks
+// its rows, so a report filed against an event while its files are being
+// removed waits for the commit (and then fails its foreign key) instead of
+// racing the purge. Its open-report check predates those locks, so
+// FilterLockedPurgeable repeats it under the locks and only its result has
+// files deleted. An event whose files could not be removed is left out of
+// the row delete and retried by the next run. listed is the batch size, so
+// the caller knows whether more may be waiting.
+func (w *CleanupWorker) purgeEventBatch(ctx context.Context, now time.Time) (listed int, purged int64, failed int, err error) {
+	err = pgx.BeginTxFunc(ctx, w.Pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		q := w.Queries.WithTx(tx)
+		ids, err := q.ListPurgeableEvents(ctx, store.ListPurgeableEventsParams{
+			DeletedBefore:  now.Add(-deletedEventGrace),
+			RemindedBefore: now.Add(-retentionReminderLead),
+			FallbackBefore: now.Add(-retentionReminderFallback),
+			EndedBefore:    now.Add(-retentionAfterEnd),
+			Lim:            eventPurgeBatchSize,
+		})
+		if err != nil {
+			return fmt.Errorf("list purgeable events: %w", err)
+		}
+		listed = len(ids)
+		purged, failed, err = w.purgeLocked(ctx, q, ids)
+		return err
+	})
+	if err != nil {
+		// The transaction rolled back, so no row went away.
+		return 0, 0, failed, err
+	}
+	return listed, purged, failed, nil
+}
+
+// purgeLocked hard-deletes the listed events, which the caller's transaction
+// holds row locks on. The list's open-report check used a snapshot from before
+// the locks, so FilterLockedPurgeable repeats it under the locks and only the
+// events it returns have their files removed: a report committed between the
+// list and the locks keeps its event, files included.
+func (w *CleanupWorker) purgeLocked(ctx context.Context, q *store.Queries, listed []uuid.UUID) (purged int64, failed int, err error) {
+	if len(listed) == 0 {
+		return 0, 0, nil
+	}
+	ids, err := q.FilterLockedPurgeable(ctx, listed)
+	if err != nil {
+		return 0, 0, fmt.Errorf("filter locked purgeable events: %w", err)
+	}
+	return w.purgeWithFiles(ctx, ids, q.PurgeEvents)
 }
 
 // purgeWithFiles hard-deletes the given events, files first: each event's
@@ -278,6 +368,11 @@ func (w *CleanupWorker) purgeWithFiles(ctx context.Context, ids []uuid.UUID, del
 		purged, err = deleteRows(ctx, done)
 		if err != nil {
 			return 0, failed, fmt.Errorf("delete event rows: %w", err)
+		}
+		if purged < int64(len(done)) {
+			// Their files are gone but a row stayed (state changed after the
+			// listing): data loss to look at, not a retry.
+			slog.ErrorContext(ctx, "purge event files deleted but rows kept", "event_ids", done, "files_deleted", len(done), "rows_deleted", purged)
 		}
 	}
 	if ctxErr != nil {

@@ -340,7 +340,7 @@ WHERE e.id = ANY(ARRAY(
       AND x.retention_from < $1::timestamptz
       AND x.retention_reminded_at IS NOT NULL
       AND (x.retention_reminder_sent_at < $2::timestamptz
-           OR x.retention_reminded_at < $3::timestamptz)
+           OR (x.retention_reminder_sent_at IS NULL AND x.retention_reminded_at < $3::timestamptz))
       AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = x.id AND r.status IN ('open', 'reviewing'))
     ORDER BY x.retention_from
     LIMIT $4::int
@@ -349,7 +349,7 @@ WHERE e.id = ANY(ARRAY(
   AND e.status <> 'taken_down'
   AND e.retention_from < $1::timestamptz
   AND (e.retention_reminder_sent_at < $2::timestamptz
-       OR e.retention_reminded_at < $3::timestamptz)
+       OR (e.retention_reminder_sent_at IS NULL AND e.retention_reminded_at < $3::timestamptz))
   AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'))
 RETURNING e.id
 `
@@ -362,10 +362,12 @@ type ExpireEndedEventsParams struct {
 }
 
 // Retention job: soft-deletes events whose retention_from is before ended_before and whose reminder
-// was delivered before reminded_before, or (undeliverable address) claimed before fallback_before
-// (events_retention_expire_idx; the redundant IS NOT NULL lets the planner prove that partial
-// index's predicate through the OR). Events with an open report are skipped. Slug release as in
-// SoftDeleteEvent; batch shape as in ClaimRetentionReminders.
+// was delivered before reminded_before. Only an event whose reminder was never delivered
+// (retention_reminder_sent_at NULL: undeliverable address, or the send is still retrying) falls back
+// to the claim stamp, claimed before fallback_before; a delivered reminder always gets its full lead
+// time, however late it was sent. Uses events_retention_expire_idx (the redundant IS NOT NULL lets
+// the planner prove that partial index's predicate through the OR). Events with an open report are
+// skipped. Slug release as in SoftDeleteEvent; batch shape as in ClaimRetentionReminders.
 func (q *Queries) ExpireEndedEvents(ctx context.Context, arg ExpireEndedEventsParams) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, expireEndedEvents,
 		arg.EndedBefore,
@@ -373,6 +375,38 @@ func (q *Queries) ExpireEndedEvents(ctx context.Context, arg ExpireEndedEventsPa
 		arg.FallbackBefore,
 		arg.Lim,
 	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const filterLockedPurgeable = `-- name: FilterLockedPurgeable :many
+SELECT e.id
+FROM events e
+WHERE e.id = ANY($1::uuid[]) AND e.deleted_at IS NOT NULL AND e.status <> 'taken_down'
+  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'))
+`
+
+// Second half of the purge check, run in the same transaction right after ListPurgeableEvents: that
+// query's open-report test used the statement snapshot, taken before its row locks, so a report
+// committed in between would be missed. This statement takes a new snapshot while the locks are
+// held; a report filed from now on waits on the row lock. Returns the listed ids that are still
+// purgeable, mirroring the checks PurgeEvents makes; only these may have their files deleted.
+func (q *Queries) FilterLockedPurgeable(ctx context.Context, eventIds []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, filterLockedPurgeable, eventIds)
 	if err != nil {
 		return nil, err
 	}
@@ -933,35 +967,49 @@ func (q *Queries) ListExpiredAnonDraftEvents(ctx context.Context, lim int32) ([]
 }
 
 const listPurgeableEvents = `-- name: ListPurgeableEvents :many
-SELECT id
-FROM events
-WHERE deleted_at IS NOT NULL
-  AND status <> 'taken_down'
-  AND (deleted_at < $1::timestamptz
-       OR (retention_reminded_at IS NOT NULL
-           AND retention_reminded_at < $2::timestamptz
-           AND retention_from < $3::timestamptz))
-  AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = events.id AND r.status IN ('open', 'reviewing'))
-ORDER BY deleted_at
-LIMIT $4::int
+SELECT e.id
+FROM events e
+WHERE e.id = ANY(ARRAY(
+    SELECT x.id FROM events x
+    WHERE x.deleted_at IS NOT NULL
+      AND x.status <> 'taken_down'
+      AND (x.deleted_at < $1::timestamptz
+           OR (x.retention_reminded_at IS NOT NULL
+               AND (x.retention_reminder_sent_at < $2::timestamptz
+                    OR (x.retention_reminder_sent_at IS NULL AND x.retention_reminded_at < $3::timestamptz))
+               AND x.retention_from < $4::timestamptz))
+      AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = x.id AND r.status IN ('open', 'reviewing'))
+    ORDER BY x.deleted_at
+    LIMIT $5::int
+    FOR UPDATE SKIP LOCKED))
+ORDER BY e.deleted_at
 `
 
 type ListPurgeableEventsParams struct {
 	DeletedBefore  time.Time `json:"deleted_before"`
 	RemindedBefore time.Time `json:"reminded_before"`
+	FallbackBefore time.Time `json:"fallback_before"`
 	EndedBefore    time.Time `json:"ended_before"`
 	Lim            int32     `json:"lim"`
 }
 
 // Soft-deleted events due for hard delete: deleted before deleted_before (the normal grace for an
-// owner's delete), or expired by retention (reminded before reminded_before and retention_from
-// before ended_before; those skip the grace because the owner already had the full window).
+// owner's delete), or expired by retention (reminder delivered before reminded_before, or never
+// delivered but claimed before fallback_before, and retention_from before ended_before; those skip
+// the grace because the owner already had the full window).
 // Taken-down events are kept as moderation evidence, and so is any event with an open report
-// (deleting the event cascades its reports). The caller deletes rows with PurgeEvents, then files.
+// (deleting the event cascades its reports).
+// The batch is row-locked FOR UPDATE SKIP LOCKED: run this, the file deletion and PurgeEvents in ONE
+// transaction. A report insert takes a KEY SHARE lock on the event through its foreign key, which
+// conflicts with FOR UPDATE only, so a report filed meanwhile waits for the commit (and then fails
+// its insert once the row is gone) instead of landing on an event whose files are already deleted.
+// A row a report insert holds right now is skipped and picked up on the next run. Concurrent runs
+// take disjoint batches. ANY(ARRAY(...)) as in ClaimRetentionReminders.
 func (q *Queries) ListPurgeableEvents(ctx context.Context, arg ListPurgeableEventsParams) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listPurgeableEvents,
 		arg.DeletedBefore,
 		arg.RemindedBefore,
+		arg.FallbackBefore,
 		arg.EndedBefore,
 		arg.Lim,
 	)
@@ -1079,12 +1127,15 @@ func (q *Queries) LockEventForRSVP(ctx context.Context, eventID uuid.UUID) (Lock
 	return i, err
 }
 
-const markRetentionReminderSent = `-- name: MarkRetentionReminderSent :execrows
+const markRetentionReminderSent = `-- name: MarkRetentionReminderSent :one
 UPDATE events
 SET retention_reminder_sent_at = now()
 WHERE id = $1
   AND retention_reminded_at = $2::timestamptz
   AND retention_reminder_sent_at IS NULL
+  AND deleted_at IS NULL
+  AND status <> 'taken_down'
+RETURNING retention_reminder_sent_at::timestamptz AS sent_at
 `
 
 type MarkRetentionReminderSentParams struct {
@@ -1092,14 +1143,14 @@ type MarkRetentionReminderSentParams struct {
 	ClaimedAt time.Time `json:"claimed_at"`
 }
 
-// Stamps the claim as delivered. Zero rows: the claim was replaced or cleared by a re-date, or the
-// reminder was already marked; the caller sends nothing.
-func (q *Queries) MarkRetentionReminderSent(ctx context.Context, arg MarkRetentionReminderSentParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markRetentionReminderSent, arg.EventID, arg.ClaimedAt)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+// Stamps the claim as delivered and returns the stamp. No row: the claim was replaced or cleared by
+// a re-date, the reminder was already marked, or the event was deleted or taken down since the
+// caller loaded it; the caller sends nothing.
+func (q *Queries) MarkRetentionReminderSent(ctx context.Context, arg MarkRetentionReminderSentParams) (time.Time, error) {
+	row := q.db.QueryRow(ctx, markRetentionReminderSent, arg.EventID, arg.ClaimedAt)
+	var sent_at time.Time
+	err := row.Scan(&sent_at)
+	return sent_at, err
 }
 
 const publishEvent = `-- name: PublishEvent :one
