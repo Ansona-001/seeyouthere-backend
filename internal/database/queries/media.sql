@@ -1,4 +1,7 @@
--- Files are written before the row (see internal/media); every delete path removes the row first.
+-- Files are written before the row (see internal/media) and deleted before the row on every delete
+-- path except detached-media cleanup, which is row-first on purpose: DeleteDetachedMedia re-checks
+-- detached_at atomically, and files of a row that was re-attached meanwhile must not be removed.
+-- Orphaned files left by a failed step are swept by media reconcile.
 
 -- name: CreateHostMedia :one
 -- Owner or editor, after LockEventForEditor and the quota check in the same tx.
@@ -36,6 +39,71 @@ SELECT count(*) AS files, coalesce(sum(size_bytes), 0)::bigint AS bytes
 FROM media
 WHERE event_id = @event_id AND uploaded_by = @uploaded_by AND moderation_status <> 'rejected';
 
+-- name: MediaStorageUsage :one
+-- Upload quota (run after LockMediaStorageQuota). owner_bytes: live events of one owner, rejected
+-- rows and pending guest photos excluded (soft-deleted events free the owner's quota at once; a
+-- guest photo is charged to the owner only once the host approves it). total_bytes: every event,
+-- soft-deleted ones included until purge, pending guest photos too, because their files still
+-- occupy the bucket. pending_guest_bytes: pending guest photos of one event, bounded separately.
+-- owner_pending_guest_bytes: pending guest photos across all live events of one owner, bounded
+-- by a per-owner allowance so many events cannot each park a full per-event allowance.
+-- NULL owner (anonymous draft): owner_bytes and owner_pending_guest_bytes are 0 and the caller
+-- skips the per-user checks. NULL event: pending_guest_bytes is 0.
+SELECT (SELECT coalesce(sum(m.size_bytes), 0)
+        FROM media m JOIN events e ON e.id = m.event_id
+        WHERE e.owner_id = sqlc.narg(owner_id)::uuid
+          AND e.deleted_at IS NULL
+          AND m.moderation_status <> 'rejected'
+          AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending'))::bigint AS owner_bytes,
+       (SELECT coalesce(sum(size_bytes), 0)
+        FROM media
+        WHERE moderation_status <> 'rejected')::bigint AS total_bytes,
+       (SELECT coalesce(sum(size_bytes), 0)
+        FROM media
+        WHERE event_id = sqlc.narg(event_id)::uuid
+          AND uploaded_by = 'guest'
+          AND moderation_status = 'pending')::bigint AS pending_guest_bytes,
+       (SELECT coalesce(sum(m.size_bytes), 0)
+        FROM media m JOIN events e ON e.id = m.event_id
+        WHERE e.owner_id = sqlc.narg(owner_id)::uuid
+          AND e.deleted_at IS NULL
+          AND m.uploaded_by = 'guest'
+          AND m.moderation_status = 'pending')::bigint AS owner_pending_guest_bytes;
+
+-- name: MediaOwnerUsage :one
+-- Approval check (run after LockMediaStorageQuota): same owner_bytes rule as MediaStorageUsage,
+-- without the global sum, so the global lock is not held across a bucket-wide scan.
+SELECT coalesce(sum(m.size_bytes), 0)::bigint AS owner_bytes
+FROM media m JOIN events e ON e.id = m.event_id
+WHERE e.owner_id = @owner_id::uuid
+  AND e.deleted_at IS NULL
+  AND m.moderation_status <> 'rejected'
+  AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending');
+
+-- name: LockMediaStorageQuota :exec
+-- Serialises the quota check and insert across upload transactions. Take it last, after the event
+-- row lock, so lock order is always event -> quota and cannot deadlock.
+SELECT pg_advisory_xact_lock(hashtextextended('syt:media_storage_quota', 0));
+
+-- name: GetServableMedia :one
+-- Public /media serving gate: approved media of an event that is neither soft-deleted nor taken
+-- down. No row = not servable, whatever the reason (the caller answers every case with the same 404).
+SELECT m.id
+FROM media m
+JOIN events e ON e.id = m.event_id
+WHERE m.id = @media_id
+  AND m.event_id = @event_id
+  AND m.moderation_status = 'approved'
+  AND e.deleted_at IS NULL
+  AND e.status <> 'taken_down';
+
+-- name: LiveMediaIDs :many
+-- Reconcile: which of these media ids still have a non-rejected row; files of any other id are
+-- orphans. Callers pass at most one listing page (1000 ids).
+SELECT id
+FROM media
+WHERE id = ANY(@ids::uuid[]) AND moderation_status <> 'rejected';
+
 -- name: ListEventMedia :many
 -- Any member. Newest first; uploaded_by / status NULL = all. The page is cut before the guest join.
 SELECT m.id, m.width, m.height, m.size_bytes, m.uploaded_by, m.moderation_status, m.created_at,
@@ -64,20 +132,18 @@ WHERE m.id = @media_id::uuid
   AND m.event_id = @event_id::uuid
   AND event_role(@event_id::uuid, @user_id::uuid) IS NOT NULL;
 
--- name: ListMediaModerationByEvent :many
--- MediaVisibilityWorker: per-file moderation_status for one event, so each file is placed
--- individually instead of moving a whole directory at once. Unpaginated — an event has at most
--- ~2,150 media rows (see phase A caps) and media_event_id_idx covers this lookup.
-SELECT id, moderation_status
+-- name: ListRejectedMediaIDsByEvent :many
+-- MediaVisibilityWorker: rejected media of one event, whose files must be gone. Unpaginated: an
+-- event has at most ~2,150 media rows (per-event caps) and media_event_created_idx covers the lookup.
+SELECT id
 FROM media
-WHERE event_id = @event_id::uuid;
+WHERE event_id = @event_id::uuid AND moderation_status = 'rejected';
 
 -- name: SetGuestMediaModeration :one
 -- Owner or editor approves/rejects a guest photo; returns the previous status so the caller knows
--- which files to move or delete. Approve only from pending (files still sit in the pending
--- location); reject blocked only when already rejected (files for a rejected row are already
--- deleted, so re-rejecting would re-issue a delete for files that don't exist). Either transition
--- is blocked once the event is taken down, to avoid racing the quarantine job.
+-- whether files need deleting. Approve only from pending; reject blocked only when already
+-- rejected (its files are already deleted, so re-rejecting would re-issue a delete for files that
+-- don't exist). Either transition is blocked once the event is taken down.
 WITH prev AS (
     SELECT x.id, x.moderation_status FROM media x
     WHERE x.id = @media_id::uuid
@@ -148,10 +214,6 @@ WHERE id IN (
     SELECT x.id FROM media x
     WHERE x.moderation_status = 'rejected' AND x.created_at < now() - interval '7 days'
     LIMIT 500);
-
--- name: MediaIDsForEvent :many
--- Reconcile: bounded by the per-event quotas.
-SELECT id FROM media WHERE event_id = @event_id;
 
 -- name: ListGuestMediaAdmin :many
 -- Moderation queue: guest uploads with one status, newest first (media_guest_status_created_idx).

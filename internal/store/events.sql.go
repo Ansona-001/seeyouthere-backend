@@ -304,31 +304,6 @@ func (q *Queries) DeleteExpiredAnonDraftEvents(ctx context.Context, eventIds []u
 	return result.RowsAffected(), nil
 }
 
-const existingEventIDs = `-- name: ExistingEventIDs :many
-SELECT id FROM events WHERE id = ANY($1::uuid[])
-`
-
-// Media reconcile: which of these directory names still have an event row (deleted or not).
-func (q *Queries) ExistingEventIDs(ctx context.Context, eventIds []uuid.UUID) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, existingEventIDs, eventIds)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []uuid.UUID{}
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const expireEndedEvents = `-- name: ExpireEndedEvents :many
 UPDATE events e
 SET deleted_at = now(), updated_at = now(),
@@ -759,7 +734,7 @@ type GetEventMediaStateRow struct {
 	DeletedAt *time.Time `json:"deleted_at"`
 }
 
-// media_visibility job: decides where the event's files belong.
+// media_visibility job: whether the event still exists and is neither deleted nor taken down.
 func (q *Queries) GetEventMediaState(ctx context.Context, eventID uuid.UUID) (GetEventMediaStateRow, error) {
 	row := q.db.QueryRow(ctx, getEventMediaState, eventID)
 	var i GetEventMediaStateRow

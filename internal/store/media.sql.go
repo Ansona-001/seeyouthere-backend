@@ -179,7 +179,10 @@ type CreateHostMediaRow struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
-// Files are written before the row (see internal/media); every delete path removes the row first.
+// Files are written before the row (see internal/media) and deleted before the row on every delete
+// path except detached-media cleanup, which is row-first on purpose: DeleteDetachedMedia re-checks
+// detached_at atomically, and files of a row that was re-attached meanwhile must not be removed.
+// Orphaned files left by a failed step are swept by media reconcile.
 // Owner or editor, after LockEventForEditor and the quota check in the same tx.
 func (q *Queries) CreateHostMedia(ctx context.Context, arg CreateHostMediaParams) (CreateHostMediaRow, error) {
 	row := q.db.QueryRow(ctx, createHostMedia,
@@ -370,6 +373,31 @@ func (q *Queries) GetMediaAdmin(ctx context.Context, mediaID uuid.UUID) (GetMedi
 		&i.EventDeletedAt,
 	)
 	return i, err
+}
+
+const getServableMedia = `-- name: GetServableMedia :one
+SELECT m.id
+FROM media m
+JOIN events e ON e.id = m.event_id
+WHERE m.id = $1
+  AND m.event_id = $2
+  AND m.moderation_status = 'approved'
+  AND e.deleted_at IS NULL
+  AND e.status <> 'taken_down'
+`
+
+type GetServableMediaParams struct {
+	MediaID uuid.UUID `json:"media_id"`
+	EventID uuid.UUID `json:"event_id"`
+}
+
+// Public /media serving gate: approved media of an event that is neither soft-deleted nor taken
+// down. No row = not servable, whatever the reason (the caller answers every case with the same 404).
+func (q *Queries) GetServableMedia(ctx context.Context, arg GetServableMediaParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getServableMedia, arg.MediaID, arg.EventID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const listApprovedGuestPhotos = `-- name: ListApprovedGuestPhotos :many
@@ -579,47 +607,16 @@ func (q *Queries) ListGuestMediaAdmin(ctx context.Context, arg ListGuestMediaAdm
 	return items, nil
 }
 
-const listMediaModerationByEvent = `-- name: ListMediaModerationByEvent :many
-SELECT id, moderation_status
+const listRejectedMediaIDsByEvent = `-- name: ListRejectedMediaIDsByEvent :many
+SELECT id
 FROM media
-WHERE event_id = $1::uuid
+WHERE event_id = $1::uuid AND moderation_status = 'rejected'
 `
 
-type ListMediaModerationByEventRow struct {
-	ID               uuid.UUID `json:"id"`
-	ModerationStatus string    `json:"moderation_status"`
-}
-
-// MediaVisibilityWorker: per-file moderation_status for one event, so each file is placed
-// individually instead of moving a whole directory at once. Unpaginated — an event has at most
-// ~2,150 media rows (see phase A caps) and media_event_id_idx covers this lookup.
-func (q *Queries) ListMediaModerationByEvent(ctx context.Context, eventID uuid.UUID) ([]ListMediaModerationByEventRow, error) {
-	rows, err := q.db.Query(ctx, listMediaModerationByEvent, eventID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListMediaModerationByEventRow{}
-	for rows.Next() {
-		var i ListMediaModerationByEventRow
-		if err := rows.Scan(&i.ID, &i.ModerationStatus); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const mediaIDsForEvent = `-- name: MediaIDsForEvent :many
-SELECT id FROM media WHERE event_id = $1
-`
-
-// Reconcile: bounded by the per-event quotas.
-func (q *Queries) MediaIDsForEvent(ctx context.Context, eventID uuid.UUID) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, mediaIDsForEvent, eventID)
+// MediaVisibilityWorker: rejected media of one event, whose files must be gone. Unpaginated: an
+// event has at most ~2,150 media rows (per-event caps) and media_event_created_idx covers the lookup.
+func (q *Queries) ListRejectedMediaIDsByEvent(ctx context.Context, eventID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listRejectedMediaIDsByEvent, eventID)
 	if err != nil {
 		return nil, err
 	}
@@ -636,6 +633,119 @@ func (q *Queries) MediaIDsForEvent(ctx context.Context, eventID uuid.UUID) ([]uu
 		return nil, err
 	}
 	return items, nil
+}
+
+const liveMediaIDs = `-- name: LiveMediaIDs :many
+SELECT id
+FROM media
+WHERE id = ANY($1::uuid[]) AND moderation_status <> 'rejected'
+`
+
+// Reconcile: which of these media ids still have a non-rejected row; files of any other id are
+// orphans. Callers pass at most one listing page (1000 ids).
+func (q *Queries) LiveMediaIDs(ctx context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, liveMediaIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockMediaStorageQuota = `-- name: LockMediaStorageQuota :exec
+SELECT pg_advisory_xact_lock(hashtextextended('syt:media_storage_quota', 0))
+`
+
+// Serialises the quota check and insert across upload transactions. Take it last, after the event
+// row lock, so lock order is always event -> quota and cannot deadlock.
+func (q *Queries) LockMediaStorageQuota(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, lockMediaStorageQuota)
+	return err
+}
+
+const mediaOwnerUsage = `-- name: MediaOwnerUsage :one
+SELECT coalesce(sum(m.size_bytes), 0)::bigint AS owner_bytes
+FROM media m JOIN events e ON e.id = m.event_id
+WHERE e.owner_id = $1::uuid
+  AND e.deleted_at IS NULL
+  AND m.moderation_status <> 'rejected'
+  AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending')
+`
+
+// Approval check (run after LockMediaStorageQuota): same owner_bytes rule as MediaStorageUsage,
+// without the global sum, so the global lock is not held across a bucket-wide scan.
+func (q *Queries) MediaOwnerUsage(ctx context.Context, ownerID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, mediaOwnerUsage, ownerID)
+	var owner_bytes int64
+	err := row.Scan(&owner_bytes)
+	return owner_bytes, err
+}
+
+const mediaStorageUsage = `-- name: MediaStorageUsage :one
+SELECT (SELECT coalesce(sum(m.size_bytes), 0)
+        FROM media m JOIN events e ON e.id = m.event_id
+        WHERE e.owner_id = $1::uuid
+          AND e.deleted_at IS NULL
+          AND m.moderation_status <> 'rejected'
+          AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending'))::bigint AS owner_bytes,
+       (SELECT coalesce(sum(size_bytes), 0)
+        FROM media
+        WHERE moderation_status <> 'rejected')::bigint AS total_bytes,
+       (SELECT coalesce(sum(size_bytes), 0)
+        FROM media
+        WHERE event_id = $2::uuid
+          AND uploaded_by = 'guest'
+          AND moderation_status = 'pending')::bigint AS pending_guest_bytes,
+       (SELECT coalesce(sum(m.size_bytes), 0)
+        FROM media m JOIN events e ON e.id = m.event_id
+        WHERE e.owner_id = $1::uuid
+          AND e.deleted_at IS NULL
+          AND m.uploaded_by = 'guest'
+          AND m.moderation_status = 'pending')::bigint AS owner_pending_guest_bytes
+`
+
+type MediaStorageUsageParams struct {
+	OwnerID *uuid.UUID `json:"owner_id"`
+	EventID *uuid.UUID `json:"event_id"`
+}
+
+type MediaStorageUsageRow struct {
+	OwnerBytes             int64 `json:"owner_bytes"`
+	TotalBytes             int64 `json:"total_bytes"`
+	PendingGuestBytes      int64 `json:"pending_guest_bytes"`
+	OwnerPendingGuestBytes int64 `json:"owner_pending_guest_bytes"`
+}
+
+// Upload quota (run after LockMediaStorageQuota). owner_bytes: live events of one owner, rejected
+// rows and pending guest photos excluded (soft-deleted events free the owner's quota at once; a
+// guest photo is charged to the owner only once the host approves it). total_bytes: every event,
+// soft-deleted ones included until purge, pending guest photos too, because their files still
+// occupy the bucket. pending_guest_bytes: pending guest photos of one event, bounded separately.
+// owner_pending_guest_bytes: pending guest photos across all live events of one owner, bounded
+// by a per-owner allowance so many events cannot each park a full per-event allowance.
+// NULL owner (anonymous draft): owner_bytes and owner_pending_guest_bytes are 0 and the caller
+// skips the per-user checks. NULL event: pending_guest_bytes is 0.
+func (q *Queries) MediaStorageUsage(ctx context.Context, arg MediaStorageUsageParams) (MediaStorageUsageRow, error) {
+	row := q.db.QueryRow(ctx, mediaStorageUsage, arg.OwnerID, arg.EventID)
+	var i MediaStorageUsageRow
+	err := row.Scan(
+		&i.OwnerBytes,
+		&i.TotalBytes,
+		&i.PendingGuestBytes,
+		&i.OwnerPendingGuestBytes,
+	)
+	return i, err
 }
 
 const mediaUsage = `-- name: MediaUsage :one
@@ -737,10 +847,9 @@ type SetGuestMediaModerationRow struct {
 }
 
 // Owner or editor approves/rejects a guest photo; returns the previous status so the caller knows
-// which files to move or delete. Approve only from pending (files still sit in the pending
-// location); reject blocked only when already rejected (files for a rejected row are already
-// deleted, so re-rejecting would re-issue a delete for files that don't exist). Either transition
-// is blocked once the event is taken down, to avoid racing the quarantine job.
+// whether files need deleting. Approve only from pending; reject blocked only when already
+// rejected (its files are already deleted, so re-rejecting would re-issue a delete for files that
+// don't exist). Either transition is blocked once the event is taken down.
 func (q *Queries) SetGuestMediaModeration(ctx context.Context, arg SetGuestMediaModerationParams) (SetGuestMediaModerationRow, error) {
 	row := q.db.QueryRow(ctx, setGuestMediaModeration,
 		arg.Status,

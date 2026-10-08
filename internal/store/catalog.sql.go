@@ -109,6 +109,27 @@ func (q *Queries) GetPublishedTemplateBySlug(ctx context.Context, arg GetPublish
 	return i, err
 }
 
+const getTemplateAssetsPath = `-- name: GetTemplateAssetsPath :one
+SELECT assets_path
+FROM template_versions
+WHERE template_id = $1 AND version = $2 AND assets_path <> ''
+`
+
+type GetTemplateAssetsPathParams struct {
+	TemplateID uuid.UUID `json:"template_id"`
+	Version    int32     `json:"version"`
+}
+
+// /media/templates/... serving gate (any version, published or not, so the admin preview works).
+// No row: unknown version or no asset uploaded yet. Narrow on purpose: GetTemplateVersion also
+// reads the manifest jsonb.
+func (q *Queries) GetTemplateAssetsPath(ctx context.Context, arg GetTemplateAssetsPathParams) (string, error) {
+	row := q.db.QueryRow(ctx, getTemplateAssetsPath, arg.TemplateID, arg.Version)
+	var assets_path string
+	err := row.Scan(&assets_path)
+	return assets_path, err
+}
+
 const getTemplateVersion = `-- name: GetTemplateVersion :one
 SELECT template_id, version, manifest, assets_path, created_by, created_at, published_at FROM template_versions
 WHERE template_id = $1 AND version = $2

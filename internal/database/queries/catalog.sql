@@ -54,3 +54,11 @@ WHERE t.slug = @slug
 -- name: GetTemplateVersion :one
 SELECT * FROM template_versions
 WHERE template_id = @template_id AND version = @version;
+
+-- name: GetTemplateAssetsPath :one
+-- /media/templates/... serving gate (any version, published or not, so the admin preview works).
+-- No row: unknown version or no asset uploaded yet. Narrow on purpose: GetTemplateVersion also
+-- reads the manifest jsonb.
+SELECT assets_path
+FROM template_versions
+WHERE template_id = @template_id AND version = @version AND assets_path <> '';

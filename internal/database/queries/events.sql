@@ -542,12 +542,8 @@ DELETE FROM events e
 WHERE e.id = ANY(@event_ids::uuid[]) AND e.deleted_at IS NOT NULL AND e.status <> 'taken_down'
   AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing'));
 
--- name: ExistingEventIDs :many
--- Media reconcile: which of these directory names still have an event row (deleted or not).
-SELECT id FROM events WHERE id = ANY(@event_ids::uuid[]);
-
 -- name: GetEventMediaState :one
--- media_visibility job: decides where the event's files belong.
+-- media_visibility job: whether the event still exists and is neither deleted nor taken down.
 SELECT id, status, deleted_at FROM events WHERE id = @event_id;
 
 -- name: SearchEventsAdmin :many
