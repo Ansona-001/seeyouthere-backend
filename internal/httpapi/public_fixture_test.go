@@ -20,7 +20,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/ansonarose/seeyouthere-backend/internal/config"
 	"github.com/ansonarose/seeyouthere-backend/internal/content"
 	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/passhash"
@@ -203,10 +202,7 @@ func newPublicEventFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, 
 		}
 	})
 
-	mediaStore, err := media.NewStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("media.NewStore: %v", err)
-	}
+	mediaStore := newTestMediaStore(t)
 	tokens, err := token.NewKeys(testAuthSecret())
 	if err != nil {
 		t.Fatalf("token.NewKeys: %v", err)
@@ -214,7 +210,7 @@ func newPublicEventFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, 
 
 	s := &Server{
 		pool: pool, q: q, rdb: rdb, limiter: ratelimit.New(rdb),
-		cfg:    config.Config{SiteURL: "https://seeyouthere.at"},
+		cfg: testConfig(), mediaSem: make(chan struct{}, mediaStreams),
 		tokens: tokens, hasher: hasher, media: mediaStore, images: media.NewProcessor(1),
 	}
 	return &publicEventFixture{s: s, ownerID: ownerID, eventID: event.ID, slug: slug}

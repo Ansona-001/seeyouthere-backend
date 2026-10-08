@@ -17,11 +17,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/ansonarose/seeyouthere-backend/internal/config"
 	"github.com/ansonarose/seeyouthere-backend/internal/content"
 	"github.com/ansonarose/seeyouthere-backend/internal/jobs"
 	mailpkg "github.com/ansonarose/seeyouthere-backend/internal/mail"
-	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/ratelimit"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 )
@@ -115,11 +113,12 @@ func newEventTestFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client) ev
 	})
 
 	s := &Server{
-		pool:    pool,
-		q:       q,
-		rdb:     rdb,
-		limiter: ratelimit.New(rdb),
-		cfg:     config.Config{SiteURL: "https://seeyouthere.at"},
+		pool:     pool,
+		q:        q,
+		rdb:      rdb,
+		limiter:  ratelimit.New(rdb),
+		cfg:      testConfig(),
+		mediaSem: make(chan struct{}, mediaStreams),
 	}
 	return eventTestFixture{s: s, ownerID: owner, editorID: editor, viewerID: viewer, strangerID: stranger, eventID: event.ID}
 }
@@ -508,11 +507,8 @@ func TestHandleDeleteEvent_EnqueuesMediaVisibilityJob(t *testing.T) {
 	ctx := context.Background()
 	q := store.New(pool)
 
-	mediaStore, err := media.NewStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("media.NewStore: %v", err)
-	}
-	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL)
+	mediaStore := newTestMediaStore(t)
+	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes)
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}

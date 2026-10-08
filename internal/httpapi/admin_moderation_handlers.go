@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/jobs"
+	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 )
 
@@ -631,25 +631,9 @@ func (s *Server) handleGetAdminMediaFile(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	f, err := s.media.Open(row.EventID, mediaID, width)
-	if err != nil {
-		if os.IsNotExist(err) {
-			writeError(w, http.StatusNotFound, "not_found", "No such file.")
-			return
-		}
-		serverError(w, r, fmt.Errorf("open media file: %w", err))
-		return
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		serverError(w, r, fmt.Errorf("stat media file: %w", err))
-		return
-	}
-
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Cache-Control", "private, max-age=300")
-	http.ServeContent(w, r, "", info.ModTime(), f)
+	s.serveObject(w, r, func(ctx context.Context, inm string) (*media.Object, error) {
+		return s.media.Open(ctx, row.EventID, mediaID, width, inm)
+	}, previewMediaCache, previewReads)
 }
 
 // POST /v1/admin/media/{id}/reject
@@ -698,7 +682,7 @@ func (s *Server) handleAdminRejectMedia(w http.ResponseWriter, r *http.Request) 
 		serverError(w, r, err)
 		return
 	}
-	if err := s.media.DeleteMedia(row.EventID, mediaID); err != nil {
+	if err := s.media.DeleteMedia(ctx, row.EventID, mediaID); err != nil {
 		slog.WarnContext(ctx, "delete rejected media files", "err", err, "media_id", mediaID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"media": mediaResp{

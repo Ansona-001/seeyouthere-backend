@@ -77,7 +77,13 @@ func logRequests(next http.Handler) http.Handler {
 		start := time.Now()
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
-		slog.InfoContext(r.Context(), "request",
+		// Image views are by far the most frequent requests; successful ones
+		// are logged at Debug so they don't drown out everything else.
+		level := slog.LevelInfo
+		if st := ww.Status(); strings.HasPrefix(r.URL.Path, "/media/") && (st/100 == 2 || st == http.StatusNotModified) {
+			level = slog.LevelDebug
+		}
+		slog.Log(r.Context(), level, "request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", ww.Status(),

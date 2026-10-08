@@ -9,7 +9,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 )
 
@@ -43,7 +42,7 @@ func TestHandleListAdminMedia_IncludesGuestName(t *testing.T) {
 
 	mediaID := uuid.Must(uuid.NewV7())
 	outDir, result := processTestUpload(t, f.s, testJPEG(t))
-	if err := f.s.media.Commit(outDir, media.AreaPending, f.eventID, mediaID); err != nil {
+	if err := f.s.media.Commit(ctx, outDir, f.eventID, mediaID); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if _, err := f.s.q.CreateGuestMedia(ctx, store.CreateGuestMediaParams{

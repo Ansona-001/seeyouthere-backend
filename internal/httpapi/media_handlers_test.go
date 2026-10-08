@@ -21,6 +21,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/content"
+	"github.com/ansonarose/seeyouthere-backend/internal/jobs"
 	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 	"github.com/ansonarose/seeyouthere-backend/internal/token"
@@ -28,14 +29,20 @@ import (
 
 // newMediaTestFixture builds on newEventTestFixture (owner/editor/viewer/
 // stranger + one draft event) and wires the media-specific dependencies
-// (Store, Processor, token.Keys) that only media_handlers.go needs.
+// (Store, Processor, token.Keys, a never-started River client) that only
+// media_handlers.go needs.
 func newMediaTestFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client) eventTestFixture {
 	t.Helper()
+	f, _ := newMediaTestFixtureBlobs(t, pool, rdb)
+	return f
+}
+
+// newMediaTestFixtureBlobs is newMediaTestFixture that also returns the
+// counting/failure-injecting storage backend behind f.s.media.
+func newMediaTestFixtureBlobs(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client) (eventTestFixture, *testBlobs) {
+	t.Helper()
 	f := newEventTestFixture(t, pool, rdb)
-	mediaStore, err := media.NewStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("media.NewStore: %v", err)
-	}
+	mediaStore, blobs := newTestMediaStoreBlobs(t)
 	tokens, err := token.NewKeys(testAuthSecret())
 	if err != nil {
 		t.Fatalf("token.NewKeys: %v", err)
@@ -43,7 +50,20 @@ func newMediaTestFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client) ev
 	f.s.media = mediaStore
 	f.s.images = media.NewProcessor(1)
 	f.s.tokens = tokens
-	return f
+	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, f.s.q, mediaStore, tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes)
+	if err != nil {
+		t.Fatalf("jobs.NewClient: %v", err)
+	}
+	f.s.jobs = jobClient
+	// Reject paths enqueue media_visibility jobs; the shared dev DB must not
+	// accumulate them.
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(),
+			"DELETE FROM river_job WHERE kind = 'media_visibility' AND args->>'event_id' = $1", f.eventID.String()); err != nil {
+			t.Logf("cleanup river_job: %v", err)
+		}
+	})
+	return f, blobs
 }
 
 // uploadRequest builds a multipart-free raw-body upload request (the API
@@ -363,7 +383,7 @@ func processTestUpload(t *testing.T, s *Server, img []byte) (outDir string, resu
 	return outDir, result
 }
 
-func TestSetMediaModeration_ApproveMovesToPublicRejectDeletesFiles(t *testing.T) {
+func TestSetMediaModeration_ApproveLeavesFilesRejectDeletesThem(t *testing.T) {
 	pool := dbTestPool(t)
 	rdb := dbTestRedis(t)
 	f := newMediaTestFixture(t, pool, rdb)
@@ -391,7 +411,7 @@ func TestSetMediaModeration_ApproveMovesToPublicRejectDeletesFiles(t *testing.T)
 		t.Helper()
 		id := uuid.Must(uuid.NewV7())
 		outDir, result := processTestUpload(t, f.s, testJPEG(t))
-		if err := f.s.media.Commit(outDir, media.AreaPending, f.eventID, id); err != nil {
+		if err := f.s.media.Commit(ctx, outDir, f.eventID, id); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 		if _, err := f.s.q.CreateGuestMedia(ctx, store.CreateGuestMediaParams{
@@ -403,7 +423,7 @@ func TestSetMediaModeration_ApproveMovesToPublicRejectDeletesFiles(t *testing.T)
 		return id
 	}
 
-	t.Run("approve moves pending files to public and flips status", func(t *testing.T) {
+	t.Run("approve flips status and leaves the files alone", func(t *testing.T) {
 		mediaID := newPendingUpload(t)
 		req := requestAs(http.MethodPost, "/", f.ownerID)
 		req = withRouteParam(req, "id", f.eventID.String())
@@ -413,11 +433,11 @@ func TestSetMediaModeration_ApproveMovesToPublicRejectDeletesFiles(t *testing.T)
 		if rec.Code != http.StatusOK || !containsAll(rec.Body.String(), `"moderation_status":"approved"`) {
 			t.Fatalf("status = %d, body = %s, want 200 approved", rec.Code, rec.Body.String())
 		}
-		opened, err := f.s.media.Open(f.eventID, mediaID, 480)
+		opened, err := f.s.media.Open(ctx, f.eventID, mediaID, 480, "")
 		if err != nil {
-			t.Errorf("expected the file to be openable (moved to public), got: %v", err)
+			t.Errorf("expected the file to stay in place (approve touches no objects), got: %v", err)
 		} else {
-			opened.Close()
+			opened.Body.Close()
 		}
 	})
 
@@ -431,8 +451,8 @@ func TestSetMediaModeration_ApproveMovesToPublicRejectDeletesFiles(t *testing.T)
 		if rec.Code != http.StatusOK || !containsAll(rec.Body.String(), `"moderation_status":"rejected"`) {
 			t.Fatalf("status = %d, body = %s, want 200 rejected", rec.Code, rec.Body.String())
 		}
-		if _, err := f.s.media.Open(f.eventID, mediaID, 480); err == nil {
-			t.Error("expected the file to be gone after rejection")
+		if _, err := f.s.media.Open(ctx, f.eventID, mediaID, 480, ""); !errors.Is(err, media.ErrNotFound) {
+			t.Errorf("expected the file to be gone after rejection, got err = %v", err)
 		}
 	})
 

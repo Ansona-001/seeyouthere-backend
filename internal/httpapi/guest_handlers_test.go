@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/jobs"
-	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 	"github.com/ansonarose/seeyouthere-backend/internal/token"
 )
@@ -28,11 +27,8 @@ func withGuestFixtureJobs(t *testing.T, f eventTestFixture, pool *pgxpool.Pool) 
 	}
 	f.s.tokens = keys
 
-	mediaStore, err := media.NewStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("media.NewStore: %v", err)
-	}
-	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, f.s.q, mediaStore, keys, f.s.limiter, "", f.s.cfg.SiteURL)
+	mediaStore := newTestMediaStore(t)
+	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, f.s.q, mediaStore, keys, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes)
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}

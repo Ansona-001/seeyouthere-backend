@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/jobs"
-	"github.com/ansonarose/seeyouthere-backend/internal/media"
 )
 
 // withJobs attaches a real (but never-started) River client to f.s, the way
@@ -16,11 +15,8 @@ import (
 // a client that at least recognises the job kind.
 func (f *publicEventFixture) withJobs(t *testing.T) {
 	t.Helper()
-	mediaStore, err := media.NewStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("media.NewStore: %v", err)
-	}
-	jobClient, err := jobs.NewClient(f.s.pool, noopSender{}, noopSender{}, f.s.q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL)
+	mediaStore := newTestMediaStore(t)
+	jobClient, err := jobs.NewClient(f.s.pool, noopSender{}, noopSender{}, f.s.q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes)
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}

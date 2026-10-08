@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -47,12 +48,18 @@ type Server struct {
 	totp   *totp.Sealer
 	media  *media.Store
 	images *media.Processor
+	// mediaSem bounds concurrent object streams (serveObject).
+	mediaSem chan struct{}
+	// limiterWarnAt is when the media routes last logged a rate-limiter
+	// outage (UnixNano); see warnLimiterDown.
+	limiterWarnAt atomic.Int64
 }
 
 // NewServer wires the API's dependencies. It can fail: deriving token
 // subkeys, building the TOTP sealer and preparing MEDIA_ROOT are all
-// checked at startup rather than on the first request that needs them.
-func NewServer(cfg config.Config, pool *pgxpool.Pool, rdb *redis.Client, jobClient *jobs.Client) (*Server, error) {
+// checked at startup rather than on the first request that needs them. The
+// media store is built once in main and shared with the job client.
+func NewServer(cfg config.Config, pool *pgxpool.Pool, rdb *redis.Client, jobClient *jobs.Client, mediaStore *media.Store) (*Server, error) {
 	q := store.New(pool)
 
 	tokens, err := token.NewKeys(cfg.AuthSecret)
@@ -60,10 +67,6 @@ func NewServer(cfg config.Config, pool *pgxpool.Pool, rdb *redis.Client, jobClie
 		return nil, fmt.Errorf("httpapi: %w", err)
 	}
 	sealer, err := totp.NewSealer(cfg.TOTPKey)
-	if err != nil {
-		return nil, fmt.Errorf("httpapi: %w", err)
-	}
-	mediaStore, err := media.NewStore(cfg.MediaRoot)
 	if err != nil {
 		return nil, fmt.Errorf("httpapi: %w", err)
 	}
@@ -81,6 +84,7 @@ func NewServer(cfg config.Config, pool *pgxpool.Pool, rdb *redis.Client, jobClie
 		hasher:   passhash.New(passwordHashConcurrency),
 		totp:     sealer,
 		media:    mediaStore,
+		mediaSem: make(chan struct{}, mediaStreams),
 		images:   media.NewProcessor(imageProcessConcurrency),
 	}, nil
 }
@@ -285,11 +289,14 @@ func (s *Server) Routes() http.Handler {
 		r.Get("/v1/events/{id}/rsvps.csv", s.handleExportRSVPsCSV)
 	})
 
-	// Dev convenience only: production serves /media/* from Caddy, straight
-	// off the volume, before requests ever reach the API.
-	if !s.cfg.IsProduction() {
-		r.Get("/media/*", s.devMediaHandler())
-	}
+	// Media bytes: streamed from the object store (or local disk in dev).
+	// Deliberately outside the /v1 group: no secureHeaders (its no-store
+	// would defeat caching), no session lookup, and no 15s timeout (the
+	// handlers bound their own streams).
+	r.Group(func(r chi.Router) {
+		r.Get("/media/templates/{template_id}/{version}/background/{file}", s.handleTemplateMediaFile)
+		r.Get("/media/{event_id}/{media_id}/{file}", s.handleMediaFile)
+	})
 
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such endpoint.")

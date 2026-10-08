@@ -21,7 +21,6 @@ import (
 	"github.com/ansonarose/seeyouthere-backend/internal/auth"
 	"github.com/ansonarose/seeyouthere-backend/internal/config"
 	"github.com/ansonarose/seeyouthere-backend/internal/jobs"
-	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/ratelimit"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 	"github.com/ansonarose/seeyouthere-backend/internal/token"
@@ -120,16 +119,13 @@ func newAdminHandlerFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client)
 	if err != nil {
 		t.Fatalf("new sealer: %v", err)
 	}
-	mediaStore, err := media.NewStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("new media store: %v", err)
-	}
+	mediaStore := newTestMediaStore(t)
 	tokens, err := token.NewKeys([]byte("0123456789012345678901234567890123456789"))
 	if err != nil {
 		t.Fatalf("new token keys: %v", err)
 	}
 	limiter := ratelimit.New(rdb)
-	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, tokens, limiter, "", "https://seeyouthere.at")
+	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, tokens, limiter, "", "https://seeyouthere.at", testTotalQuotaBytes)
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}

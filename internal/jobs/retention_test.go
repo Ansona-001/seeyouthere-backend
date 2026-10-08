@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -15,11 +16,19 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/rivertype"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/mail"
+	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/ratelimit"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 )
+
+// mediaCall is one recorded fakeDeleter.DeleteMedia call.
+type mediaCall struct {
+	eventID uuid.UUID
+	ids     []uuid.UUID
+}
 
 // fakeDeleter is a mediaDeleter that records DeleteEventFiles calls, whether
 // the event's row still existed at that moment (files must go first), and
@@ -30,13 +39,22 @@ type fakeDeleter struct {
 	mu         sync.Mutex
 	failFor    map[uuid.UUID]bool
 	calls      []uuid.UUID
+	mediaCalls []mediaCall
 	rowPresent map[uuid.UUID]bool
 	// onDelete, when set, runs for every DeleteEventFiles call, while the
 	// purge transaction is open.
 	onDelete func(uuid.UUID)
 }
 
-func (d *fakeDeleter) DeleteMedia(uuid.UUID, uuid.UUID) error { return nil }
+func (d *fakeDeleter) DeleteMedia(_ context.Context, eventID uuid.UUID, mediaIDs ...uuid.UUID) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.mediaCalls = append(d.mediaCalls, mediaCall{eventID: eventID, ids: mediaIDs})
+	if d.failFor[eventID] {
+		return errors.New("simulated media delete failure")
+	}
+	return nil
+}
 
 func (d *fakeDeleter) DeleteEventFiles(ctx context.Context, eventID uuid.UUID) error {
 	var exists bool
@@ -75,7 +93,7 @@ func newRetentionFixture(t *testing.T) retentionFixture {
 	deleter := &fakeDeleter{pool: pool}
 	// A real, never-started client: InsertManyTx needs it to know the
 	// retention_reminder kind and to apply the args' InsertOpts.
-	client, err := NewClient(pool, sender, sender, q, nil, nil, nil, "", "https://seeyouthere.at")
+	client, err := NewClient(pool, sender, sender, q, nil, nil, nil, "", "https://seeyouthere.at", 0)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -462,6 +480,77 @@ func TestPurgeWithFiles(t *testing.T) {
 			t.Errorf("purged = %d, err = %v, want 0 and context.Canceled", purged, err)
 		}
 	})
+}
+
+// scriptedDeleter is a mediaDeleter whose DeleteEventFiles results are scripted
+// per call; it needs no database.
+type scriptedDeleter struct {
+	results []error
+	calls   int
+}
+
+func (d *scriptedDeleter) DeleteMedia(context.Context, uuid.UUID, ...uuid.UUID) error { return nil }
+
+func (d *scriptedDeleter) DeleteEventFiles(context.Context, uuid.UUID) error {
+	err := d.results[d.calls]
+	d.calls++
+	return err
+}
+
+func TestPurgeWithFiles_StorageOutageStopsEarly(t *testing.T) {
+	outage := fmt.Errorf("media: delete event files: %w", media.ErrStorageUnavailable)
+	tests := []struct {
+		name       string
+		results    []error
+		wantCalls  int
+		wantFailed int
+		wantRows   int
+	}{
+		{"outage on first stops the batch", []error{outage, nil, nil, nil}, 1, 4, 0},
+		{"outage mid-batch keeps the rest", []error{nil, outage, nil, nil}, 2, 3, 1},
+		{"other errors do not stop the batch", []error{errors.New("boom"), nil, errors.New("boom"), nil}, 4, 2, 2},
+		{"no errors", []error{nil, nil, nil, nil}, 4, 0, 4},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &scriptedDeleter{results: tc.results}
+			w := &CleanupWorker{Media: d}
+			ids := make([]uuid.UUID, len(tc.results))
+			for i := range ids {
+				ids[i] = uuid.Must(uuid.NewV7())
+			}
+			var rows int
+			purged, failed, err := w.purgeWithFiles(context.Background(), ids, func(_ context.Context, done []uuid.UUID) (int64, error) {
+				rows = len(done)
+				return int64(len(done)), nil
+			})
+			if err != nil {
+				t.Fatalf("purgeWithFiles: %v", err)
+			}
+			if d.calls != tc.wantCalls || failed != tc.wantFailed || rows != tc.wantRows || int(purged) != tc.wantRows {
+				t.Errorf("calls = %d, failed = %d, rows = %d, purged = %d; want %d, %d, %d, %d",
+					d.calls, failed, rows, purged, tc.wantCalls, tc.wantFailed, tc.wantRows, tc.wantRows)
+			}
+		})
+	}
+}
+
+func TestMediaVisibilityArgs_UniquePerEventWhileInFlight(t *testing.T) {
+	u := MediaVisibilityArgs{}.InsertOpts().UniqueOpts
+	if !u.ByArgs {
+		t.Error("ByArgs = false, want true so each event has one queued sweep")
+	}
+	for _, s := range []rivertype.JobState{
+		rivertype.JobStateAvailable, rivertype.JobStatePending, rivertype.JobStateRunning,
+		rivertype.JobStateRetryable, rivertype.JobStateScheduled,
+	} {
+		if !slices.Contains(u.ByState, s) {
+			t.Errorf("ByState is missing %q", s)
+		}
+	}
+	if slices.Contains(u.ByState, rivertype.JobStateCompleted) {
+		t.Error("ByState includes completed: a finished sweep must not block the next reject")
+	}
 }
 
 func TestPurgeWithFiles_ExpiredAnonDrafts(t *testing.T) {

@@ -1,5 +1,5 @@
 // Package jobs defines River background jobs: email delivery, periodic
-// cleanup, and moving event media between visibility areas.
+// cleanup, and deletion of rejected event media.
 package jobs
 
 import (
@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivertype"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/mail"
 	"github.com/ansonarose/seeyouthere-backend/internal/media"
@@ -131,19 +132,16 @@ func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) err
 	slog.InfoContext(ctx, "cleanup", "expired_anon_drafts", totalDrafts, "anon_draft_file_failures", draftFailures)
 
 	// Host media detached from an event's content for 7+ days: the row is
-	// deleted first, then its files (a crash here just leaves an orphan
-	// media_reconcile removes later).
+	// deleted first (DeleteDetachedMedia re-checks detached_at atomically),
+	// then its files. A failed or interrupted file delete just leaves an
+	// orphan media_reconcile removes later.
 	var totalDetached int64
 	for i := 0; i < mediaCleanupBatchesPerRun; i++ {
 		rows, err := w.Queries.DeleteDetachedMedia(ctx)
 		if err != nil {
 			return fmt.Errorf("delete detached media: %w", err)
 		}
-		for _, row := range rows {
-			if err := w.Media.DeleteMedia(row.EventID, row.ID); err != nil {
-				return fmt.Errorf("delete detached media files: %w", err)
-			}
-		}
+		deleteDetachedFiles(ctx, w.Media, rows)
 		totalDetached += int64(len(rows))
 		if len(rows) < mediaCleanupBatchSize {
 			break
@@ -201,34 +199,58 @@ func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) err
 	return nil
 }
 
-// MediaVisibilityArgs moves an event's media files between areas (public,
-// pending, quarantine) to match its current status. It's enqueued in the
-// same transaction as anything that changes an event's visibility: host
-// delete and anonymous-draft delete (this phase); takedown/restore/
-// account-delete/ban land in later phases and reuse the same worker.
+// MediaVisibilityArgs asks for the files of an event's rejected media to be
+// deleted. It is enqueued in the same transaction as the rejection. Jobs are
+// unique per event while one is queued or running, so a burst of rejects
+// queues one event-wide sweep, not one per reject.
 type MediaVisibilityArgs struct {
 	EventID uuid.UUID `json:"event_id"`
 }
 
 func (MediaVisibilityArgs) Kind() string { return "media_visibility" }
 
-// MediaVisibilityWorker re-reads an event's current status/deleted_at and
-// moves its media to match: taken-down or (soft-)deleted moves every file
-// into quarantine in bulk, regardless of moderation state. Otherwise
-// (draft, hidden or published) each file is placed individually by its own
-// moderation_status — approved in public/, pending in pending/, rejected
-// deleted — so an unapproved or rejected guest upload is never exposed
-// through a host's own event just because the rest of its media is public,
-// and a host's own approved uploads are never hidden by draft/hidden
-// status. MoveMedia/MoveEvent are called from every other area into the
-// target, which makes this idempotent and safe to retry regardless of
-// which area the files actually started in. A missing event row (already
-// hard-deleted, e.g. an expired anon draft purged before this job ran) is
-// not an error: Reconcile cleans up any orphaned directory later.
+func (MediaVisibilityArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+			ByState: []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRunning,
+				rivertype.JobStateRetryable,
+				rivertype.JobStateScheduled,
+			},
+		},
+	}
+}
+
+// deleteDetachedFiles removes the files of just-deleted detached media rows,
+// one DeleteMedia call per event. Failures are logged, not returned: the rows
+// are already gone, so a retry could not find them, and media_reconcile sweeps
+// whatever objects are left.
+func deleteDetachedFiles(ctx context.Context, m mediaDeleter, rows []store.DeleteDetachedMediaRow) {
+	byEvent := make(map[uuid.UUID][]uuid.UUID)
+	for _, row := range rows {
+		byEvent[row.EventID] = append(byEvent[row.EventID], row.ID)
+	}
+	for eventID, ids := range byEvent {
+		if err := m.DeleteMedia(ctx, eventID, ids...); err != nil {
+			slog.WarnContext(ctx, "delete detached media files", "event_id", eventID, "count", len(ids), "error", err)
+		}
+	}
+}
+
+// MediaVisibilityWorker deletes the files of an event's rejected media. A
+// taken-down or (soft-)deleted event needs nothing: the media serve check
+// already hides its files, so they stay in place in case it is restored. A
+// missing event row (already hard-deleted, e.g. an expired anon draft purged
+// before this job ran) is not an error: media_reconcile cleans up any
+// orphaned objects later. Files for a rejected row are deleted synchronously
+// when it is rejected; this only cleans up a straggler left by a crash.
 type MediaVisibilityWorker struct {
 	river.WorkerDefaults[MediaVisibilityArgs]
 	Queries *store.Queries
-	Media   *media.Store
+	Media   mediaDeleter
 }
 
 func (w *MediaVisibilityWorker) Work(ctx context.Context, job *river.Job[MediaVisibilityArgs]) error {
@@ -239,53 +261,30 @@ func (w *MediaVisibilityWorker) Work(ctx context.Context, job *river.Job[MediaVi
 	if err != nil {
 		return fmt.Errorf("media visibility: get event state: %w", err)
 	}
-
 	if state.DeletedAt != nil || state.Status == "taken_down" {
-		for _, from := range []media.Area{media.AreaPublic, media.AreaPending} {
-			if err := w.Media.MoveEvent(from, media.AreaQuarantine, job.Args.EventID); err != nil {
-				return fmt.Errorf("media visibility: move %s to quarantine: %w", from, err)
-			}
-		}
 		return nil
 	}
 
-	rows, err := w.Queries.ListMediaModerationByEvent(ctx, job.Args.EventID)
+	ids, err := w.Queries.ListRejectedMediaIDsByEvent(ctx, job.Args.EventID)
 	if err != nil {
-		return fmt.Errorf("media visibility: list media: %w", err)
+		return fmt.Errorf("media visibility: list rejected media: %w", err)
 	}
-	for _, row := range rows {
-		if row.ModerationStatus == "rejected" {
-			// Files for a rejected row are deleted synchronously when it's
-			// rejected; this only cleans up a straggler left by a crash or
-			// an earlier inconsistent state.
-			if err := w.Media.DeleteMedia(job.Args.EventID, row.ID); err != nil {
-				return fmt.Errorf("media visibility: delete rejected %s: %w", row.ID, err)
-			}
-			continue
-		}
-		target := media.AreaPending
-		if row.ModerationStatus == "approved" {
-			target = media.AreaPublic
-		}
-		for _, from := range []media.Area{media.AreaPublic, media.AreaPending, media.AreaQuarantine} {
-			if from == target {
-				continue
-			}
-			if err := w.Media.MoveMedia(from, target, job.Args.EventID, row.ID); err != nil {
-				return fmt.Errorf("media visibility: move %s to %s: %w", row.ID, target, err)
-			}
-		}
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := w.Media.DeleteMedia(ctx, job.Args.EventID, ids...); err != nil {
+		return fmt.Errorf("media visibility: delete rejected media: %w", err)
 	}
 	return nil
 }
 
 // MediaReconcileArgs periodically runs internal/media's Reconcile: it
-// removes media directories that have no matching database row (a crash
-// between Store.Commit and the row insert, or an event/media row that was
-// hard-deleted) across public/, pending/ and quarantine/, plus stale tmp/
-// entries. Event purges and anonymous-draft deletes remove files before rows,
-// so this is the safety net for crashes and older leftovers, not the primary
-// cleanup. Never enqueued manually.
+// removes stored objects that have no matching live database row (a crash
+// between Store.Commit and the row insert, or a media row that was
+// hard-deleted or rejected) plus stale tmp/ entries, and checks the bucket's
+// size against the configured ceiling. Event purges and anonymous-draft
+// deletes remove files before rows, so this is the safety net for crashes and
+// older leftovers, not the primary cleanup. Never enqueued manually.
 type MediaReconcileArgs struct{}
 
 func (MediaReconcileArgs) Kind() string { return "media_reconcile" }
@@ -294,10 +293,22 @@ func (MediaReconcileArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{Queue: "maintenance"}
 }
 
+// mediaReconciler is the part of *media.Store the reconcile worker needs.
+type mediaReconciler interface {
+	Reconcile(ctx context.Context, live media.LiveMediaFunc) (media.ReconcileStats, error)
+}
+
+// reconcileDriftPercent is how far the bucket's byte total may exceed the
+// database's before it is worth a warning: leftovers from crashed uploads
+// and in-flight uploads are normal, a large gap means leaking objects.
+const reconcileDriftPercent = 5
+
 type MediaReconcileWorker struct {
 	river.WorkerDefaults[MediaReconcileArgs]
 	Queries *store.Queries
-	Media   *media.Store
+	Media   mediaReconciler
+	// TotalQuotaBytes is the global storage ceiling (MEDIA_TOTAL_QUOTA_MB).
+	TotalQuotaBytes int64
 }
 
 func (w *MediaReconcileWorker) Timeout(*river.Job[MediaReconcileArgs]) time.Duration {
@@ -305,30 +316,31 @@ func (w *MediaReconcileWorker) Timeout(*river.Job[MediaReconcileArgs]) time.Dura
 }
 
 func (w *MediaReconcileWorker) Work(ctx context.Context, _ *river.Job[MediaReconcileArgs]) error {
-	eventExists := func(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]bool, error) {
-		existing, err := w.Queries.ExistingEventIDs(ctx, ids)
+	live := func(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]bool, error) {
+		found, err := w.Queries.LiveMediaIDs(ctx, ids)
 		if err != nil {
-			return nil, fmt.Errorf("existing event ids: %w", err)
+			return nil, fmt.Errorf("live media ids: %w", err)
 		}
-		out := make(map[uuid.UUID]bool, len(existing))
-		for _, id := range existing {
+		out := make(map[uuid.UUID]bool, len(found))
+		for _, id := range found {
 			out[id] = true
 		}
 		return out, nil
 	}
-	eventMedia := func(ctx context.Context, eventID uuid.UUID) (map[uuid.UUID]bool, error) {
-		ids, err := w.Queries.MediaIDsForEvent(ctx, eventID)
-		if err != nil {
-			return nil, fmt.Errorf("media ids for event %s: %w", eventID, err)
-		}
-		out := make(map[uuid.UUID]bool, len(ids))
-		for _, id := range ids {
-			out[id] = true
-		}
-		return out, nil
-	}
-	if err := w.Media.Reconcile(ctx, eventExists, eventMedia); err != nil {
+	stats, err := w.Media.Reconcile(ctx, live)
+	if err != nil {
 		return fmt.Errorf("media reconcile: %w", err)
+	}
+
+	if w.TotalQuotaBytes > 0 && stats.Bytes >= w.TotalQuotaBytes {
+		slog.ErrorContext(ctx, "media storage at ceiling", "bytes", stats.Bytes, "ceiling_bytes", w.TotalQuotaBytes)
+	}
+	usage, err := w.Queries.MediaStorageUsage(ctx, store.MediaStorageUsageParams{})
+	if err != nil {
+		return fmt.Errorf("media reconcile: storage usage: %w", err)
+	}
+	if stats.Bytes > usage.TotalBytes+usage.TotalBytes*reconcileDriftPercent/100 {
+		slog.WarnContext(ctx, "media storage exceeds database total", "bytes", stats.Bytes, "db_bytes", usage.TotalBytes)
 	}
 	return nil
 }
@@ -395,14 +407,14 @@ func (w *NotifyReportWorker) Timeout(*river.Job[NotifyReportArgs]) time.Duration
 // calendarSender sends the calendar-invite variant of send_rsvp_confirmation
 // (an attending="yes" response); pass the same value as sender to reuse the
 // primary SMTP identity.
-func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *store.Queries, mediaStore *media.Store, tokens *token.Keys, limiter *ratelimit.Limiter, adminAlertEmail, siteURL string) (*Client, error) {
+func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *store.Queries, mediaStore *media.Store, tokens *token.Keys, limiter *ratelimit.Limiter, adminAlertEmail, siteURL string, mediaTotalQuotaBytes int64) (*Client, error) {
 	workers := river.NewWorkers()
 	cleanup := &CleanupWorker{Queries: queries, Pool: pool, Media: mediaStore}
 	river.AddWorker(workers, &SendEmailWorker{Sender: sender})
 	river.AddWorker(workers, cleanup)
 	river.AddWorker(workers, &RetentionReminderWorker{Queries: queries, Sender: sender, Limiter: limiter, SiteURL: siteURL})
 	river.AddWorker(workers, &MediaVisibilityWorker{Queries: queries, Media: mediaStore})
-	river.AddWorker(workers, &MediaReconcileWorker{Queries: queries, Media: mediaStore})
+	river.AddWorker(workers, &MediaReconcileWorker{Queries: queries, Media: mediaStore, TotalQuotaBytes: mediaTotalQuotaBytes})
 	river.AddWorker(workers, &NotifyReportWorker{Queries: queries, Sender: sender, AdminAlertEmail: adminAlertEmail, SiteURL: siteURL})
 	river.AddWorker(workers, &SendInviteWorker{Queries: queries, Sender: sender, Tokens: tokens, Limiter: limiter, SiteURL: siteURL})
 	river.AddWorker(workers, &NotifyCohostAddedWorker{Queries: queries, Sender: sender, SiteURL: siteURL})

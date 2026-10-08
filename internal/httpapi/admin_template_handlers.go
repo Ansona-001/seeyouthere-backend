@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"regexp"
 	"time"
 	"unicode/utf8"
@@ -478,10 +477,9 @@ func (s *Server) handleUploadAdminTemplateBackground(w http.ResponseWriter, r *h
 	if !ok {
 		return
 	}
-	assetsPath, err := s.media.CommitTemplateAsset(outDir, templateID, version)
+	assetsPath, err := s.media.CommitTemplateAsset(ctx, outDir, templateID, version)
 	if err != nil {
-		os.RemoveAll(outDir)
-		serverError(w, r, fmt.Errorf("commit template asset: %w", err))
+		writeStorageError(w, r, fmt.Errorf("commit template asset: %w", err))
 		return
 	}
 

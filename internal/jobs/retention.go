@@ -13,6 +13,7 @@ import (
 	"github.com/riverqueue/river/rivertype"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/mail"
+	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/ratelimit"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 )
@@ -61,7 +62,7 @@ type jobInserter interface {
 
 // mediaDeleter is the part of *media.Store the cleanup worker needs.
 type mediaDeleter interface {
-	DeleteMedia(eventID, mediaID uuid.UUID) error
+	DeleteMedia(ctx context.Context, eventID uuid.UUID, mediaIDs ...uuid.UUID) error
 	DeleteEventFiles(ctx context.Context, eventID uuid.UUID) error
 }
 
@@ -353,11 +354,20 @@ func (w *CleanupWorker) purgeLocked(ctx context.Context, q *store.Queries, liste
 func (w *CleanupWorker) purgeWithFiles(ctx context.Context, ids []uuid.UUID, deleteRows func(context.Context, []uuid.UUID) (int64, error)) (purged int64, failed int, err error) {
 	done := make([]uuid.UUID, 0, len(ids))
 	var ctxErr error
-	for _, id := range ids {
+	for i, id := range ids {
 		if ctxErr = ctx.Err(); ctxErr != nil {
 			break
 		}
 		if err := w.Media.DeleteEventFiles(ctx, id); err != nil {
+			if errors.Is(err, media.ErrStorageUnavailable) {
+				// The object store is down: trying the rest would only hold the
+				// caller's transaction open while every call retries and fails.
+				// Keep them all for the next run.
+				failed += len(ids) - i
+				slog.ErrorContext(ctx, "purge event files: object storage unavailable, keeping remaining events",
+					"event_id", id, "kept", len(ids)-i, "error", err)
+				break
+			}
 			failed++
 			slog.ErrorContext(ctx, "purge event files", "event_id", id, "error", err)
 			continue
