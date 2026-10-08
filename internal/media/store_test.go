@@ -3,304 +3,370 @@ package media
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 )
 
-func writeRendition(t *testing.T, dir string, w int) {
+func writeRenditions(t *testing.T, dir string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, renditionName(w)), []byte("fake jpeg bytes"), 0o644); err != nil {
-		t.Fatalf("write rendition: %v", err)
-	}
-}
-
-func TestNewStore_CreatesLayout(t *testing.T) {
-	root := t.TempDir()
-	if _, err := NewStore(root); err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	for _, dir := range []string{"tmp", "public", "pending", "quarantine"} {
-		if info, err := os.Stat(filepath.Join(root, dir)); err != nil || !info.IsDir() {
-			t.Errorf("expected directory %s to exist", dir)
+	for _, w := range Widths {
+		if err := os.WriteFile(filepath.Join(dir, renditionName(w)), []byte(fmt.Sprintf("jpeg-%d", w)), 0o644); err != nil {
+			t.Fatalf("write rendition: %v", err)
 		}
 	}
 }
 
-func TestStore_CommitAndOpen(t *testing.T) {
-	s := newTestStore(t)
-	eventID, mediaID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+func newIDs() (uuid.UUID, uuid.UUID) { return uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()) }
 
-	outDir := t.TempDir()
-	for _, w := range Widths {
-		writeRendition(t, outDir, w)
+func TestNewStore_CreatesTmp(t *testing.T) {
+	root := t.TempDir()
+	if _, err := NewStore(root, newMemBlobs()); err != nil {
+		t.Fatalf("NewStore: %v", err)
 	}
-	if err := s.Commit(outDir, AreaPublic, eventID, mediaID); err != nil {
+	if info, err := os.Stat(filepath.Join(root, "tmp")); err != nil || !info.IsDir() {
+		t.Error("expected tmp directory to exist")
+	}
+}
+
+func TestNewStore_RootNotWritable(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStore(file, newMemBlobs()); err == nil {
+		t.Error("expected error when root is a file")
+	}
+}
+
+func TestStore_Commit(t *testing.T) {
+	s, b := newTestStoreBlobs(t)
+	eventID, mediaID := newIDs()
+	outDir := t.TempDir()
+	writeRenditions(t, outDir)
+
+	if err := s.Commit(context.Background(), outDir, eventID, mediaID); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
+	for _, w := range Widths {
+		if !b.has(fmt.Sprintf("e/%s/%s/%d.jpg", eventID, mediaID, w)) {
+			t.Errorf("rendition %d not stored", w)
+		}
+	}
+	if b.count() != 3 {
+		t.Errorf("objects = %d, want 3", b.count())
+	}
+	if _, err := os.Stat(outDir); !os.IsNotExist(err) {
+		t.Error("outDir should be removed after Commit")
+	}
+}
 
-	f, err := s.Open(eventID, mediaID, 480)
+func TestStore_Commit_Failures(t *testing.T) {
+	errBoom := errors.New("boom")
+	tests := []struct {
+		name    string
+		failOn  int // width whose Put fails; 0 = missing rendition file instead
+		cancel  bool
+		wantErr error
+	}{
+		{name: "second rendition put fails", failOn: 1080, wantErr: errBoom},
+		{name: "first rendition put fails", failOn: 480, wantErr: errBoom},
+		{name: "cancelled context", cancel: true, wantErr: context.Canceled},
+		{name: "missing rendition file", failOn: 0, wantErr: os.ErrNotExist},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, b := newTestStoreBlobs(t)
+			eventID, mediaID := newIDs()
+			outDir := t.TempDir()
+			writeRenditions(t, outDir)
+			ctx := context.Background()
+			switch {
+			case tt.cancel:
+				c, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = c
+				b.putErr = func(string) error { return c.Err() }
+			case tt.failOn == 0:
+				if err := os.Remove(filepath.Join(outDir, renditionName(Widths[2]))); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				b.putErr = func(key string) error {
+					if strings.HasSuffix(key, fmt.Sprintf("/%d.jpg", tt.failOn)) {
+						return errBoom
+					}
+					return nil
+				}
+			}
+
+			err := s.Commit(ctx, outDir, eventID, mediaID)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+			if b.count() != 0 {
+				t.Errorf("%d objects left after failed Commit", b.count())
+			}
+			if _, err := os.Stat(outDir); !os.IsNotExist(err) {
+				t.Error("outDir should be removed even when Commit fails")
+			}
+			if tt.cancel && b.deletes == 0 {
+				t.Error("cleanup delete should run despite cancelled context")
+			}
+		})
+	}
+}
+
+func TestStore_Commit_CleanupFailureReturnsPutError(t *testing.T) {
+	s, b := newTestStoreBlobs(t)
+	errPut := errors.New("put failed")
+	b.putErr = func(key string) error {
+		if strings.HasSuffix(key, "/1920.jpg") {
+			return errPut
+		}
+		return nil
+	}
+	b.deleteErr = errors.New("delete failed")
+	outDir := t.TempDir()
+	writeRenditions(t, outDir)
+	eventID, mediaID := newIDs()
+	if err := s.Commit(context.Background(), outDir, eventID, mediaID); !errors.Is(err, errPut) {
+		t.Errorf("err = %v, want the put error", err)
+	}
+}
+
+func TestStore_Open(t *testing.T) {
+	s, b := newTestStoreBlobs(t)
+	eventID, mediaID := newIDs()
+	outDir := t.TempDir()
+	writeRenditions(t, outDir)
+	if err := s.Commit(context.Background(), outDir, eventID, mediaID); err != nil {
+		t.Fatal(err)
+	}
+
+	obj, err := s.Open(context.Background(), eventID, mediaID, 480, "")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	f.Close()
-
-	if _, err := os.Stat(outDir); !os.IsNotExist(err) {
-		t.Error("outDir should have been moved (renamed), not copied")
-	}
-}
-
-func TestStore_Open_NotFound(t *testing.T) {
-	s := newTestStore(t)
-	if err := openAndClose(s, uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), 480); !os.IsNotExist(err) {
-		t.Errorf("err = %v, want os.IsNotExist", err)
-	}
-}
-
-func TestStore_MoveMedia(t *testing.T) {
-	s := newTestStore(t)
-	eventID, mediaID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
-	outDir := t.TempDir()
-	writeRendition(t, outDir, 480)
-	if err := s.Commit(outDir, AreaPending, eventID, mediaID); err != nil {
-		t.Fatalf("Commit: %v", err)
+	body, _ := io.ReadAll(obj.Body)
+	obj.Body.Close()
+	if string(body) != "jpeg-480" || obj.Size != int64(len(body)) || obj.ETag == "" {
+		t.Errorf("got body %q size %d etag %q", body, obj.Size, obj.ETag)
 	}
 
-	if err := s.MoveMedia(AreaPending, AreaPublic, eventID, mediaID); err != nil {
-		t.Fatalf("MoveMedia: %v", err)
+	tests := []struct {
+		name    string
+		event   uuid.UUID
+		media   uuid.UUID
+		width   int
+		inm     string
+		wantErr error
+		wantGet bool
+	}{
+		{"unknown media", eventID, uuid.Must(uuid.NewV7()), 480, "", ErrNotFound, true},
+		{"wrong event", uuid.Must(uuid.NewV7()), mediaID, 480, "", ErrNotFound, true},
+		{"invalid width", eventID, mediaID, 500, "", ErrNotFound, false},
+		{"zero width", eventID, mediaID, 0, "", ErrNotFound, false},
+		{"etag match", eventID, mediaID, 480, obj.ETag, ErrNotModified, true},
 	}
-	if err := openAndClose(s, eventID, mediaID, 480); err != nil {
-		t.Fatalf("expected media to be openable from public after move: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := b.gets
+			_, err := s.Open(context.Background(), tt.event, tt.media, tt.width, tt.inm)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("err = %v, want %v", err, tt.wantErr)
+			}
+			if got := b.gets - before; (got == 1) != tt.wantGet {
+				t.Errorf("backend gets = %d, wantGet = %v", got, tt.wantGet)
+			}
+		})
 	}
 
-	// Missing source is not an error.
-	if err := s.MoveMedia(AreaPending, AreaQuarantine, eventID, mediaID); err != nil {
-		t.Errorf("MoveMedia of an already-moved (now missing) source should not error: %v", err)
-	}
-}
-
-func TestStore_MoveEvent_IdempotentAndMerges(t *testing.T) {
-	s := newTestStore(t)
-	eventID := uuid.Must(uuid.NewV7())
-	media1, media2 := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
-
-	for _, m := range []uuid.UUID{media1, media2} {
-		outDir := t.TempDir()
-		writeRendition(t, outDir, 480)
-		if err := s.Commit(outDir, AreaPublic, eventID, m); err != nil {
-			t.Fatalf("Commit: %v", err)
+	t.Run("backend error passes through", func(t *testing.T) {
+		b.getErr = ErrStorageUnavailable
+		if _, err := s.Open(context.Background(), eventID, mediaID, 480, ""); !errors.Is(err, ErrStorageUnavailable) {
+			t.Errorf("err = %v", err)
 		}
-	}
-
-	if err := s.MoveEvent(AreaPublic, AreaQuarantine, eventID); err != nil {
-		t.Fatalf("MoveEvent: %v", err)
-	}
-	for _, m := range []uuid.UUID{media1, media2} {
-		if err := openAndClose(s, eventID, m, 480); err != nil {
-			t.Errorf("media %s should be openable from quarantine: %v", m, err)
-		}
-	}
-
-	// Idempotent: moving again (source now empty/missing) is a no-op, not an error.
-	if err := s.MoveEvent(AreaPublic, AreaQuarantine, eventID); err != nil {
-		t.Errorf("repeat MoveEvent should be a no-op: %v", err)
-	}
-
-	// Move back, then add a new media item to "public" and move again: the
-	// existing quarantine dir must be merged into, not clobbered/failed.
-	if err := s.MoveEvent(AreaQuarantine, AreaPublic, eventID); err != nil {
-		t.Fatalf("MoveEvent back: %v", err)
-	}
-	media3 := uuid.Must(uuid.NewV7())
-	outDir := t.TempDir()
-	writeRendition(t, outDir, 480)
-	if err := s.Commit(outDir, AreaQuarantine, eventID, media3); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-	if err := s.MoveEvent(AreaPublic, AreaQuarantine, eventID); err != nil {
-		t.Fatalf("MoveEvent merge: %v", err)
-	}
-	for _, m := range []uuid.UUID{media1, media2, media3} {
-		if err := openAndClose(s, eventID, m, 480); err != nil {
-			t.Errorf("media %s should be openable after merge: %v", m, err)
-		}
-	}
+	})
 }
 
 func TestStore_DeleteMedia(t *testing.T) {
-	s := newTestStore(t)
-	eventID, mediaID := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
-	outDir := t.TempDir()
-	writeRendition(t, outDir, 480)
-	if err := s.Commit(outDir, AreaPublic, eventID, mediaID); err != nil {
-		t.Fatalf("Commit: %v", err)
+	s, b := newTestStoreBlobs(t)
+	eventID, mediaID := newIDs()
+	otherMedia := uuid.Must(uuid.NewV7())
+	for _, m := range []uuid.UUID{mediaID, otherMedia} {
+		outDir := t.TempDir()
+		writeRenditions(t, outDir)
+		if err := s.Commit(context.Background(), outDir, eventID, m); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	if err := s.DeleteMedia(eventID, mediaID); err != nil {
+	if err := s.DeleteMedia(context.Background(), eventID, mediaID); err != nil {
 		t.Fatalf("DeleteMedia: %v", err)
 	}
-	if err := openAndClose(s, eventID, mediaID, 480); !os.IsNotExist(err) {
-		t.Errorf("media should be gone after delete, err = %v", err)
+	if b.count() != 3 || !b.has(mediaKey(eventID, otherMedia, 480)) {
+		t.Errorf("only the named media should be removed, %d objects left", b.count())
+	}
+	if err := s.DeleteMedia(context.Background(), eventID, mediaID); err != nil {
+		t.Errorf("deleting already-missing media: %v", err)
 	}
 
-	// Deleting again (already missing) is not an error.
-	if err := s.DeleteMedia(eventID, mediaID); err != nil {
-		t.Errorf("deleting already-missing media should not error: %v", err)
-	}
+	t.Run("no ids makes no backend call", func(t *testing.T) {
+		before := b.deletes
+		if err := s.DeleteMedia(context.Background(), eventID); err != nil {
+			t.Fatal(err)
+		}
+		if b.deletes != before {
+			t.Error("backend Delete called for empty id list")
+		}
+	})
+
+	t.Run("many ids go in one backend call", func(t *testing.T) {
+		ids := make([]uuid.UUID, 400)
+		for i := range ids {
+			ids[i] = uuid.Must(uuid.NewV7())
+		}
+		before := len(b.deleteBatches)
+		if err := s.DeleteMedia(context.Background(), eventID, ids...); err != nil {
+			t.Fatal(err)
+		}
+		if len(b.deleteBatches) != before+1 || len(b.deleteBatches[before]) != 1200 {
+			t.Errorf("want one batch of 1200 keys, got %d batches", len(b.deleteBatches)-before)
+		}
+	})
+
+	t.Run("backend failure is returned", func(t *testing.T) {
+		b.deleteErr = ErrStorageUnavailable
+		if err := s.DeleteMedia(context.Background(), eventID, otherMedia); !errors.Is(err, ErrStorageUnavailable) {
+			t.Errorf("err = %v", err)
+		}
+		if !b.has(mediaKey(eventID, otherMedia, 480)) {
+			t.Error("object removed despite failing backend")
+		}
+	})
 }
 
 func TestStore_CommitTemplateAsset(t *testing.T) {
-	s := newTestStore(t)
+	s, b := newTestStoreBlobs(t)
 	templateID := uuid.Must(uuid.NewV7())
 	outDir := t.TempDir()
-	writeRendition(t, outDir, 480)
+	writeRenditions(t, outDir)
 
-	assetsPath, err := s.CommitTemplateAsset(outDir, templateID, 3)
+	assetsPath, err := s.CommitTemplateAsset(context.Background(), outDir, templateID, 3)
 	if err != nil {
 		t.Fatalf("CommitTemplateAsset: %v", err)
 	}
-	want := "templates/" + templateID.String() + "/3"
-	if assetsPath != want {
+	if want := "templates/" + templateID.String() + "/3"; assetsPath != want {
 		t.Errorf("assetsPath = %q, want %q", assetsPath, want)
 	}
-	if _, err := os.Stat(filepath.Join(s.root, "public", assetsPath, "background", "480.jpg")); err != nil {
-		t.Errorf("expected background file at the returned path: %v", err)
+	for _, w := range Widths {
+		if !b.has(fmt.Sprintf("t/%s/3/%d.jpg", templateID, w)) {
+			t.Errorf("rendition %d not stored", w)
+		}
 	}
+	if _, err := os.Stat(outDir); !os.IsNotExist(err) {
+		t.Error("outDir should be removed")
+	}
+
+	// Re-upload overwrites in place.
+	outDir = t.TempDir()
+	for _, w := range Widths {
+		if err := os.WriteFile(filepath.Join(outDir, renditionName(w)), []byte("v2"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.CommitTemplateAsset(context.Background(), outDir, templateID, 3); err != nil {
+		t.Fatalf("reupload: %v", err)
+	}
+	obj, err := s.OpenTemplateAsset(context.Background(), templateID, 3, 1080, "")
+	if err != nil {
+		t.Fatalf("OpenTemplateAsset: %v", err)
+	}
+	body, _ := io.ReadAll(obj.Body)
+	obj.Body.Close()
+	if string(body) != "v2" {
+		t.Errorf("body = %q, want overwritten content", body)
+	}
+
+	t.Run("put failure", func(t *testing.T) {
+		b.putErr = func(string) error { return ErrStorageUnavailable }
+		out := t.TempDir()
+		writeRenditions(t, out)
+		if _, err := s.CommitTemplateAsset(context.Background(), out, templateID, 4); !errors.Is(err, ErrStorageUnavailable) {
+			t.Errorf("err = %v", err)
+		}
+		if _, err := os.Stat(out); !os.IsNotExist(err) {
+			t.Error("outDir should be removed on failure")
+		}
+	})
 }
 
-func TestStore_CommitTemplateAsset_Reupload(t *testing.T) {
-	s := newTestStore(t)
-	templateID := uuid.Must(uuid.NewV7())
-
-	firstDir := t.TempDir()
-	writeRendition(t, firstDir, 480)
-	if _, err := s.CommitTemplateAsset(firstDir, templateID, 3); err != nil {
-		t.Fatalf("first CommitTemplateAsset: %v", err)
+func TestStore_OpenTemplateAsset_Errors(t *testing.T) {
+	s, _ := newTestStoreBlobs(t)
+	id := uuid.Must(uuid.NewV7())
+	tests := []struct {
+		name  string
+		width int
+	}{
+		{"missing object", 480},
+		{"invalid width", 481},
 	}
-
-	// Re-upload: outDir differs (a new file) from the previously committed
-	// asset. On most platforms os.Rename onto a non-empty directory fails,
-	// so CommitTemplateAsset must swap it in rather than plain-renaming.
-	secondDir := t.TempDir()
-	writeRendition(t, secondDir, 1080)
-	assetsPath, err := s.CommitTemplateAsset(secondDir, templateID, 3)
-	if err != nil {
-		t.Fatalf("second CommitTemplateAsset (reupload): %v", err)
-	}
-
-	bgDir := filepath.Join(s.root, "public", assetsPath, "background")
-	if _, err := os.Stat(filepath.Join(bgDir, "1080.jpg")); err != nil {
-		t.Errorf("expected new rendition at the returned path: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(bgDir, "480.jpg")); !os.IsNotExist(err) {
-		t.Errorf("expected old rendition to be gone after reupload, err = %v", err)
-	}
-
-	// No staging/displaced siblings should be left behind.
-	entries, err := os.ReadDir(filepath.Dir(s.templateDir(templateID, 3)))
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	if len(entries) != 1 || entries[0].Name() != "background" {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
-		}
-		t.Errorf("expected only the committed version dir, got %v", names)
-	}
-}
-
-func TestStore_CommitTemplateAsset_FailurePartwayLeavesExistingAssetIntact(t *testing.T) {
-	s := newTestStore(t)
-	templateID := uuid.Must(uuid.NewV7())
-
-	firstDir := t.TempDir()
-	writeRendition(t, firstDir, 480)
-	assetsPath, err := s.CommitTemplateAsset(firstDir, templateID, 3)
-	if err != nil {
-		t.Fatalf("first CommitTemplateAsset: %v", err)
-	}
-
-	// A non-existent outDir makes the initial stage rename fail before
-	// anything about the existing asset is touched.
-	if _, err := s.CommitTemplateAsset(filepath.Join(t.TempDir(), "missing"), templateID, 3); err == nil {
-		t.Fatal("expected error for missing outDir")
-	}
-
-	bgDir := filepath.Join(s.root, "public", assetsPath, "background")
-	if _, err := os.Stat(filepath.Join(bgDir, "480.jpg")); err != nil {
-		t.Errorf("existing asset should be untouched after a failed reupload: %v", err)
-	}
-	entries, err := os.ReadDir(filepath.Dir(s.templateDir(templateID, 3)))
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	if len(entries) != 1 || entries[0].Name() != "background" {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
-		}
-		t.Errorf("expected only the original version dir after failure, got %v", names)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := s.OpenTemplateAsset(context.Background(), id, 1, tt.width, ""); !errors.Is(err, ErrNotFound) {
+				t.Errorf("err = %v, want ErrNotFound", err)
+			}
+		})
 	}
 }
 
 func TestStore_CheckFree(t *testing.T) {
 	s := newTestStore(t)
-	// On a real dev machine this should always have >2GiB free; this is a
-	// smoke test that CheckFree doesn't error, not a disk-full simulation
-	// (see diskfree_other.go's no-op on non-Linux).
+	// Smoke test that CheckFree doesn't error (see diskfree_other.go's
+	// no-op on non-Linux), not a disk-full simulation.
 	if err := s.CheckFree(); err != nil {
 		t.Errorf("CheckFree: %v", err)
 	}
 }
 
 func TestStore_DeleteEventFiles(t *testing.T) {
-	s := newTestStore(t)
-	eventA, eventB := uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())
+	s, b := newTestStoreBlobs(t)
+	b.pageSize = 2 // force several pages
+	eventA, eventB := newIDs()
 	templateID := uuid.Must(uuid.NewV7())
 
-	put := func(area Area, eventID uuid.UUID) string {
-		t.Helper()
-		dir := filepath.Join(s.root, string(area), eventID.String(), uuid.Must(uuid.NewV7()).String())
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
+	for i := 0; i < 3; i++ {
+		for _, ev := range []uuid.UUID{eventA, eventB} {
+			outDir := t.TempDir()
+			writeRenditions(t, outDir)
+			if err := s.Commit(context.Background(), outDir, ev, uuid.Must(uuid.NewV7())); err != nil {
+				t.Fatal(err)
+			}
 		}
-		writeRendition(t, dir, Widths[0])
-		return filepath.Dir(dir)
 	}
-	areas := []Area{AreaPublic, AreaPending, AreaQuarantine}
-	var aDirs, bDirs []string
-	for _, a := range areas {
-		aDirs = append(aDirs, put(a, eventA))
-		bDirs = append(bDirs, put(a, eventB))
-	}
-	templateFile := filepath.Join(s.root, "public", "templates", templateID.String(), "1", "background")
-	if err := os.MkdirAll(templateFile, 0o755); err != nil {
-		t.Fatalf("mkdir template: %v", err)
-	}
-
-	exists := func(path string) bool {
-		_, err := os.Stat(path)
-		return err == nil
-	}
+	b.seed(templateKey(templateID, 1, 480), 5, 0)
+	b.seed("e/"+eventA.String()+"/stray-orphan.jpg", 5, 0) // sweeps orphans too
 
 	if err := s.DeleteEventFiles(context.Background(), eventA); err != nil {
 		t.Fatalf("DeleteEventFiles: %v", err)
 	}
-	for _, d := range aDirs {
-		if exists(d) {
-			t.Errorf("%s still exists after delete", d)
+	for k := range b.objs {
+		if strings.HasPrefix(k, "e/"+eventA.String()+"/") {
+			t.Errorf("%s of the deleted event remains", k)
 		}
 	}
-	for _, d := range bDirs {
-		if !exists(d) {
-			t.Errorf("%s of another event was removed", d)
-		}
+	if b.count() != 9+1 {
+		t.Errorf("objects left = %d, want 10 (event B + template)", b.count())
 	}
-	if !exists(templateFile) {
-		t.Error("public/templates was removed")
+	if len(b.deleteBatches) < 5 {
+		t.Errorf("expected page-by-page deletes, got %d batches", len(b.deleteBatches))
 	}
 
 	t.Run("second call and never-existing event", func(t *testing.T) {
@@ -312,17 +378,46 @@ func TestStore_DeleteEventFiles(t *testing.T) {
 		}
 	})
 
-	t.Run("cancelled context", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		err := s.DeleteEventFiles(ctx, eventB)
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("err = %v, want context.Canceled", err)
+	t.Run("list failure", func(t *testing.T) {
+		b.listErr = ErrStorageUnavailable
+		defer func() { b.listErr = nil }()
+		if err := s.DeleteEventFiles(context.Background(), eventB); !errors.Is(err, ErrStorageUnavailable) {
+			t.Errorf("err = %v", err)
 		}
-		for _, d := range bDirs {
-			if !exists(d) {
-				t.Errorf("%s removed despite cancelled context", d)
+	})
+
+	t.Run("delete failure keeps objects", func(t *testing.T) {
+		b.deleteErr = ErrStorageUnavailable
+		defer func() { b.deleteErr = nil }()
+		before := b.count()
+		if err := s.DeleteEventFiles(context.Background(), eventB); !errors.Is(err, ErrStorageUnavailable) {
+			t.Errorf("err = %v", err)
+		}
+		if b.count() != before {
+			t.Error("objects removed despite failing delete")
+		}
+	})
+
+	t.Run("invalid keys are skipped, not deleted", func(t *testing.T) {
+		bad := "e/" + eventB.String() + "/UPPER.JPG"
+		b.seed(bad, 5, 0)
+		b.deleteBatches = nil
+		if err := s.DeleteEventFiles(context.Background(), eventB); err != nil {
+			t.Fatalf("DeleteEventFiles: %v", err)
+		}
+		for _, batch := range b.deleteBatches {
+			if slices.Contains(batch, bad) {
+				t.Errorf("invalid key passed to Delete: %v", batch)
 			}
 		}
+		if !b.has(bad) {
+			t.Error("invalid key should be left in place")
+		}
+		for k := range b.objs {
+			if strings.HasPrefix(k, "e/"+eventB.String()+"/") && k != bad {
+				t.Errorf("%s of the deleted event remains", k)
+			}
+		}
+		delete(b.objs, bad)
 	})
 }

@@ -2,17 +2,21 @@ package media
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"image"
 	"image/color"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"io"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // solidImage returns a w x h image where each quadrant has a distinct
@@ -244,22 +248,145 @@ func acquireWaitForTest(t *testing.T, ms int) func() {
 	return func() { acquireWait = old }
 }
 
-// openAndClose is Store.Open followed by an immediate Close, for tests that
-// only care whether a rendition is openable: Windows won't let a later
-// rename/RemoveAll touch a file with a still-open handle, unlike POSIX.
-func openAndClose(s *Store, eventID, mediaID uuid.UUID, width int) error {
-	f, err := s.Open(eventID, mediaID, width)
-	if err != nil {
-		return err
-	}
-	return f.Close()
-}
-
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := NewStore(t.TempDir())
+	s, _ := newTestStoreBlobs(t)
+	return s
+}
+
+// newTestStoreBlobs returns a Store backed by an in-memory fake, plus the
+// fake for call counters, failure injection and direct inspection.
+func newTestStoreBlobs(t *testing.T) (*Store, *memBlobs) {
+	t.Helper()
+	b := newMemBlobs()
+	s, err := NewStore(t.TempDir(), b)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	return s
+	return s, b
+}
+
+// memBlobs is an in-memory Blobs with call counters and failure injection.
+type memBlobs struct {
+	mu       sync.Mutex
+	objs     map[string]memObj
+	pageSize int
+
+	puts, gets, deletes, lists int // call counts
+	deleteBatches              [][]string
+
+	putErr    func(key string) error // returned instead of storing, when non-nil
+	getErr    error
+	deleteErr error
+	listErr   error
+}
+
+type memObj struct {
+	data []byte
+	mod  time.Time
+}
+
+func newMemBlobs() *memBlobs {
+	return &memBlobs{objs: map[string]memObj{}, pageSize: listPageSize}
+}
+
+func (m *memBlobs) Put(_ context.Context, key string, body io.ReadSeeker, size int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.puts++
+	if !ValidKey(key) {
+		return errInvalidKey(key)
+	}
+	if m.putErr != nil {
+		if err := m.putErr(key); err != nil {
+			return err
+		}
+	}
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) != size {
+		return fmt.Errorf("size mismatch: %d != %d", len(data), size)
+	}
+	m.objs[key] = memObj{data: data, mod: time.Now()}
+	return nil
+}
+
+func memETag(o memObj) string { return fmt.Sprintf("\"%d\"", len(o.data)) }
+
+func (m *memBlobs) Get(_ context.Context, key, ifNoneMatch string) (*Object, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gets++
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
+	o, ok := m.objs[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if ifNoneMatch != "" && ifNoneMatch == memETag(o) {
+		return nil, ErrNotModified
+	}
+	return &Object{Body: io.NopCloser(bytes.NewReader(o.data)), Size: int64(len(o.data)), ETag: memETag(o)}, nil
+}
+
+func (m *memBlobs) Delete(_ context.Context, keys []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deletes++
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	m.deleteBatches = append(m.deleteBatches, slices.Clone(keys))
+	for _, k := range keys {
+		delete(m.objs, k)
+	}
+	return nil
+}
+
+func (m *memBlobs) List(_ context.Context, prefix string, fn func([]ObjectInfo) error) error {
+	m.mu.Lock()
+	m.lists++
+	if m.listErr != nil {
+		m.mu.Unlock()
+		return m.listErr
+	}
+	var all []ObjectInfo
+	for k, o := range m.objs {
+		if strings.HasPrefix(k, prefix) {
+			all = append(all, ObjectInfo{Key: k, Size: int64(len(o.data)), LastModified: o.mod})
+		}
+	}
+	m.mu.Unlock() // fn may call back into the fake (Delete)
+	slices.SortFunc(all, func(a, b ObjectInfo) int { return strings.Compare(a.Key, b.Key) })
+	for len(all) > 0 {
+		n := min(m.pageSize, len(all))
+		if err := fn(all[:n]); err != nil {
+			return err
+		}
+		all = all[n:]
+	}
+	return nil
+}
+
+func (m *memBlobs) has(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.objs[key]
+	return ok
+}
+
+func (m *memBlobs) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.objs)
+}
+
+// seed stores an object last modified age ago.
+func (m *memBlobs) seed(key string, size int, age time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objs[key] = memObj{data: make([]byte, size), mod: time.Now().Add(-age)}
 }

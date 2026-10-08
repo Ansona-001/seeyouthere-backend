@@ -14,7 +14,7 @@ func BenchmarkProcess_24MP(b *testing.B) {
 	if err != nil {
 		b.Fatalf("encode fixture: %v", err)
 	}
-	s, err := NewStore(b.TempDir())
+	s, err := NewStore(b.TempDir(), newMemBlobs())
 	if err != nil {
 		b.Fatalf("NewStore: %v", err)
 	}

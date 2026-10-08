@@ -3,131 +3,137 @@ package media
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// batchSize bounds how many directory entries reconcile inspects per DB
-// round trip, matching the plan's "batches of 500 names".
-const batchSize = 500
-
-// orphanAge is how long a directory with no matching DB row must sit before
-// it's removed, so a request that's mid-flight (files committed, row insert
+// orphanAge is how long an object with no live media row must sit before
+// it's removed, so a request that's mid-flight (objects uploaded, row insert
 // not yet committed) is never deleted out from under it.
 const orphanAge = time.Hour
 
-// EventExistsFunc reports which of the given (candidate) event ids still
-// have a live row, backed by ExistingEventIDs.
-type EventExistsFunc func(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]bool, error)
+// LiveMediaFunc reports which of the given media ids still have a live
+// (non-rejected) row. It takes at most one listing page of ids (<= 1000).
+type LiveMediaFunc func(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]bool, error)
 
-// EventMediaFunc reports which media ids exist for eventID, backed by
-// MediaIDsForEvent.
-type EventMediaFunc func(ctx context.Context, eventID uuid.UUID) (map[uuid.UUID]bool, error)
-
-// Reconcile walks public/, pending/ and quarantine/ removing directories
-// that don't correspond to a database row and are older than orphanAge (a
-// crash between Store.Commit and the row insert leaves exactly this kind of
-// orphan; see decision 9 in the media pipeline notes), and removes stale
-// tmp/ entries. It takes its DB lookups as functions rather than importing
-// internal/store directly, keeping this package free of a database
-// dependency; the jobs package wires these to real queries.
-func (s *Store) Reconcile(ctx context.Context, eventExists EventExistsFunc, eventMedia EventMediaFunc) error {
-	now := time.Now()
-	for _, area := range []Area{AreaPublic, AreaPending, AreaQuarantine} {
-		if err := s.reconcileArea(ctx, area, eventExists, eventMedia, now); err != nil {
-			return err
-		}
-	}
-	return s.reconcileTmp(now)
+// ReconcileStats summarises one reconcile pass: every object listed under
+// "e/" (Objects, Bytes, taken before any orphan was removed) and how many
+// orphans were deleted.
+type ReconcileStats struct {
+	Objects        int
+	Bytes          int64
+	OrphansDeleted int
 }
 
-func (s *Store) reconcileArea(ctx context.Context, area Area, eventExists EventExistsFunc, eventMedia EventMediaFunc, now time.Time) error {
-	areaRoot := filepath.Join(s.root, string(area))
-	entries, err := os.ReadDir(areaRoot)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("media: reconcile list %s: %w", area, err)
-	}
+// Reconcile removes objects under "e/" whose media row is gone or rejected
+// and that are older than orphanAge (a crash between Store.Commit and the
+// row insert leaves exactly this kind of orphan), and removes stale tmp/
+// entries. Keys it can't parse are logged and left alone. Template objects
+// ("t/") are not reconciled. It takes its DB lookup as a function rather
+// than importing internal/store, keeping this package free of a database
+// dependency; the jobs package wires it to a real query. Memory is bounded
+// by one listing page. The stats are returned even alongside an error, for
+// whatever was processed before it.
+func (s *Store) Reconcile(ctx context.Context, live LiveMediaFunc) (ReconcileStats, error) {
+	now := time.Now()
+	var st ReconcileStats
+	var unparseable int
 
-	for batchStart := 0; batchStart < len(entries); batchStart += batchSize {
-		batch := entries[batchStart:min(batchStart+batchSize, len(entries))]
-
-		var ids []uuid.UUID
-		byID := make(map[uuid.UUID]os.DirEntry, len(batch))
-		for _, e := range batch {
-			if !e.IsDir() || e.Name() == "templates" {
+	err := s.blobs.List(ctx, "e/", func(page []ObjectInfo) error {
+		ids := make([]uuid.UUID, 0, len(page))
+		keyMedia := make([]uuid.UUID, len(page)) // uuid.Nil = unparseable
+		seen := make(map[uuid.UUID]struct{}, len(page))
+		for i, o := range page {
+			st.Objects++
+			st.Bytes += o.Size
+			id, ok := mediaIDFromKey(o.Key)
+			if !ok {
+				unparseable++
 				continue
 			}
-			id, err := uuid.Parse(e.Name())
-			if err != nil {
-				continue // not an event directory; leave it alone
+			keyMedia[i] = id
+			if _, dup := seen[id]; !dup {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
 			}
-			ids = append(ids, id)
-			byID[id] = e
 		}
 		if len(ids) == 0 {
-			continue
-		}
-
-		exists, err := eventExists(ctx, ids)
-		if err != nil {
-			return fmt.Errorf("media: reconcile check events: %w", err)
-		}
-
-		for _, id := range ids {
-			eventDir := filepath.Join(areaRoot, id.String())
-			if !exists[id] {
-				if olderThan(eventDir, orphanAge, now) {
-					_ = os.RemoveAll(eventDir)
-				}
-				continue
-			}
-			if err := s.reconcileEventMedia(ctx, eventDir, id, eventMedia, now); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (s *Store) reconcileEventMedia(ctx context.Context, eventDir string, eventID uuid.UUID, eventMedia EventMediaFunc, now time.Time) error {
-	mediaEntries, err := os.ReadDir(eventDir)
-	if err != nil {
-		if os.IsNotExist(err) {
 			return nil
 		}
-		return fmt.Errorf("media: reconcile list event dir: %w", err)
-	}
-	if len(mediaEntries) == 0 {
+
+		liveIDs, err := live(ctx, ids)
+		if err != nil {
+			return fmt.Errorf("check live media: %w", err)
+		}
+		var doomed []string
+		for i, o := range page {
+			id := keyMedia[i]
+			if id == uuid.Nil || liveIDs[id] || now.Sub(o.LastModified) <= orphanAge {
+				continue
+			}
+			doomed = append(doomed, o.Key)
+		}
+		if len(doomed) == 0 {
+			return nil
+		}
+		if err := s.blobs.Delete(ctx, doomed); err != nil {
+			return fmt.Errorf("delete orphans: %w", err)
+		}
+		st.OrphansDeleted += len(doomed)
 		return nil
+	})
+	if err != nil {
+		return st, fmt.Errorf("media: reconcile: %w", err)
 	}
 
-	known, err := eventMedia(ctx, eventID)
-	if err != nil {
-		return fmt.Errorf("media: reconcile check media: %w", err)
+	if unparseable > 0 {
+		slog.WarnContext(ctx, "media reconcile skipped unrecognised keys", "count", unparseable)
 	}
-	for _, e := range mediaEntries {
-		if !e.IsDir() {
-			continue
-		}
-		id, err := uuid.Parse(e.Name())
-		if err != nil {
-			continue
-		}
-		if known[id] {
-			continue
-		}
-		dir := filepath.Join(eventDir, e.Name())
-		if olderThan(dir, orphanAge, now) {
-			_ = os.RemoveAll(dir)
-		}
+	slog.InfoContext(ctx, "media reconcile", "objects", st.Objects, "bytes", st.Bytes, "orphans_deleted", st.OrphansDeleted)
+	return st, s.reconcileTmp(now)
+}
+
+// mediaIDFromKey extracts the media id from "e/<event>/<media>/<w>.jpg". The
+// key must be valid and both ids canonical (lowercase, hyphenated), so every
+// object is attributed to exactly one id and nothing else is ever deleted.
+func mediaIDFromKey(key string) (uuid.UUID, bool) {
+	if !ValidKey(key) {
+		return uuid.Nil, false
 	}
-	return nil
+	parts := strings.Split(key, "/")
+	if len(parts) != 4 || parts[0] != "e" {
+		return uuid.Nil, false
+	}
+	if _, ok := canonicalUUID(parts[1]); !ok {
+		return uuid.Nil, false
+	}
+	name, ok := strings.CutSuffix(parts[3], ".jpg")
+	if !ok {
+		return uuid.Nil, false
+	}
+	if w, err := strconv.Atoi(name); err != nil || !validWidth(w) || strconv.Itoa(w) != name {
+		return uuid.Nil, false
+	}
+	id, ok := canonicalUUID(parts[2])
+	if !ok || id == uuid.Nil {
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+// canonicalUUID parses only the lowercase hyphenated form.
+func canonicalUUID(s string) (uuid.UUID, bool) {
+	id, err := uuid.Parse(s)
+	if err != nil || id.String() != s {
+		return uuid.Nil, false
+	}
+	return id, true
 }
 
 func (s *Store) reconcileTmp(now time.Time) error {
