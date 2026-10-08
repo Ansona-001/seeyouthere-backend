@@ -8,6 +8,7 @@ import (
 	"net/mail"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +54,17 @@ type Config struct {
 	// MediaRoot is the filesystem root for uploaded/processed images (see
 	// internal/media). Created and writability-checked by media.NewStore.
 	MediaRoot string
+	// R2* configure Cloudflare R2 as the media object store. All four are set
+	// together or not at all; unset, renditions live on local disk under
+	// MediaRoot/objects. R2SecretAccessKey must never be logged or printed.
+	R2Endpoint        string
+	R2Bucket          string
+	R2AccessKeyID     string
+	R2SecretAccessKey string
+	// MediaUserQuotaBytes caps one user's stored photos; MediaTotalQuotaBytes
+	// caps all photos (keeps the bucket inside the free tier). Decimal MB.
+	MediaUserQuotaBytes  int64
+	MediaTotalQuotaBytes int64
 	// TOTPKey seals/opens admin TOTP secrets at rest (AES-256-GCM). Exactly 32 bytes.
 	TOTPKey []byte
 	// AdminAlertEmail receives notify_report emails. Empty disables them.
@@ -64,6 +76,20 @@ type Config struct {
 }
 
 func (c Config) IsProduction() bool { return c.Env == "production" }
+
+// R2Configured reports whether media is stored in R2 rather than on disk.
+func (c Config) R2Configured() bool { return c.R2Endpoint != "" }
+
+// String and GoString keep the R2 secret out of any %v / %+v / %#v output.
+func (c Config) String() string   { return "config.Config{redacted}" }
+func (c Config) GoString() string { return c.String() }
+
+var r2BucketRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
+
+const (
+	megabyte         = 1_000_000
+	r2EndpointSuffix = ".r2.cloudflarestorage.com"
+)
 
 func Load() (Config, error) {
 	c := Config{
@@ -85,6 +111,11 @@ func Load() (Config, error) {
 
 		SiteURL:         env("SITE_URL", "http://localhost:3100"),
 		AdminAlertEmail: os.Getenv("ADMIN_ALERT_EMAIL"),
+
+		R2Endpoint:        os.Getenv("R2_ENDPOINT"),
+		R2Bucket:          os.Getenv("R2_BUCKET"),
+		R2AccessKeyID:     os.Getenv("R2_ACCESS_KEY_ID"),
+		R2SecretAccessKey: os.Getenv("R2_SECRET_ACCESS_KEY"),
 	}
 
 	var errs []error
@@ -144,6 +175,22 @@ func Load() (Config, error) {
 		errs = append(errs, errors.New("MEDIA_ROOT must not be empty"))
 	}
 
+	errs = append(errs, c.validateR2()...)
+
+	userMB, err := strconv.ParseInt(env("MEDIA_USER_QUOTA_MB", "200"), 10, 64)
+	if err != nil || userMB < 1 || userMB > 1_000_000 {
+		errs = append(errs, errors.New("MEDIA_USER_QUOTA_MB must be an integer between 1 and 1000000"))
+	}
+	totalMB, err := strconv.ParseInt(env("MEDIA_TOTAL_QUOTA_MB", "9000"), 10, 64)
+	if err != nil || totalMB < 100 || totalMB > 10_000_000 {
+		errs = append(errs, errors.New("MEDIA_TOTAL_QUOTA_MB must be an integer between 100 and 10000000"))
+	} else if userMB >= 1 && userMB <= 1_000_000 && totalMB < userMB {
+		errs = append(errs, errors.New("MEDIA_TOTAL_QUOTA_MB must be at least MEDIA_USER_QUOTA_MB"))
+	} else {
+		c.MediaUserQuotaBytes = userMB * megabyte
+		c.MediaTotalQuotaBytes = totalMB * megabyte
+	}
+
 	if raw := os.Getenv("TOTP_KEY"); raw == "" {
 		errs = append(errs, errors.New("TOTP_KEY is required"))
 	} else if key, err := base64.StdEncoding.DecodeString(raw); err != nil || len(key) != 32 {
@@ -197,6 +244,41 @@ func Load() (Config, error) {
 	}
 
 	return c, errors.Join(errs...)
+}
+
+// validateR2 checks the all-or-none R2 variables. Errors never include the
+// secret or the access key id.
+func (c Config) validateR2() []error {
+	if c.R2Endpoint == "" && c.R2Bucket == "" && c.R2AccessKeyID == "" && c.R2SecretAccessKey == "" {
+		return nil
+	}
+	var errs []error
+	var missing []string
+	for _, v := range []struct{ name, val string }{
+		{"R2_ENDPOINT", c.R2Endpoint}, {"R2_BUCKET", c.R2Bucket},
+		{"R2_ACCESS_KEY_ID", c.R2AccessKeyID}, {"R2_SECRET_ACCESS_KEY", c.R2SecretAccessKey},
+	} {
+		if v.val == "" {
+			missing = append(missing, v.name)
+		}
+	}
+	if len(missing) > 0 {
+		errs = append(errs, fmt.Errorf("R2_ENDPOINT, R2_BUCKET, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY must be set together (missing %s)", strings.Join(missing, ", ")))
+	}
+	if c.R2Endpoint != "" {
+		u, err := url.Parse(c.R2Endpoint)
+		switch {
+		case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "":
+			errs = append(errs, errors.New("R2_ENDPOINT must be scheme://host[:port] with no path, query or credentials"))
+		case c.IsProduction() && (u.Scheme != "https" || !strings.HasSuffix(u.Hostname(), r2EndpointSuffix)):
+			errs = append(errs, errors.New("R2_ENDPOINT must be https://<account>"+r2EndpointSuffix+" in production"))
+		}
+	}
+	if c.R2Bucket != "" && !r2BucketRE.MatchString(c.R2Bucket) {
+		errs = append(errs, fmt.Errorf("R2_BUCKET: %q is not a valid bucket name", c.R2Bucket))
+	}
+	return errs
 }
 
 func env(key, fallback string) string {

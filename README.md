@@ -142,6 +142,17 @@ The next push to `main` deploys the new code again, so revert or fix in git as w
 - Optional: a dedicated `deploy` user in the docker group, without sudo, owning the repo checkout.
 - Optional: `git pull --ff-only --verify-signatures` in the entry script, with an SSH `allowedSignersFile` configured for git (`gpg.format ssh`, `gpg.ssh.allowedSignersFile`) so only your signed commits deploy.
 
+### Media storage (Cloudflare R2)
+
+By default photos are stored on local disk (`MEDIA_ROOT/objects`). To use Cloudflare R2 instead, the API serves every image itself (Caddy no longer reads the media volume), so the bucket stays private:
+
+1. Create a bucket and leave public access off (no `r2.dev` URL, no custom domain).
+2. Create an R2 API token with Object Read & Write, scoped to that one bucket only.
+3. In `deploy/.env` set all four of `R2_ENDPOINT` (`https://<account id>.r2.cloudflarestorage.com`), `R2_BUCKET`, `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`. Setting only some makes the API refuse to start. Optionally tune `MEDIA_USER_QUOTA_MB` (default 200) and `MEDIA_TOTAL_QUOTA_MB` (default 9000; keeps storage inside the R2 free tier). The per-user cap counts the owner's uploads and guest photos the host has approved; pending guest photos count only toward the total and are bounded to 100 MB per event.
+4. Redeploy the API (`docker compose -f compose.prod.yaml --env-file .env up -d --no-deps api`) and check the log line `media storage` shows `"backend":"r2"`.
+
+Existing photos are not copied automatically: switching backends leaves already-uploaded files behind. Rollback is unsetting the four `R2_*` variables and recreating the API, which goes back to local disk.
+
 ## Production
 
 Production runs from `deploy/compose.prod.yaml` with `deploy/.env` (copy `deploy/.env.example`; never commit it). Always pass `-f compose.prod.yaml --env-file .env` from `deploy/`. Do not use `up --build`: `api` and `web` are GHCR images (`pull_policy: never`; only `deploy.sh` pulls). Email is sent through Zoho Mail SMTP; set its credentials in `deploy/.env` and add Zoho's SPF, DKIM and DMARC records for the domain.

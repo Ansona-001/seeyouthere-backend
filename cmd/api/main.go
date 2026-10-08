@@ -14,6 +14,7 @@ import (
 	netmail "net/mail"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -88,7 +89,23 @@ func runServer(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) error
 		return fmt.Errorf("ping valkey: %w", err)
 	}
 
-	mediaStore, err := media.NewStore(cfg.MediaRoot)
+	var blobs media.Blobs
+	if cfg.R2Configured() {
+		blobs, err = media.NewR2Blobs(cfg.R2Endpoint, cfg.R2Bucket, cfg.R2AccessKeyID, cfg.R2SecretAccessKey)
+		if err != nil {
+			return fmt.Errorf("media blobs: %w", err)
+		}
+		slog.Info("media storage", "backend", "r2", "bucket", cfg.R2Bucket)
+	} else {
+		disk, err := media.NewDiskBlobs(filepath.Join(cfg.MediaRoot, "objects"))
+		if err != nil {
+			return fmt.Errorf("media blobs: %w", err)
+		}
+		defer disk.Close()
+		blobs = disk
+		slog.Info("media storage", "backend", "disk")
+	}
+	mediaStore, err := media.NewStore(cfg.MediaRoot, blobs)
 	if err != nil {
 		return fmt.Errorf("media store: %w", err)
 	}
@@ -106,7 +123,7 @@ func runServer(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) error
 	if cfg.RSVPMailFrom != "" {
 		calendarSender = &mail.SMTPSender{Addr: cfg.RSVPSMTPAddr, User: cfg.RSVPSMTPUser, Pass: cfg.RSVPSMTPPass, From: cfg.RSVPMailFrom}
 	}
-	jobClient, err := jobs.NewClient(pool, sender, calendarSender, store.New(pool), mediaStore, tokens, ratelimit.New(rdb), cfg.AdminAlertEmail, cfg.SiteURL)
+	jobClient, err := jobs.NewClient(pool, sender, calendarSender, store.New(pool), mediaStore, tokens, ratelimit.New(rdb), cfg.AdminAlertEmail, cfg.SiteURL, cfg.MediaTotalQuotaBytes)
 	if err != nil {
 		return fmt.Errorf("river client: %w", err)
 	}
@@ -114,7 +131,7 @@ func runServer(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) error
 		return fmt.Errorf("start river: %w", err)
 	}
 
-	srv, err := httpapi.NewServer(cfg, pool, rdb, jobClient)
+	srv, err := httpapi.NewServer(cfg, pool, rdb, jobClient, mediaStore)
 	if err != nil {
 		return fmt.Errorf("httpapi: %w", err)
 	}

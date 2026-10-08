@@ -25,7 +25,6 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-      - media:/srv/media:ro
     depends_on: [web, api]
 
   api:
@@ -52,6 +51,13 @@ services:
       TOTP_KEY: ${TOTP_KEY}
       ADMIN_ALERT_EMAIL: ${ADMIN_ALERT_EMAIL}
       MAIL_DAILY_INVITE_CAP: ${MAIL_DAILY_INVITE_CAP}
+      # Cloudflare R2 media store; all four set, or all empty for local disk.
+      R2_ENDPOINT: ${R2_ENDPOINT:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      MEDIA_USER_QUOTA_MB: ${MEDIA_USER_QUOTA_MB:-200}
+      MEDIA_TOTAL_QUOTA_MB: ${MEDIA_TOTAL_QUOTA_MB:-9000}
       GOMEMLIMIT: 160MiB
     volumes:
       - media:/data/media

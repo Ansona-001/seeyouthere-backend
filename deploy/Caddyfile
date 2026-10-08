@@ -18,11 +18,7 @@
 
 	@media path_regexp ^/media/([0-9a-f-]{36}/[0-9a-f-]{36}|templates/[0-9a-f-]{36}/[0-9]+/background)/(480|1080|1920)\.jpg$
 	handle @media {
-		root * /srv/media/public
-		uri strip_prefix /media
-		file_server
-		header Cache-Control "public, max-age=31536000, immutable"
-		header Content-Security-Policy "default-src 'none'"
+		reverse_proxy api:8080
 	}
 	handle /media/* {
 		respond 404
