@@ -109,12 +109,15 @@ type mediaRef struct {
 }
 
 type heroBlockJSON struct {
-	ID       string    `json:"id"`
-	Type     string    `json:"type"`
-	Kicker   string    `json:"kicker"`
-	Title    string    `json:"title"`
-	Subtitle string    `json:"subtitle"`
-	Image    *mediaRef `json:"image"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Kicker   string `json:"kicker"`
+	Title    string `json:"title"`
+	Subtitle string `json:"subtitle"`
+	// Badge is the optional large numeral/monogram themes show on the hero.
+	// omitempty keeps content stored before the field existed byte-identical.
+	Badge string    `json:"badge,omitempty"`
+	Image *mediaRef `json:"image"`
 }
 
 type textBlockJSON struct {
@@ -409,6 +412,7 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 			b.Kicker = checkField(iss, path+".kicker", b.Kicker, kickerMax, false, false)
 			b.Title = checkField(iss, path+".title", b.Title, headingMax, true, false)
 			b.Subtitle = checkField(iss, path+".subtitle", b.Subtitle, 200, false, false)
+			b.Badge = checkBadge(iss, path+".badge", b.Badge)
 			if b.Image != nil {
 				b.Image.Alt = checkField(iss, path+".image.alt", b.Image.Alt, 200, false, false)
 				addMedia(path+".image.media_id", b.Image.MediaID)
