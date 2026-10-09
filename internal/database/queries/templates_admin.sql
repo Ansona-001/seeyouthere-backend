@@ -70,6 +70,13 @@ UPDATE template_versions
 SET assets_path = @assets_path
 WHERE template_id = @template_id AND version = @version AND published_at IS NULL;
 
+-- name: GetTemplateVersionForUpdate :one
+-- Row-locks the version so a concurrent manifest or asset change waits for the publish
+-- transaction (and then fails with version_published) instead of slipping in after validation.
+SELECT * FROM template_versions
+WHERE template_id = @template_id AND version = @version
+FOR UPDATE;
+
 -- name: PublishTemplateVersion :one
 UPDATE template_versions
 SET published_at = now()
@@ -79,3 +86,11 @@ RETURNING published_at::timestamptz AS published_at;
 -- name: CountPublishedVersions :one
 SELECT count(*) FROM template_versions
 WHERE template_id = @template_id AND published_at IS NOT NULL;
+
+-- name: ListTemplateVersionManifests :many
+-- Every version of every template (draft, published, retired), for validating the whole stored
+-- catalog against the manifest rules. Not on a request path; bounded because the catalog is small.
+SELECT template_id, version, manifest
+FROM template_versions
+ORDER BY template_id, version
+LIMIT 500;

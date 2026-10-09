@@ -247,12 +247,12 @@ func (s *Server) buildEventResponse(ctx context.Context, q *store.Queries, row e
 		return eventResp{}, fmt.Errorf("parse stored content for event %s: %w", e.ID, err)
 	}
 
-	manifest, err := content.ValidateManifest(row.Manifest)
+	manifest, err := content.ValidateStoredManifest(row.Manifest)
 	if err != nil {
 		return eventResp{}, fmt.Errorf("parse manifest for event %s: %w", e.ID, err)
 	}
 	backgroundSrc := ""
-	if manifest.Background != nil && row.AssetsPath != "" {
+	if manifest.UsesBackgroundAsset() && row.AssetsPath != "" {
 		backgroundSrc = "/media/" + row.AssetsPath + "/background"
 	}
 	theme := content.ResolveTheme(manifest, e.Overrides, backgroundSrc)
@@ -756,7 +756,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 
 	var overridesJSON []byte
 	if len(body.Overrides) > 0 {
-		m, err := content.ValidateManifest(manifest)
+		m, err := content.ValidateStoredManifest(manifest)
 		if err != nil {
 			serverError(w, r, fmt.Errorf("parse manifest: %w", err))
 			return

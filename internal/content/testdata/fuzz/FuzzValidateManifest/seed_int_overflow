@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"schema\":2,\"card\":{\"radius\":9223372036854775808}}")

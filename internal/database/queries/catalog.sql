@@ -19,7 +19,7 @@ WHERE slug = @slug;
 
 -- name: ListPublishedTemplates :many
 -- Host picker: published, non-premium templates with their latest published version.
--- occasion NULL lists every template.
+-- occasion NULL lists every template. Picker order is templates.sort_order, then name.
 SELECT t.id, t.slug, t.name, t.tags, v.version, v.manifest, v.assets_path
 FROM templates t
 JOIN LATERAL (
@@ -33,7 +33,7 @@ WHERE t.status = 'published'
   AND NOT t.is_premium
   AND (sqlc.narg(occasion)::text IS NULL
        OR t.tags @> jsonb_build_object('occasions', jsonb_build_array(sqlc.narg(occasion)::text)))
-ORDER BY t.name, t.id
+ORDER BY t.sort_order, t.name, t.id
 LIMIT 100;
 
 -- name: GetPublishedTemplateBySlug :one

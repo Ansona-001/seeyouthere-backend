@@ -209,7 +209,7 @@ WHERE t.status = 'published'
   AND NOT t.is_premium
   AND ($1::text IS NULL
        OR t.tags @> jsonb_build_object('occasions', jsonb_build_array($1::text)))
-ORDER BY t.name, t.id
+ORDER BY t.sort_order, t.name, t.id
 LIMIT 100
 `
 
@@ -224,7 +224,7 @@ type ListPublishedTemplatesRow struct {
 }
 
 // Host picker: published, non-premium templates with their latest published version.
-// occasion NULL lists every template.
+// occasion NULL lists every template. Picker order is templates.sort_order, then name.
 func (q *Queries) ListPublishedTemplates(ctx context.Context, occasion *string) ([]ListPublishedTemplatesRow, error) {
 	rows, err := q.db.Query(ctx, listPublishedTemplates, occasion)
 	if err != nil {
