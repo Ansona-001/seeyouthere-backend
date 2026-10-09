@@ -1,0 +1,123 @@
+{
+  "schema": 2,
+  "layout": "centered",
+  "hero_style": "text_only",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "ink",
+      "name": "Ink",
+      "colors": {
+        "background": "#F1EFEA",
+        "surface": "#FAF9F6",
+        "text": "#16161A",
+        "muted": "#4E4E55",
+        "accent": "#16161A",
+        "accent_text": "#FAF9F6"
+      },
+      "accent_ink": "#16161A",
+      "art": [
+        "#16161A",
+        "#D8D4CB"
+      ]
+    },
+    {
+      "id": "cotton",
+      "name": "Cotton",
+      "colors": {
+        "background": "#F6F0E5",
+        "surface": "#FCF9F3",
+        "text": "#2E241D",
+        "muted": "#62564B",
+        "accent": "#2E241D",
+        "accent_text": "#FCF9F3"
+      },
+      "accent_ink": "#2E241D",
+      "art": [
+        "#2E241D",
+        "#E3D9C8"
+      ]
+    },
+    {
+      "id": "slate",
+      "name": "Slate",
+      "colors": {
+        "background": "#2A3037",
+        "surface": "#323941",
+        "text": "#F1EEE8",
+        "muted": "#C1C5CA",
+        "accent": "#F1EEE8",
+        "accent_text": "#2A3037"
+      },
+      "accent_ink": "#F1EEE8",
+      "art": [
+        "#F1EEE8",
+        "#20252B"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "bodoni",
+      "name": "Bodoni and Josefin Sans",
+      "heading": "bodoni_moda",
+      "body": "josefin_sans",
+      "accent": ""
+    }
+  ],
+  "defaults": {
+    "palette": "ink",
+    "font": "bodoni"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "vignette": "art2",
+      "vignette_opacity": 0.6
+    },
+    {
+      "kind": "texture",
+      "texture": "linen",
+      "opacity": 0.12,
+      "blend": "multiply"
+    },
+    {
+      "kind": "art",
+      "art": "printers_corners",
+      "placement": "corners",
+      "colors": [
+        "art1"
+      ],
+      "opacity": 0.9
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.08,
+      "blend": "multiply"
+    },
+    {
+      "kind": "frame",
+      "frame": "single_hairline",
+      "inset": 18,
+      "color": "text"
+    }
+  ],
+  "ornament": {
+    "hero": "monogram_rule",
+    "divider": "line",
+    "badge": "none",
+    "ampersand": "none",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "reply_card",
+    "border": "ink",
+    "radius": 0,
+    "fields": "underline",
+    "buttons": "accent"
+  },
+  "motion": "none"
+}

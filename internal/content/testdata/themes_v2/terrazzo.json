@@ -1,0 +1,134 @@
+{
+  "schema": 2,
+  "layout": "split",
+  "hero_style": "text_only",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "stone",
+      "name": "Stone",
+      "colors": {
+        "background": "#EFEBE4",
+        "surface": "#FBF9F5",
+        "text": "#2A2622",
+        "muted": "#5C554E",
+        "accent": "#B44A30",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#A6442B",
+      "art": [
+        "#D9764F",
+        "#E8B54A",
+        "#5E7F6F",
+        "#2A2622",
+        "#C9C2B6",
+        "#FFFFFF"
+      ]
+    },
+    {
+      "id": "sorbet",
+      "name": "Sorbet",
+      "colors": {
+        "background": "#FBEFE8",
+        "surface": "#FFFAF7",
+        "text": "#33242A",
+        "muted": "#665158",
+        "accent": "#B8395A",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#B03658",
+      "art": [
+        "#F29A8A",
+        "#F6C76B",
+        "#9FD0B8",
+        "#B6A4E0",
+        "#E36A86",
+        "#FFFFFF"
+      ]
+    },
+    {
+      "id": "night",
+      "name": "Night",
+      "colors": {
+        "background": "#1E2229",
+        "surface": "#262B33",
+        "text": "#F2EEE8",
+        "muted": "#B9B4AC",
+        "accent": "#E8A04F",
+        "accent_text": "#1E2229"
+      },
+      "accent_ink": "#E8A04F",
+      "art": [
+        "#E07A55",
+        "#E8B54A",
+        "#6FA08A",
+        "#F2EEE8",
+        "#4A5260",
+        "#8C93A0"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "dmserif",
+      "name": "DM Serif and Josefin Sans",
+      "heading": "dm_serif_display",
+      "body": "josefin_sans",
+      "accent": ""
+    }
+  ],
+  "defaults": {
+    "palette": "stone",
+    "font": "dmserif"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "vignette": "art5",
+      "vignette_opacity": 0.35
+    },
+    {
+      "kind": "texture",
+      "texture": "marble",
+      "opacity": 0.1,
+      "blend": "soft-light"
+    },
+    {
+      "kind": "art",
+      "art": "terrazzo_chips",
+      "placement": "scatter",
+      "colors": [
+        "art1",
+        "art2",
+        "art3",
+        "art5",
+        "art6"
+      ],
+      "density": "dense",
+      "opacity": 0.6
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.1,
+      "blend": "multiply"
+    }
+  ],
+  "ornament": {
+    "hero": "none",
+    "divider": "dots",
+    "badge": "none",
+    "ampersand": "none",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "soft",
+    "border": "none",
+    "radius": 32,
+    "fields": "boxed",
+    "buttons": "accent"
+  },
+  "motion": "pop_and_settle"
+}

@@ -1,0 +1,138 @@
+{
+  "schema": 2,
+  "layout": "stacked",
+  "hero_style": "text_only",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "fluoro",
+      "name": "Fluoro",
+      "colors": {
+        "background": "#F3EEE4",
+        "surface": "#FBF8F2",
+        "text": "#1F2340",
+        "muted": "#4D5070",
+        "accent": "#FF48B0",
+        "accent_text": "#1F2340"
+      },
+      "accent_ink": "#C2186E",
+      "art": [
+        "#FF48B0",
+        "#0078BF",
+        "#FFE800"
+      ]
+    },
+    {
+      "id": "teal",
+      "name": "Teal",
+      "colors": {
+        "background": "#F1EEE6",
+        "surface": "#FAF8F3",
+        "text": "#10302F",
+        "muted": "#40605D",
+        "accent": "#FF6C2F",
+        "accent_text": "#10302F"
+      },
+      "accent_ink": "#00707A",
+      "art": [
+        "#00838A",
+        "#FF6C2F",
+        "#FFE800"
+      ]
+    },
+    {
+      "id": "mono",
+      "name": "Mono",
+      "colors": {
+        "background": "#EFEDE8",
+        "surface": "#F9F8F5",
+        "text": "#1B1B1B",
+        "muted": "#4E4E4E",
+        "accent": "#1B1B1B",
+        "accent_text": "#F9F8F5"
+      },
+      "accent_ink": "#1B1B1B",
+      "art": [
+        "#FF48B0",
+        "#3A3A3A",
+        "#B9B6AE"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "fraunces",
+      "name": "Fraunces and Figtree",
+      "heading": "fraunces",
+      "body": "figtree",
+      "accent": ""
+    }
+  ],
+  "defaults": {
+    "palette": "fluoro",
+    "font": "fraunces"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background"
+    },
+    {
+      "kind": "pattern",
+      "pattern": "halftone",
+      "color": "art2",
+      "opacity": 0.22,
+      "origin": "top_right",
+      "mask": "corner"
+    },
+    {
+      "kind": "art",
+      "art": "riso_shapes",
+      "placement": "corners",
+      "colors": [
+        "art1",
+        "art2",
+        "art3"
+      ]
+    },
+    {
+      "kind": "art",
+      "art": "riso_shapes",
+      "placement": "scatter",
+      "colors": [
+        "art1",
+        "art2",
+        "art3"
+      ],
+      "opacity": 0.7
+    },
+    {
+      "kind": "texture",
+      "texture": "fibers",
+      "opacity": 0.08,
+      "blend": "multiply"
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.18,
+      "blend": "multiply"
+    }
+  ],
+  "ornament": {
+    "hero": "none",
+    "divider": "wave",
+    "badge": "none",
+    "ampersand": "none",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "none",
+    "border": "none",
+    "radius": 0,
+    "fields": "boxed",
+    "buttons": "accent"
+  },
+  "motion": "pop_and_settle"
+}

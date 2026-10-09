@@ -1,0 +1,154 @@
+{
+  "schema": 2,
+  "layout": "centered",
+  "hero_style": "spotlight",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "silver",
+      "name": "Silver",
+      "colors": {
+        "background": "#14121C",
+        "surface": "#1F1C2A",
+        "text": "#F4F2F8",
+        "muted": "#BDB8CC",
+        "accent": "#ECE9F4",
+        "accent_text": "#14121C"
+      },
+      "accent_ink": "#DCD8EA",
+      "art": [
+        "#8E7CC3",
+        "#F7B3D9",
+        "#FFFFFF"
+      ],
+      "foil": [
+        "#A3AABA",
+        "#D7DCE6",
+        "#FFFFFF",
+        "#B9C0CE",
+        "#E6E9F0"
+      ]
+    },
+    {
+      "id": "violet",
+      "name": "Violet",
+      "colors": {
+        "background": "#1C1033",
+        "surface": "#271848",
+        "text": "#F6F0FF",
+        "muted": "#C9BEE4",
+        "accent": "#F06FC2",
+        "accent_text": "#1C1033"
+      },
+      "accent_ink": "#F59AD3",
+      "art": [
+        "#B79CFF",
+        "#F06FC2",
+        "#FFFFFF"
+      ],
+      "foil": [
+        "#B7A6F0",
+        "#F2C7F0",
+        "#FFFFFF",
+        "#A9DCF4",
+        "#E3CCFF"
+      ]
+    },
+    {
+      "id": "gold",
+      "name": "Gold",
+      "colors": {
+        "background": "#1A140A",
+        "surface": "#251D11",
+        "text": "#FBF3E2",
+        "muted": "#CDBF9F",
+        "accent": "#E7C46A",
+        "accent_text": "#1A140A"
+      },
+      "accent_ink": "#E7C46A",
+      "art": [
+        "#C08A3E",
+        "#F29E4C",
+        "#FFF1C4"
+      ],
+      "foil": [
+        "#E3C779",
+        "#C9A45C",
+        "#F3E2AA",
+        "#B48A43",
+        "#D9B769"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "limelight",
+      "name": "Limelight and Figtree",
+      "heading": "limelight",
+      "body": "figtree",
+      "accent": ""
+    }
+  ],
+  "defaults": {
+    "palette": "silver",
+    "font": "limelight"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "glow": "art1",
+      "glow_opacity": 0.3,
+      "vignette": "art2",
+      "vignette_opacity": 0.18
+    },
+    {
+      "kind": "pattern",
+      "pattern": "dots",
+      "color": "art3",
+      "opacity": 0.08,
+      "origin": "top",
+      "mask": "radial"
+    },
+    {
+      "kind": "art",
+      "art": "mirror_ball",
+      "placement": "hero_top",
+      "region": "hero",
+      "paint": "foil"
+    },
+    {
+      "kind": "art",
+      "art": "sparkles",
+      "placement": "scatter",
+      "colors": [
+        "art3",
+        "art2"
+      ],
+      "density": "dense",
+      "opacity": 0.75
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.12,
+      "blend": "screen"
+    }
+  ],
+  "ornament": {
+    "hero": "none",
+    "divider": "sparkle_rule",
+    "badge": "none",
+    "ampersand": "none",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "glass",
+    "border": "hairline",
+    "radius": 24,
+    "fields": "boxed",
+    "buttons": "accent"
+  },
+  "motion": "foil_sheen"
+}

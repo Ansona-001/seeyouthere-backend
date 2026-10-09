@@ -1,0 +1,163 @@
+{
+  "schema": 2,
+  "layout": "split",
+  "hero_style": "color_block",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "cobalt",
+      "name": "Cobalt",
+      "colors": {
+        "background": "#FFF4DC",
+        "surface": "#FFFFFF",
+        "text": "#211A4D",
+        "muted": "#4D4677",
+        "accent": "#2B4BE0",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#C8174A",
+      "art": [
+        "#FFC21A",
+        "#FF4F7B",
+        "#16C79A",
+        "#FF8A3D",
+        "#FFFFFF"
+      ]
+    },
+    {
+      "id": "berry",
+      "name": "Berry",
+      "colors": {
+        "background": "#FFF0F4",
+        "surface": "#FFFFFF",
+        "text": "#3B1030",
+        "muted": "#6B3A5E",
+        "accent": "#B3124F",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#2B4BE0",
+      "art": [
+        "#FFC21A",
+        "#7FD3FF",
+        "#16C79A",
+        "#FF8A3D",
+        "#FFFFFF"
+      ]
+    },
+    {
+      "id": "mint",
+      "name": "Mint",
+      "colors": {
+        "background": "#E8F8F1",
+        "surface": "#FFFFFF",
+        "text": "#0F3B2E",
+        "muted": "#3E6B5C",
+        "accent": "#0B6B50",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#B3124F",
+      "art": [
+        "#FFC21A",
+        "#FF4F7B",
+        "#7FD3FF",
+        "#FF8A3D",
+        "#FFFFFF"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "bagel",
+      "name": "Bagel Fat One and Figtree",
+      "heading": "bagel_fat_one",
+      "body": "figtree",
+      "accent": "figtree"
+    }
+  ],
+  "defaults": {
+    "palette": "cobalt",
+    "font": "bagel"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "glow": "art1",
+      "glow_opacity": 0.35
+    },
+    {
+      "kind": "block",
+      "edge": "scallop"
+    },
+    {
+      "kind": "pattern",
+      "pattern": "halftone",
+      "color": "accent_text",
+      "opacity": 0.24,
+      "region": "hero",
+      "origin": "top_right",
+      "mask": "corner"
+    },
+    {
+      "kind": "art",
+      "art": "confetti",
+      "placement": "hero",
+      "region": "hero",
+      "colors": [
+        "art1",
+        "art2",
+        "art3",
+        "art4",
+        "art5"
+      ],
+      "density": "dense"
+    },
+    {
+      "kind": "art",
+      "art": "balloons",
+      "placement": "hero_top",
+      "region": "hero",
+      "colors": [
+        "art2",
+        "art1",
+        "art3",
+        "art4"
+      ]
+    },
+    {
+      "kind": "art",
+      "art": "confetti",
+      "placement": "edges",
+      "colors": [
+        "accent",
+        "art2",
+        "art3",
+        "art4",
+        "art1"
+      ],
+      "density": "normal"
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.12,
+      "blend": "multiply"
+    }
+  ],
+  "ornament": {
+    "hero": "sticker_numeral",
+    "divider": "squiggle",
+    "badge": "starburst_sticker",
+    "ampersand": "none",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "sticker",
+    "border": "ink",
+    "radius": 28,
+    "fields": "boxed",
+    "buttons": "accent"
+  },
+  "motion": "pop_and_settle"
+}

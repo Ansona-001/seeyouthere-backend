@@ -1,0 +1,158 @@
+{
+  "schema": 2,
+  "layout": "split",
+  "hero_style": "text_only",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "noir",
+      "name": "Noir",
+      "colors": {
+        "background": "#0E0D0A",
+        "surface": "#17150F",
+        "text": "#F3EAD7",
+        "muted": "#BCAF97",
+        "accent": "#C9A45C",
+        "accent_text": "#15120B"
+      },
+      "accent_ink": "#D4B06A",
+      "art": [
+        "#C9A45C",
+        "#8E7440"
+      ],
+      "foil": [
+        "#E3C779",
+        "#C9A45C",
+        "#F3E2AA",
+        "#B48A43",
+        "#D9B769"
+      ]
+    },
+    {
+      "id": "emerald",
+      "name": "Emerald",
+      "colors": {
+        "background": "#0B1F1A",
+        "surface": "#12302A",
+        "text": "#EAF3EE",
+        "muted": "#A9C4BA",
+        "accent": "#C9A45C",
+        "accent_text": "#0B1F1A"
+      },
+      "accent_ink": "#D4B06A",
+      "art": [
+        "#C9A45C",
+        "#7FB59F"
+      ],
+      "foil": [
+        "#E3C779",
+        "#C9A45C",
+        "#F3E2AA",
+        "#B48A43",
+        "#D9B769"
+      ]
+    },
+    {
+      "id": "oxblood",
+      "name": "Oxblood",
+      "colors": {
+        "background": "#1F0B0E",
+        "surface": "#2E1216",
+        "text": "#F6ECEC",
+        "muted": "#CDB0B3",
+        "accent": "#D4AF6A",
+        "accent_text": "#1F0B0E"
+      },
+      "accent_ink": "#D9B672",
+      "art": [
+        "#D4AF6A",
+        "#B66A73"
+      ],
+      "foil": [
+        "#E3C779",
+        "#C9A45C",
+        "#F3E2AA",
+        "#B48A43",
+        "#D9B769"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "deco",
+      "name": "Limelight and Josefin Sans",
+      "heading": "limelight",
+      "body": "josefin_sans",
+      "accent": "josefin_sans"
+    }
+  ],
+  "defaults": {
+    "palette": "noir",
+    "font": "deco"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "glow": "art1",
+      "glow_opacity": 0.26
+    },
+    {
+      "kind": "pattern",
+      "pattern": "sunburst",
+      "color": "art1",
+      "opacity": 0.15,
+      "origin": "top",
+      "mask": "radial"
+    },
+    {
+      "kind": "art",
+      "art": "stepped_arches",
+      "placement": "hero",
+      "paint": "foil"
+    },
+    {
+      "kind": "pattern",
+      "pattern": "pinstripe",
+      "color": "text",
+      "opacity": 0.03
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.16,
+      "blend": "screen"
+    },
+    {
+      "kind": "art",
+      "art": "deco_fans",
+      "placement": "bottom_corners",
+      "colors": [
+        "art1"
+      ],
+      "opacity": 0.6
+    },
+    {
+      "kind": "frame",
+      "frame": "double_hairline_deco_corners",
+      "inset": 10,
+      "paint": "foil"
+    }
+  ],
+  "ornament": {
+    "hero": "foil_numeral",
+    "divider": "deco_diamond",
+    "badge": "none",
+    "ampersand": "none",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "chamfered",
+    "border": "foil",
+    "radius": 0,
+    "fields": "underline",
+    "buttons": "foil"
+  },
+  "motion": "foil_sheen"
+}

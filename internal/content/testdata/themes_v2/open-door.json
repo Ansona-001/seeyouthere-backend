@@ -1,0 +1,135 @@
+{
+  "schema": 2,
+  "layout": "split",
+  "hero_style": "framed",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "kraft",
+      "name": "Kraft",
+      "colors": {
+        "background": "#CDAA7E",
+        "surface": "#F4EADA",
+        "text": "#24190F",
+        "muted": "#45331F",
+        "accent": "#2B4232",
+        "accent_text": "#F4EADA"
+      },
+      "accent_ink": "#22382A",
+      "art": [
+        "#2B4A36",
+        "#6E8F4E",
+        "#A4532E",
+        "#F6EEDF",
+        "#A88458"
+      ]
+    },
+    {
+      "id": "olive",
+      "name": "Olive",
+      "colors": {
+        "background": "#E6E1CF",
+        "surface": "#F8F5EC",
+        "text": "#26291C",
+        "muted": "#53583E",
+        "accent": "#4C5728",
+        "accent_text": "#F8F5EC"
+      },
+      "accent_ink": "#4C5728",
+      "art": [
+        "#3E5A33",
+        "#7E9A55",
+        "#B5653E",
+        "#FFFFFF",
+        "#C9C0A0"
+      ]
+    },
+    {
+      "id": "terracotta",
+      "name": "Terracotta",
+      "colors": {
+        "background": "#EBD3C2",
+        "surface": "#FBF2EA",
+        "text": "#3A1E14",
+        "muted": "#683F31",
+        "accent": "#9C4426",
+        "accent_text": "#FFF8F2"
+      },
+      "accent_ink": "#8E3D22",
+      "art": [
+        "#2F5A3E",
+        "#6E8F4E",
+        "#A4482A",
+        "#FFF8F2",
+        "#C99A82"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "bodoni",
+      "name": "Bodoni and Josefin Sans",
+      "heading": "bodoni_moda",
+      "body": "josefin_sans",
+      "accent": ""
+    }
+  ],
+  "defaults": {
+    "palette": "kraft",
+    "font": "bodoni"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "glow": "art4",
+      "glow_opacity": 0.25,
+      "vignette": "art5",
+      "vignette_opacity": 0.4
+    },
+    {
+      "kind": "texture",
+      "texture": "fibers",
+      "opacity": 0.1,
+      "blend": "multiply"
+    },
+    {
+      "kind": "art",
+      "art": "open_door_plants",
+      "placement": "bottom_corners",
+      "colors": [
+        "art1",
+        "art2",
+        "art3"
+      ]
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.12,
+      "blend": "multiply"
+    },
+    {
+      "kind": "frame",
+      "frame": "single_hairline",
+      "inset": 12,
+      "color": "art4"
+    }
+  ],
+  "ornament": {
+    "hero": "doorway",
+    "divider": "line",
+    "badge": "wax_seal",
+    "ampersand": "none",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "chamfered",
+    "border": "ink",
+    "radius": 0,
+    "fields": "underline",
+    "buttons": "accent"
+  },
+  "motion": "draw_on"
+}

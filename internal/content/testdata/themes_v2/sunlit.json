@@ -1,0 +1,133 @@
+{
+  "schema": 2,
+  "layout": "stacked",
+  "hero_style": "framed",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "apricot",
+      "name": "Apricot",
+      "colors": {
+        "background": "#FBF3EA",
+        "surface": "#FFFAF4",
+        "text": "#3B2A22",
+        "muted": "#6B5347",
+        "accent": "#A9492A",
+        "accent_text": "#FFFAF4"
+      },
+      "accent_ink": "#9A4327",
+      "art": [
+        "#F2B48F",
+        "#F6D58E",
+        "#EFC4C0",
+        "#8DA27A",
+        "#C8754E"
+      ]
+    },
+    {
+      "id": "meadow",
+      "name": "Meadow",
+      "colors": {
+        "background": "#F5F6EA",
+        "surface": "#FCFDF6",
+        "text": "#26301F",
+        "muted": "#53604A",
+        "accent": "#4A6733",
+        "accent_text": "#FCFDF6"
+      },
+      "accent_ink": "#4A6733",
+      "art": [
+        "#C9DB9E",
+        "#F3E19A",
+        "#E9C7D6",
+        "#7E9A62",
+        "#5E7A47"
+      ]
+    },
+    {
+      "id": "sea",
+      "name": "Sea",
+      "colors": {
+        "background": "#F1F5F6",
+        "surface": "#FAFCFC",
+        "text": "#1E2E36",
+        "muted": "#4A5D66",
+        "accent": "#2C6070",
+        "accent_text": "#FAFCFC"
+      },
+      "accent_ink": "#2C6070",
+      "art": [
+        "#A9D3DC",
+        "#F1DDB0",
+        "#C7D6EE",
+        "#7CA89A",
+        "#3F6F7C"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "cormorant",
+      "name": "Cormorant and Figtree",
+      "heading": "cormorant_garamond",
+      "body": "figtree",
+      "accent": "pinyon_script"
+    }
+  ],
+  "defaults": {
+    "palette": "apricot",
+    "font": "cormorant"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "glow": "art2",
+      "glow_opacity": 0.45
+    },
+    {
+      "kind": "texture",
+      "texture": "watercolour",
+      "opacity": 0.34,
+      "blend": "multiply",
+      "colors": [
+        "art1",
+        "art2",
+        "art3"
+      ]
+    },
+    {
+      "kind": "art",
+      "art": "botanical_wash",
+      "placement": "top_corners",
+      "colors": [
+        "art4",
+        "art1",
+        "art3",
+        "art5"
+      ]
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.07,
+      "blend": "multiply"
+    }
+  ],
+  "ornament": {
+    "hero": "none",
+    "divider": "floral",
+    "badge": "none",
+    "ampersand": "script",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "glass",
+    "border": "hairline",
+    "radius": 22,
+    "fields": "boxed",
+    "buttons": "accent"
+  },
+  "motion": "draw_on"
+}

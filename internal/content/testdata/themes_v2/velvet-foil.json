@@ -1,0 +1,163 @@
+{
+  "schema": 2,
+  "layout": "centered",
+  "hero_style": "spotlight",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "emerald",
+      "name": "Emerald",
+      "colors": {
+        "background": "#0F2A21",
+        "surface": "#15342A",
+        "text": "#F3EEDF",
+        "muted": "#C3CFC3",
+        "accent": "#E9D9A6",
+        "accent_text": "#0F2A21"
+      },
+      "accent_ink": "#E2C987",
+      "art": [
+        "#081C15",
+        "#2F5E4B",
+        "#C9A45C",
+        "#E9D3A1"
+      ],
+      "foil": [
+        "#E3C779",
+        "#C9A45C",
+        "#F3E2AA",
+        "#B48A43",
+        "#D9B769"
+      ]
+    },
+    {
+      "id": "garnet",
+      "name": "Garnet",
+      "colors": {
+        "background": "#3A0F1A",
+        "surface": "#461521",
+        "text": "#F7ECE6",
+        "muted": "#DCC2C2",
+        "accent": "#EBCF9A",
+        "accent_text": "#3A0F1A"
+      },
+      "accent_ink": "#E8C98E",
+      "art": [
+        "#260810",
+        "#6E2333",
+        "#D4AF6A",
+        "#F0D9A8"
+      ],
+      "foil": [
+        "#E3C779",
+        "#C9A45C",
+        "#F3E2AA",
+        "#B48A43",
+        "#D9B769"
+      ]
+    },
+    {
+      "id": "midnight",
+      "name": "Midnight",
+      "colors": {
+        "background": "#121A33",
+        "surface": "#19223F",
+        "text": "#EEF0F7",
+        "muted": "#B9C0D8",
+        "accent": "#DCE1F0",
+        "accent_text": "#121A33"
+      },
+      "accent_ink": "#CDD4E8",
+      "art": [
+        "#0A1024",
+        "#2D3B6B",
+        "#AEB6C8",
+        "#E3E7F0"
+      ],
+      "foil": [
+        "#A3AABA",
+        "#D7DCE6",
+        "#FFFFFF",
+        "#B9C0CE",
+        "#E6E9F0"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "bodoni",
+      "name": "Bodoni and Lora",
+      "heading": "bodoni_moda",
+      "body": "lora",
+      "accent": "pinyon_script"
+    }
+  ],
+  "defaults": {
+    "palette": "emerald",
+    "font": "bodoni"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "glow": "art2",
+      "glow_opacity": 0.7,
+      "vignette": "art1",
+      "vignette_opacity": 0.9
+    },
+    {
+      "kind": "texture",
+      "texture": "velvet",
+      "opacity": 0.32,
+      "blend": "soft-light"
+    },
+    {
+      "kind": "art",
+      "art": "botanical_wash",
+      "placement": "top_corners",
+      "colors": [
+        "art2",
+        "art2",
+        "art1",
+        "art4"
+      ]
+    },
+    {
+      "kind": "art",
+      "art": "sparkles",
+      "placement": "hero",
+      "region": "hero",
+      "paint": "foil",
+      "density": "sparse",
+      "opacity": 0.8
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.1,
+      "blend": "screen"
+    },
+    {
+      "kind": "frame",
+      "frame": "double_hairline",
+      "inset": 14,
+      "paint": "foil"
+    }
+  ],
+  "ornament": {
+    "hero": "ring",
+    "divider": "sparkle_rule",
+    "badge": "none",
+    "ampersand": "script",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "soft",
+    "border": "foil",
+    "radius": 18,
+    "fields": "boxed",
+    "buttons": "accent"
+  },
+  "motion": "foil_sheen"
+}

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -236,6 +237,80 @@ func TestListActiveOccasions_SeededCatalogParses(t *testing.T) {
 	for _, row := range tmplRows {
 		if _, err := content.ValidateManifest(row.Manifest); err != nil {
 			t.Errorf("ValidateManifest(%s): %v", row.Slug, err)
+		}
+	}
+
+	// Every stored version, not just the latest published one: drafts and old
+	// published versions must parse too, since events pin old versions and an
+	// admin can publish a draft at any time. Fixture templates other tests
+	// leave behind in the shared dev database (slug "test-tpl-...", their
+	// cleanup is blocked by the versions' RESTRICT foreign key) carry
+	// placeholder manifests and are skipped.
+	fixtures := map[uuid.UUID]bool{}
+	fixtureRows, err := pool.Query(ctx, "SELECT id FROM templates WHERE slug LIKE 'test-tpl-%'")
+	if err != nil {
+		t.Fatalf("list fixture templates: %v", err)
+	}
+	for fixtureRows.Next() {
+		var id uuid.UUID
+		if err := fixtureRows.Scan(&id); err != nil {
+			t.Fatalf("scan fixture template: %v", err)
+		}
+		fixtures[id] = true
+	}
+	if err := fixtureRows.Err(); err != nil {
+		t.Fatalf("list fixture templates: %v", err)
+	}
+	fixtureRows.Close()
+
+	versions, err := q.ListTemplateVersionManifests(ctx)
+	if err != nil {
+		t.Fatalf("list template version manifests: %v", err)
+	}
+	// The 12 theme-engine-v2 templates seeded by migration 00007 (ids
+	// ...0007 to ...0012) must all be present and run on engine 2.
+	v2Seeded := map[uuid.UUID]int{}
+	for i := 0; i < 12; i++ {
+		v2Seeded[uuid.MustParse(fmt.Sprintf("01926a00-0000-7000-8000-%012x", 0x07+i))] = 0
+	}
+	checked := 0
+	for _, v := range versions {
+		if fixtures[v.TemplateID] {
+			continue
+		}
+		checked++
+		label := fmt.Sprintf("template %s v%d", v.TemplateID, v.Version)
+		m, err := content.ValidateManifest(v.Manifest)
+		if err != nil {
+			t.Errorf("ValidateManifest(%s): %v", label, err)
+			continue
+		}
+		if _, isV2 := v2Seeded[v.TemplateID]; isV2 {
+			v2Seeded[v.TemplateID]++
+			if m.Schema != 2 {
+				t.Errorf("%s: manifest schema = %d, want 2", label, m.Schema)
+			}
+			if th := content.ResolveTheme(m, nil, ""); th.Engine != 2 {
+				t.Errorf("%s: resolved engine = %d, want 2", label, th.Engine)
+			}
+		}
+		for _, p := range m.Palettes {
+			for _, f := range m.Fonts {
+				overrides := fmt.Sprintf(`{"palette":%q,"font":%q}`, p.ID, f.ID)
+				th := content.ResolveTheme(m, []byte(overrides), "")
+				if th.Palette != p.Colors || th.Fonts.Heading != f.Heading || th.Fonts.Body != f.Body ||
+					th.Fonts.Accent == "" || th.AccentInk == "" {
+					t.Errorf("ResolveTheme(%s, palette %s, font %s) = %+v, want that palette and font pair", label, p.ID, f.ID, th)
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Error("no seeded template versions were validated")
+	}
+	for id, n := range v2Seeded {
+		if n == 0 {
+			t.Errorf("seeded v2 template %s has no stored version (did migration 00007 run?)", id)
 		}
 	}
 }
