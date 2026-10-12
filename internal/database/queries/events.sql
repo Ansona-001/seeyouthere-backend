@@ -642,3 +642,46 @@ RETURNING e.id,
           prev.remove_branding AS old_remove_branding, prev.template_id AS old_template_id,
           prev.template_version AS old_template_version, prev.overrides AS old_overrides,
           e.remove_branding, e.template_id, e.template_version, e.overrides, e.version;
+
+-- name: LockEventForAdminDelete :one
+-- Admin hard delete (inline and from the purge job): any state, live or soft-deleted. The row lock
+-- (FOR UPDATE, not NO KEY UPDATE) also blocks the KEY SHARE lock a report insert takes through its
+-- foreign key, so nothing lands on the event while its files are deleted. Counts feed the audit row.
+SELECT e.id, e.slug, e.status, e.owner_id, e.deleted_at,
+       (SELECT count(*) FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing')) AS open_reports,
+       (SELECT count(*) FROM rsvps s WHERE s.event_id = e.id) AS rsvp_count,
+       (SELECT count(*) FROM guests g WHERE g.event_id = e.id) AS guest_count,
+       (SELECT count(*) FROM media m WHERE m.event_id = e.id) AS media_count
+FROM events e
+WHERE e.id = @event_id
+FOR UPDATE OF e;
+
+-- name: DeleteEventAdmin :execrows
+-- Hard-deletes one event in any state; child rows cascade. Call after LockEventForAdminDelete and
+-- after its files are gone, in the same transaction. Unlike PurgeEvents it does not honour the
+-- grace period, takedown or open-report guards: those are what an admin delete overrides.
+DELETE FROM events WHERE id = @event_id;
+
+-- name: MarkOwnedEventsForAdminPurge :many
+-- Admin user delete: soft-deletes every event the user owns, in any state (events_owner_id_all_idx),
+-- keeping an earlier deleted_at. was_live is false for events that were already soft-deleted: they
+-- are already hidden and left to the normal retention purge, so the caller queues a purge job only
+-- for the live ones (bounded by the per-user live-event cap).
+WITH prev AS (
+    SELECT x.id, x.deleted_at IS NULL AS was_live
+    FROM events x
+    WHERE x.owner_id = @owner_id::uuid
+    FOR UPDATE
+)
+UPDATE events e
+SET deleted_at = coalesce(e.deleted_at, now()), updated_at = now()
+FROM prev
+WHERE e.id = prev.id
+RETURNING e.id, prev.was_live::boolean AS was_live;
+
+-- name: CountOpenReportsForOwner :one
+-- Open or reviewing reports across all events the user owns, for the admin delete audit row.
+SELECT count(*)
+FROM reports r
+JOIN events e ON e.id = r.event_id
+WHERE e.owner_id = @owner_id::uuid AND r.status IN ('open', 'reviewing');

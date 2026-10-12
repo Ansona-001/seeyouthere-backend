@@ -43,6 +43,9 @@ var (
 	errUnknownTemplate = errors.New("unknown template")
 	errEventNotFound   = errors.New("event not found")
 	errEventForbidden  = errors.New("event forbidden")
+	// errUserGone means the session's user was deleted or banned after the
+	// session was looked up (an admin action racing this request).
+	errUserGone = errors.New("user gone")
 )
 
 // versionConflictError is returned by mapEventWriteFailure when a write's
@@ -247,12 +250,12 @@ func (s *Server) buildEventResponse(ctx context.Context, q *store.Queries, row e
 		return eventResp{}, fmt.Errorf("parse stored content for event %s: %w", e.ID, err)
 	}
 
-	manifest, err := content.ValidateManifest(row.Manifest)
+	manifest, err := content.ValidateStoredManifest(row.Manifest)
 	if err != nil {
 		return eventResp{}, fmt.Errorf("parse manifest for event %s: %w", e.ID, err)
 	}
 	backgroundSrc := ""
-	if manifest.Background != nil && row.AssetsPath != "" {
+	if manifest.UsesBackgroundAsset() && row.AssetsPath != "" {
 		backgroundSrc = "/media/" + row.AssetsPath + "/background"
 	}
 	theme := content.ResolveTheme(manifest, e.Overrides, backgroundSrc)
@@ -447,6 +450,13 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 
 	err = s.inTx(ctx, func(tx pgx.Tx, q *store.Queries) error {
 		if authed {
+			// First: serialises with an in-flight admin delete of this user, so
+			// a deleted account can never end up owning a live event.
+			if _, err := q.LockLiveUser(ctx, userID); errors.Is(err, pgx.ErrNoRows) {
+				return errUserGone
+			} else if err != nil {
+				return fmt.Errorf("lock live user: %w", err)
+			}
 			n, err := q.CountLiveEventsByOwner(ctx, userID)
 			if err != nil {
 				return fmt.Errorf("count live events: %w", err)
@@ -510,6 +520,9 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	switch {
+	case errors.Is(err, errUserGone):
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Log in to continue.")
+		return
 	case errors.Is(err, errTooManyEvents):
 		writeError(w, http.StatusConflict, "too_many_events", "You've reached the limit of live events.")
 		return
@@ -756,7 +769,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 
 	var overridesJSON []byte
 	if len(body.Overrides) > 0 {
-		m, err := content.ValidateManifest(manifest)
+		m, err := content.ValidateStoredManifest(manifest)
 		if err != nil {
 			serverError(w, r, fmt.Errorf("parse manifest: %w", err))
 			return

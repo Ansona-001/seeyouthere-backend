@@ -1,0 +1,144 @@
+{
+  "schema": 2,
+  "layout": "centered",
+  "hero_style": "text_only",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "blush",
+      "name": "Blush",
+      "colors": {
+        "background": "#FBF1EF",
+        "surface": "#FFFAF9",
+        "text": "#3A2A33",
+        "muted": "#6A5560",
+        "accent": "#9E4766",
+        "accent_text": "#FFFAF9"
+      },
+      "accent_ink": "#9E4766",
+      "art": [
+        "#FFFFFF",
+        "#F2CDD3",
+        "#F7DCC4",
+        "#E8B7C2",
+        "#C98A9E"
+      ]
+    },
+    {
+      "id": "sky",
+      "name": "Sky",
+      "colors": {
+        "background": "#EEF4FA",
+        "surface": "#F9FBFE",
+        "text": "#22324A",
+        "muted": "#4F5F78",
+        "accent": "#3A6194",
+        "accent_text": "#F9FBFE"
+      },
+      "accent_ink": "#3A6194",
+      "art": [
+        "#FFFFFF",
+        "#C6DAEE",
+        "#F4E3C6",
+        "#B2CBE6",
+        "#86A6CE"
+      ]
+    },
+    {
+      "id": "butter",
+      "name": "Butter",
+      "colors": {
+        "background": "#FBF5E4",
+        "surface": "#FFFCF3",
+        "text": "#3A3222",
+        "muted": "#675B43",
+        "accent": "#81631A",
+        "accent_text": "#FFFCF3"
+      },
+      "accent_ink": "#81631A",
+      "art": [
+        "#FFFFFF",
+        "#F2E2B0",
+        "#E9EED3",
+        "#F1D27E",
+        "#C4A85A"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "fraunces",
+      "name": "Fraunces and Figtree",
+      "heading": "fraunces",
+      "body": "figtree",
+      "accent": "pinyon_script"
+    }
+  ],
+  "defaults": {
+    "palette": "blush",
+    "font": "fraunces"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "glow": "art1",
+      "glow_opacity": 0.9
+    },
+    {
+      "kind": "texture",
+      "texture": "watercolour",
+      "opacity": 0.3,
+      "blend": "multiply",
+      "colors": [
+        "art2",
+        "art3",
+        "art4"
+      ]
+    },
+    {
+      "kind": "art",
+      "art": "clouds",
+      "placement": "top",
+      "colors": [
+        "art1",
+        "art2",
+        "art1"
+      ],
+      "density": "normal"
+    },
+    {
+      "kind": "art",
+      "art": "sparkles",
+      "placement": "scatter",
+      "colors": [
+        "art5",
+        "art4"
+      ],
+      "density": "sparse",
+      "opacity": 0.8
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.06,
+      "blend": "multiply"
+    }
+  ],
+  "ornament": {
+    "hero": "cloud",
+    "divider": "heart",
+    "badge": "none",
+    "ampersand": "script",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "soft",
+    "border": "none",
+    "radius": 30,
+    "fields": "boxed",
+    "buttons": "accent"
+  },
+  "motion": "pop_and_settle"
+}

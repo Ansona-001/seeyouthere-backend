@@ -165,6 +165,7 @@ type Template struct {
 	IsPremium bool      `json:"is_premium"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	SortOrder int32     `json:"sort_order"`
 }
 
 type TemplateVersion struct {

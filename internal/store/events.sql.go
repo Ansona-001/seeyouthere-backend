@@ -181,6 +181,21 @@ func (q *Queries) CountLiveEventsByOwner(ctx context.Context, ownerID uuid.UUID)
 	return count, err
 }
 
+const countOpenReportsForOwner = `-- name: CountOpenReportsForOwner :one
+SELECT count(*)
+FROM reports r
+JOIN events e ON e.id = r.event_id
+WHERE e.owner_id = $1::uuid AND r.status IN ('open', 'reviewing')
+`
+
+// Open or reviewing reports across all events the user owns, for the admin delete audit row.
+func (q *Queries) CountOpenReportsForOwner(ctx context.Context, ownerID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOpenReportsForOwner, ownerID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createAnonDraft = `-- name: CreateAnonDraft :exec
 INSERT INTO anon_drafts (id, cookie_hash, event_id, expires_at)
 VALUES ($1, $2, $3, $4)
@@ -285,6 +300,21 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 		&i.RetentionReminderSentAt,
 	)
 	return i, err
+}
+
+const deleteEventAdmin = `-- name: DeleteEventAdmin :execrows
+DELETE FROM events WHERE id = $1
+`
+
+// Hard-deletes one event in any state; child rows cascade. Call after LockEventForAdminDelete and
+// after its files are gone, in the same transaction. Unlike PurgeEvents it does not honour the
+// grace period, takedown or open-report guards: those are what an admin delete overrides.
+func (q *Queries) DeleteEventAdmin(ctx context.Context, eventID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteEventAdmin, eventID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteExpiredAnonDraftEvents = `-- name: DeleteExpiredAnonDraftEvents :execrows
@@ -1030,6 +1060,49 @@ func (q *Queries) LockAnonDraftEvent(ctx context.Context, arg LockAnonDraftEvent
 	return id, err
 }
 
+const lockEventForAdminDelete = `-- name: LockEventForAdminDelete :one
+SELECT e.id, e.slug, e.status, e.owner_id, e.deleted_at,
+       (SELECT count(*) FROM reports r WHERE r.event_id = e.id AND r.status IN ('open', 'reviewing')) AS open_reports,
+       (SELECT count(*) FROM rsvps s WHERE s.event_id = e.id) AS rsvp_count,
+       (SELECT count(*) FROM guests g WHERE g.event_id = e.id) AS guest_count,
+       (SELECT count(*) FROM media m WHERE m.event_id = e.id) AS media_count
+FROM events e
+WHERE e.id = $1
+FOR UPDATE OF e
+`
+
+type LockEventForAdminDeleteRow struct {
+	ID          uuid.UUID  `json:"id"`
+	Slug        *string    `json:"slug"`
+	Status      string     `json:"status"`
+	OwnerID     *uuid.UUID `json:"owner_id"`
+	DeletedAt   *time.Time `json:"deleted_at"`
+	OpenReports int64      `json:"open_reports"`
+	RsvpCount   int64      `json:"rsvp_count"`
+	GuestCount  int64      `json:"guest_count"`
+	MediaCount  int64      `json:"media_count"`
+}
+
+// Admin hard delete (inline and from the purge job): any state, live or soft-deleted. The row lock
+// (FOR UPDATE, not NO KEY UPDATE) also blocks the KEY SHARE lock a report insert takes through its
+// foreign key, so nothing lands on the event while its files are deleted. Counts feed the audit row.
+func (q *Queries) LockEventForAdminDelete(ctx context.Context, eventID uuid.UUID) (LockEventForAdminDeleteRow, error) {
+	row := q.db.QueryRow(ctx, lockEventForAdminDelete, eventID)
+	var i LockEventForAdminDeleteRow
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Status,
+		&i.OwnerID,
+		&i.DeletedAt,
+		&i.OpenReports,
+		&i.RsvpCount,
+		&i.GuestCount,
+		&i.MediaCount,
+	)
+	return i, err
+}
+
 const lockEventForEditor = `-- name: LockEventForEditor :one
 SELECT e.id, e.slug, e.status, e.owner_id
 FROM events e
@@ -1100,6 +1173,49 @@ func (q *Queries) LockEventForRSVP(ctx context.Context, eventID uuid.UUID) (Lock
 		&i.OwnerID,
 	)
 	return i, err
+}
+
+const markOwnedEventsForAdminPurge = `-- name: MarkOwnedEventsForAdminPurge :many
+WITH prev AS (
+    SELECT x.id, x.deleted_at IS NULL AS was_live
+    FROM events x
+    WHERE x.owner_id = $1::uuid
+    FOR UPDATE
+)
+UPDATE events e
+SET deleted_at = coalesce(e.deleted_at, now()), updated_at = now()
+FROM prev
+WHERE e.id = prev.id
+RETURNING e.id, prev.was_live::boolean AS was_live
+`
+
+type MarkOwnedEventsForAdminPurgeRow struct {
+	ID      uuid.UUID `json:"id"`
+	WasLive bool      `json:"was_live"`
+}
+
+// Admin user delete: soft-deletes every event the user owns, in any state (events_owner_id_all_idx),
+// keeping an earlier deleted_at. was_live is false for events that were already soft-deleted: they
+// are already hidden and left to the normal retention purge, so the caller queues a purge job only
+// for the live ones (bounded by the per-user live-event cap).
+func (q *Queries) MarkOwnedEventsForAdminPurge(ctx context.Context, ownerID uuid.UUID) ([]MarkOwnedEventsForAdminPurgeRow, error) {
+	rows, err := q.db.Query(ctx, markOwnedEventsForAdminPurge, ownerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []MarkOwnedEventsForAdminPurgeRow{}
+	for rows.Next() {
+		var i MarkOwnedEventsForAdminPurgeRow
+		if err := rows.Scan(&i.ID, &i.WasLive); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const markRetentionReminderSent = `-- name: MarkRetentionReminderSent :one

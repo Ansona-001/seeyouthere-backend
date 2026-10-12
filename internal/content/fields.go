@@ -3,7 +3,9 @@ package content
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 )
 
@@ -164,9 +166,17 @@ func validateOptions(iss *issues, path string, opts []string) {
 	}
 }
 
-// strictUnmarshal decodes data into dst, rejecting unknown JSON fields.
+// strictUnmarshal decodes data into dst, rejecting unknown JSON fields and
+// any data after the first JSON value.
 func strictUnmarshal(data []byte, dst any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	return dec.Decode(dst)
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected data after the JSON value")
+	}
+	return nil
 }

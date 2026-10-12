@@ -3,9 +3,11 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/content"
@@ -84,12 +86,16 @@ func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request) {
 
 	templates := make([]templateCatalogResp, 0, len(rows))
 	for _, row := range rows {
-		m, err := content.ValidateManifest(row.Manifest)
+		m, err := content.ValidateStoredManifest(row.Manifest)
 		if err != nil {
 			// Published manifests are validated at publish time; a failure
-			// here means stored data has drifted from the validator.
-			serverError(w, r, fmt.Errorf("parse manifest for template %s: %w", row.Slug, err))
-			return
+			// here means stored data has drifted from the validator. Skip just
+			// this template so one bad version can't take the whole picker
+			// down; the error carries the first issue only, never the body.
+			slog.ErrorContext(r.Context(), "skipping template with invalid manifest",
+				"request_id", middleware.GetReqID(r.Context()),
+				"template_slug", row.Slug, "version", row.Version, "err", err)
+			continue
 		}
 		tags := row.Tags
 		if len(tags) == 0 {

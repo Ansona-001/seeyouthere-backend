@@ -27,7 +27,7 @@ func (q *Queries) CountPublishedVersions(ctx context.Context, templateID uuid.UU
 const createTemplate = `-- name: CreateTemplate :one
 INSERT INTO templates (id, slug, name, tags, is_premium)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, slug, name, tags, status, is_premium, created_at, updated_at
+RETURNING id, slug, name, tags, status, is_premium, created_at, updated_at, sort_order
 `
 
 type CreateTemplateParams struct {
@@ -57,6 +57,7 @@ func (q *Queries) CreateTemplate(ctx context.Context, arg CreateTemplateParams) 
 		&i.IsPremium,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.SortOrder,
 	)
 	return i, err
 }
@@ -100,7 +101,7 @@ func (q *Queries) CreateTemplateVersion(ctx context.Context, arg CreateTemplateV
 }
 
 const getTemplateAdmin = `-- name: GetTemplateAdmin :one
-SELECT id, slug, name, tags, status, is_premium, created_at, updated_at FROM templates WHERE id = $1
+SELECT id, slug, name, tags, status, is_premium, created_at, updated_at, sort_order FROM templates WHERE id = $1
 `
 
 func (q *Queries) GetTemplateAdmin(ctx context.Context, templateID uuid.UUID) (Template, error) {
@@ -115,8 +116,72 @@ func (q *Queries) GetTemplateAdmin(ctx context.Context, templateID uuid.UUID) (T
 		&i.IsPremium,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.SortOrder,
 	)
 	return i, err
+}
+
+const getTemplateVersionForUpdate = `-- name: GetTemplateVersionForUpdate :one
+SELECT template_id, version, manifest, assets_path, created_by, created_at, published_at FROM template_versions
+WHERE template_id = $1 AND version = $2
+FOR UPDATE
+`
+
+type GetTemplateVersionForUpdateParams struct {
+	TemplateID uuid.UUID `json:"template_id"`
+	Version    int32     `json:"version"`
+}
+
+// Row-locks the version so a concurrent manifest or asset change waits for the publish
+// transaction (and then fails with version_published) instead of slipping in after validation.
+func (q *Queries) GetTemplateVersionForUpdate(ctx context.Context, arg GetTemplateVersionForUpdateParams) (TemplateVersion, error) {
+	row := q.db.QueryRow(ctx, getTemplateVersionForUpdate, arg.TemplateID, arg.Version)
+	var i TemplateVersion
+	err := row.Scan(
+		&i.TemplateID,
+		&i.Version,
+		&i.Manifest,
+		&i.AssetsPath,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.PublishedAt,
+	)
+	return i, err
+}
+
+const listTemplateVersionManifests = `-- name: ListTemplateVersionManifests :many
+SELECT template_id, version, manifest
+FROM template_versions
+ORDER BY template_id, version
+LIMIT 500
+`
+
+type ListTemplateVersionManifestsRow struct {
+	TemplateID uuid.UUID `json:"template_id"`
+	Version    int32     `json:"version"`
+	Manifest   []byte    `json:"manifest"`
+}
+
+// Every version of every template (draft, published, retired), for validating the whole stored
+// catalog against the manifest rules. Not on a request path; bounded because the catalog is small.
+func (q *Queries) ListTemplateVersionManifests(ctx context.Context) ([]ListTemplateVersionManifestsRow, error) {
+	rows, err := q.db.Query(ctx, listTemplateVersionManifests)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTemplateVersionManifestsRow{}
+	for rows.Next() {
+		var i ListTemplateVersionManifestsRow
+		if err := rows.Scan(&i.TemplateID, &i.Version, &i.Manifest); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listTemplateVersions = `-- name: ListTemplateVersions :many

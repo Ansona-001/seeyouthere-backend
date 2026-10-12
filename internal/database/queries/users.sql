@@ -175,3 +175,37 @@ WHERE r.role = 'super_admin' AND u.deleted_at IS NULL AND u.status = 'active';
 -- name: LockRoles :exec
 -- Serialises role changes so the "last super_admin" check can't race. Transaction-scoped.
 SELECT pg_advisory_xact_lock(hashtextextended('syt:user_roles', 0));
+
+-- name: GetUserForAdminDelete :one
+-- Admin user delete: locks the live row FOR UPDATE, so concurrent edits and status changes wait.
+-- Writers that attach new rows to a user (event create, draft claim, add co-host) take
+-- LockLiveUser first, which conflicts with this lock and then finds the user gone.
+-- Returns the numbers for the audit row. No row: user missing or already deleted.
+SELECT u.id, u.email, u.status,
+       (SELECT count(*) FROM events e WHERE e.owner_id = u.id) AS owned_events
+FROM users u
+WHERE u.id = @user_id AND u.deleted_at IS NULL
+FOR UPDATE OF u;
+
+-- name: LockLiveUser :one
+-- Taken first by a transaction that is about to attach rows (events, memberships) to a user.
+-- FOR KEY SHARE conflicts with GetUserForAdminDelete's FOR UPDATE: under READ COMMITTED it waits
+-- for an in-flight admin delete and then returns no row. No row: user missing, deleted or not active.
+SELECT id FROM users
+WHERE id = @user_id AND deleted_at IS NULL AND status = 'active'
+FOR KEY SHARE;
+
+-- name: UpdateUserEmailAdmin :one
+-- Returns the address before and after. The caller compares them: an unchanged address writes
+-- nothing worth auditing. No row: user missing or deleted. A taken address fails with 23505 on
+-- users_email_key (live rows only).
+WITH prev AS (
+    SELECT x.id, x.email FROM users x
+    WHERE x.id = @target_id AND x.deleted_at IS NULL
+    FOR NO KEY UPDATE
+)
+UPDATE users u
+SET email = @email, updated_at = now()
+FROM prev
+WHERE u.id = prev.id
+RETURNING prev.email AS old_email, u.email AS new_email;

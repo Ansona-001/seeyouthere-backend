@@ -47,6 +47,9 @@ docker run --rm -v "$(pwd):/src" -w /src sqlc/sqlc generate
 | POST | `/v1/auth/verify` | â€“ | `{email, code}` â†’ creates the user on first login, sets `syt_session` cookie |
 | POST | `/v1/auth/logout` | cookie | Revokes the session |
 | GET | `/v1/me` | cookie | Current user and admin roles |
+| DELETE | `/v1/admin/events/{id}` | super_admin | `{confirm, reason?}` (`confirm` = the slug, or `delete` for a draft without one) → 204. Permanently deletes the event, its rows and files in one transaction; 503 `storage_unavailable` leaves it intact. 30/hour per admin |
+| DELETE | `/v1/admin/users/{id}` | super_admin | `{confirm_email, reason?}` → 202 `{events_queued}`. Scrubs the account and queues a purge job per owned live event (already soft-deleted ones are left to the retention purge); co-hosted events stay. 409 `has_admin_role` if the user holds a role, 409 `user_banned` if banned, 403 for yourself. 10/hour per admin |
+| PATCH | `/v1/admin/users/{id}` | moderator (email: super_admin) | `{name?, email?}` → 200 `{user}`. An email change signs the user out everywhere and notifies the old address only; 409 `email_taken`, 409 `has_admin_role` if the user holds any role. 60/hour per admin, email 10/hour per admin and 3/day per user |
 
 Errors look like `{"error": {"code": "invalid_code", "message": "..."}}`.
 

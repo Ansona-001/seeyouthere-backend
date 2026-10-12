@@ -1,0 +1,158 @@
+{
+  "schema": 2,
+  "layout": "split",
+  "hero_style": "text_only",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "ivory",
+      "name": "Ivory",
+      "colors": {
+        "background": "#F3EEE3",
+        "surface": "#FBF8F1",
+        "text": "#2C382D",
+        "muted": "#5A6457",
+        "accent": "#2F4A37",
+        "accent_text": "#FBF8F1"
+      },
+      "accent_ink": "#77592A",
+      "art": [
+        "#5F6E55",
+        "#C9D3B8",
+        "#DCE2CF",
+        "#4A5531",
+        "#FFFDF8",
+        "#E5DCC8"
+      ],
+      "foil": [
+        "#8E6B2E",
+        "#C9A963",
+        "#F3E2AA",
+        "#B48A43",
+        "#E6CC8B"
+      ]
+    },
+    {
+      "id": "sage",
+      "name": "Sage",
+      "colors": {
+        "background": "#E9EEE2",
+        "surface": "#F6F8F2",
+        "text": "#25301F",
+        "muted": "#4F5A47",
+        "accent": "#3C5A3A",
+        "accent_text": "#F6F8F2"
+      },
+      "accent_ink": "#6B5221",
+      "art": [
+        "#6A7B5C",
+        "#CAD6BC",
+        "#DDE5D2",
+        "#4F5E32",
+        "#FAFCF6",
+        "#D5DDC6"
+      ],
+      "foil": [
+        "#8E6B2E",
+        "#C9A963",
+        "#F3E2AA",
+        "#B48A43",
+        "#E6CC8B"
+      ]
+    },
+    {
+      "id": "blush",
+      "name": "Blush",
+      "colors": {
+        "background": "#F7EAE6",
+        "surface": "#FDF7F4",
+        "text": "#3A2623",
+        "muted": "#6A4F4A",
+        "accent": "#7A3B3F",
+        "accent_text": "#FDF7F4"
+      },
+      "accent_ink": "#7A3B3F",
+      "art": [
+        "#7E6B5A",
+        "#E3D2C4",
+        "#EFE2D8",
+        "#5E5236",
+        "#FFFBF9",
+        "#EBD9D2"
+      ],
+      "foil": [
+        "#C98E7E",
+        "#F0C9B8",
+        "#FFF0E8",
+        "#D9A08E",
+        "#F6D6C8"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "bodoni",
+      "name": "Bodoni and Montserrat",
+      "heading": "bodoni_moda",
+      "body": "montserrat",
+      "accent": "pinyon_script"
+    }
+  ],
+  "defaults": {
+    "palette": "ivory",
+    "font": "bodoni"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background",
+      "glow": "art5",
+      "vignette": "art6"
+    },
+    {
+      "kind": "texture",
+      "texture": "fibers",
+      "opacity": 0.06,
+      "blend": "multiply"
+    },
+    {
+      "kind": "art",
+      "art": "olive_branches",
+      "placement": "corners",
+      "colors": [
+        "art1",
+        "art2",
+        "art3",
+        "art4"
+      ]
+    },
+    {
+      "kind": "texture",
+      "texture": "grain",
+      "opacity": 0.1,
+      "blend": "multiply"
+    },
+    {
+      "kind": "frame",
+      "frame": "double_hairline",
+      "inset": 12,
+      "paint": "foil"
+    }
+  ],
+  "ornament": {
+    "hero": "wreath_monogram",
+    "divider": "olive_sprig",
+    "badge": "none",
+    "ampersand": "script",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "reply_card",
+    "border": "foil_inset",
+    "radius": 3,
+    "fields": "underline",
+    "buttons": "accent"
+  },
+  "motion": "draw_on"
+}

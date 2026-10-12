@@ -5,30 +5,47 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
-// Manifest is a template version's design definition (schema 1).
+// Manifest is a template version's design definition: schema 1 (flat theme
+// knobs) or schema 2 (theme engine v2: layers, ornament, card, motion). The
+// schema-2 fields are all omitempty so a schema-1 manifest's canonical bytes
+// are unchanged; decoration, surface and texture are omitempty because a
+// schema-2 manifest must not carry them (schema 1 always has all three).
 type Manifest struct {
 	Schema     int    `json:"schema"`
 	Layout     string `json:"layout"`
 	HeroStyle  string `json:"hero_style"`
-	Decoration string `json:"decoration"`
+	Decoration string `json:"decoration,omitempty"`
 	// Surface, Texture and HeadingScale are optional theme knobs (rich-blocks
 	// doc §4.1). "" normalises to the default ("plain" / "none" / "regular")
 	// so every manifest that predates them keeps today's rendered look.
-	Surface      string              `json:"surface"`
-	Texture      string              `json:"texture"`
+	Surface      string              `json:"surface,omitempty"`
+	Texture      string              `json:"texture,omitempty"`
 	HeadingScale string              `json:"heading_scale"`
 	Palettes     []Palette           `json:"palettes"`
 	Fonts        []FontPair          `json:"fonts"`
 	Defaults     ManifestDefaults    `json:"defaults"`
 	Background   *ManifestBackground `json:"background"`
+
+	// Schema 2 only.
+	Layers   []Layer   `json:"layers,omitempty"`
+	Ornament *Ornament `json:"ornament,omitempty"`
+	Card     *Card     `json:"card,omitempty"`
+	Motion   string    `json:"motion,omitempty"`
 }
 
 type Palette struct {
 	ID     string        `json:"id"`
 	Name   string        `json:"name"`
 	Colors PaletteColors `json:"colors"`
+
+	// Schema 2 only: an explicit readable ink for accent-styled text, the art
+	// colour ramp (art1..art8 tokens) and the foil gradient stops.
+	AccentInk string   `json:"accent_ink,omitempty"`
+	Art       []string `json:"art,omitempty"`
+	Foil      []string `json:"foil,omitempty"`
 }
 
 // PaletteColors is the resolved 6-colour theme applied to an event page.
@@ -68,6 +85,20 @@ type Overrides struct {
 	Font    string `json:"font"`
 }
 
+// Manifest size limits. A write (admin create/update) is held to both
+// maxManifestBytes on the raw input, checked before decoding, and
+// maxManifestCanonicalBytes on the canonical re-marshalled form that is actually
+// stored (defaults written out can be bigger than the input). The canonical
+// cap leaves room for PostgreSQL's jsonb text (", " and ": " spacing, about
+// 8-10% bigger), so what is read back always fits maxStoredBytes by a wide
+// margin. The DB CHECK on pg_column_size(manifest) (32768) sits above all of
+// them because jsonb's binary form is 10-15% bigger than the text.
+const (
+	maxManifestBytes          = 24 << 10
+	maxManifestCanonicalBytes = 20 << 10
+	maxStoredBytes            = 48 << 10
+)
+
 var (
 	manifestIDRe = regexp.MustCompile(`^[a-z0-9_-]{1,24}$`)
 	hexColorRe   = regexp.MustCompile(`^#[0-9A-Fa-f]{6}$`)
@@ -99,50 +130,87 @@ var allowedFonts = map[string]bool{
 	"figtree": true, "bricolage_grotesque": true, "playfair_display": true, "cormorant_garamond": true,
 	"dm_serif_display": true, "lora": true, "fraunces": true, "great_vibes": true,
 	"birthstone": true, "montserrat": true,
+	"bodoni_moda": true, "pinyon_script": true, "bagel_fat_one": true,
+	"limelight": true, "josefin_sans": true,
 }
 
 // headingOnlyFonts are display scripts too narrow/decorative for body text:
 // allowed as a font pair's heading or accent, rejected as body.
-var headingOnlyFonts = map[string]bool{"great_vibes": true, "birthstone": true}
+var headingOnlyFonts = map[string]bool{
+	"great_vibes": true, "birthstone": true,
+	"pinyon_script": true, "bagel_fat_one": true, "limelight": true,
+}
 
 // ValidateManifest decodes and validates a template manifest, normalising
 // colours to upper-case hex and checking WCAG contrast so no combination of
 // palette and font pair can render unreadable text.
+//
+// Schema 1 is validated exactly as it always was; every schema-2 rule lives
+// in validateV2 and only runs for `schema: 2`.
 func ValidateManifest(raw []byte) (Manifest, error) {
+	return validateManifest(raw, maxManifestBytes, true)
+}
+
+// ValidateStoredManifest is ValidateManifest for a manifest read back from
+// the database: the same rules, but sized for PostgreSQL's jsonb text (which
+// is looser than the canonical form it was saved from) and without the
+// canonical-size cap, so a manifest that passed on write can never fail to
+// load. Use ValidateManifest for anything that arrives from a client.
+func ValidateStoredManifest(raw []byte) (Manifest, error) {
+	return validateManifest(raw, maxStoredBytes, false)
+}
+
+func validateManifest(raw []byte, maxRaw int, capCanonical bool) (Manifest, error) {
+	if len(raw) > maxRaw {
+		return Manifest{}, single("manifest", "too_large", fmt.Sprintf("manifest must be %d KiB or smaller", maxRaw>>10))
+	}
+	if !utf8.Valid(raw) {
+		return Manifest{}, single("manifest", "invalid_json", "must be a manifest object")
+	}
 	var m Manifest
 	if err := strictUnmarshal(raw, &m); err != nil {
 		return Manifest{}, single("manifest", "invalid_json", "must be a manifest object")
 	}
 
 	iss := &issues{}
-	if m.Schema != 1 {
-		iss.add("schema", "unsupported_schema", "only schema 1 is supported")
+	if m.Schema != 1 && m.Schema != 2 {
+		return Manifest{}, single("schema", "unsupported_schema", "only schemas 1 and 2 are supported")
 	}
+	v2 := m.Schema == 2
+	checkSchemaFields(iss, &m)
+
 	if !validLayouts[m.Layout] {
 		iss.add("layout", "invalid_value", "unknown layout")
 	}
-	if !validHeroStyles[m.HeroStyle] {
+	heroStyles := validHeroStyles
+	if v2 {
+		heroStyles = validHeroStyleV2
+	}
+	if !heroStyles[m.HeroStyle] {
 		iss.add("hero_style", "invalid_value", "unknown hero style")
 	}
-	if !validDecorations[m.Decoration] {
-		iss.add("decoration", "invalid_value", "unknown decoration")
-	}
-	if !validSurfaces[m.Surface] {
-		iss.add("surface", "invalid_value", "unknown surface")
-	}
-	if !validTextures[m.Texture] {
-		iss.add("texture", "invalid_value", "unknown texture")
+	if !v2 {
+		if !validDecorations[m.Decoration] {
+			iss.add("decoration", "invalid_value", "unknown decoration")
+		}
+		if !validSurfaces[m.Surface] {
+			iss.add("surface", "invalid_value", "unknown surface")
+		}
+		if !validTextures[m.Texture] {
+			iss.add("texture", "invalid_value", "unknown texture")
+		}
 	}
 	if !validHeadingScales[m.HeadingScale] {
 		iss.add("heading_scale", "invalid_value", "unknown heading scale")
 	}
 	// Normalise "" to today's default regardless of the checks above, so a
 	// caller that only wants the canonical form (e.g. a preview) sees an
-	// explicit value even for an otherwise-invalid manifest.
-	if m.Surface == "" {
+	// explicit value even for an otherwise-invalid manifest. Schema 2 has no
+	// surface or texture to normalise.
+	if !v2 && m.Surface == "" {
 		m.Surface = "plain"
 	}
-	if m.Texture == "" {
+	if !v2 && m.Texture == "" {
 		m.Texture = "none"
 	}
 	if m.HeadingScale == "" {
@@ -163,7 +231,9 @@ func ValidateManifest(raw []byte) (Manifest, error) {
 		} else {
 			paletteIDs[p.ID] = true
 		}
-		validatePaletteColors(iss, path+".colors", &p.Colors, m.Surface)
+		if !v2 {
+			validatePaletteColors(iss, path+".colors", &p.Colors, m.Surface)
+		}
 	}
 
 	if len(m.Fonts) < 1 || len(m.Fonts) > 6 {
@@ -178,6 +248,9 @@ func ValidateManifest(raw []byte) (Manifest, error) {
 			iss.add(path+".id", "duplicate_id", "font ids must be unique")
 		} else {
 			fontIDs[f.ID] = true
+		}
+		if v2 {
+			checkNameV2(iss, path+".name", f.Name)
 		}
 		if !allowedFonts[f.Heading] {
 			iss.add(path+".heading", "invalid_value", "unknown font")
@@ -200,7 +273,11 @@ func ValidateManifest(raw []byte) (Manifest, error) {
 		iss.add("defaults.font", "invalid_value", "must reference a font pair above")
 	}
 
-	if m.Background != nil {
+	if v2 {
+		validateV2(iss, &m)
+	}
+
+	if !v2 && m.Background != nil {
 		if m.Background.Asset != "background" {
 			iss.add("background.asset", "invalid_value", `must be "background"`)
 		}
@@ -212,10 +289,21 @@ func ValidateManifest(raw []byte) (Manifest, error) {
 	if err := iss.err(); err != nil {
 		return Manifest{}, err
 	}
+	if capCanonical {
+		canon, err := json.Marshal(m)
+		if err != nil {
+			return Manifest{}, fmt.Errorf("marshal manifest: %w", err)
+		}
+		if len(canon) > maxManifestCanonicalBytes {
+			return Manifest{}, single("manifest", "too_large", fmt.Sprintf("manifest must be %d KiB or smaller once saved", maxManifestCanonicalBytes>>10))
+		}
+	}
 	return m, nil
 }
 
-func validatePaletteColors(iss *issues, path string, c *PaletteColors, surface string) {
+// normalizePaletteHex checks that the six palette colours are #RRGGBB and
+// upper-cases them in place, reporting whether all are valid.
+func normalizePaletteHex(iss *issues, path string, c *PaletteColors) bool {
 	fields := []struct {
 		name string
 		val  *string
@@ -232,7 +320,11 @@ func validatePaletteColors(iss *issues, path string, c *PaletteColors, surface s
 		}
 		*f.val = strings.ToUpper(*f.val)
 	}
-	if !ok {
+	return ok
+}
+
+func validatePaletteColors(iss *issues, path string, c *PaletteColors, surface string) {
+	if !normalizePaletteHex(iss, path, c) {
 		return
 	}
 	const minText = 4.5

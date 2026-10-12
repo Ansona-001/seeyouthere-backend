@@ -534,6 +534,88 @@ func (s *Server) respondWithAdminEvent(w http.ResponseWriter, r *http.Request, e
 	writeJSON(w, http.StatusOK, map[string]any{"event": resp})
 }
 
+// DELETE /v1/admin/events/{id} {confirm, reason?}
+//
+// handleAdminDeleteEvent (super_admin only) permanently deletes an event in
+// any state: live, taken down, soft-deleted or an anonymous draft. The
+// confirmation is the event's slug (the literal "delete" for a slug-less
+// draft). Lock, audit row, file removal and row delete share one
+// transaction, files first, so a storage failure rolls everything back and
+// the same request can simply be retried; the slug is free as soon as it
+// commits. Open reports do not block the delete (their count is audited).
+func (s *Server) handleAdminDeleteEvent(w http.ResponseWriter, r *http.Request) {
+	eventID, err := parseUUIDParam(r, "id")
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such event.")
+		return
+	}
+	callerID, _ := userIDFrom(r.Context())
+	if !s.allow(w, r, limit{"admin:event:delete:" + callerID.String(), 30, time.Hour}) {
+		return
+	}
+
+	var body struct {
+		Confirm string `json:"confirm"`
+		Reason  string `json:"reason"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	reason, ok := validateAdminReason(body.Reason, 500)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "validation_failed", "Check the reason field.")
+		return
+	}
+
+	ctx := r.Context()
+	err = s.inTx(ctx, func(_ pgx.Tx, q *store.Queries) error {
+		row, err := q.LockEventForAdminDelete(ctx, eventID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errAdminEventNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock event: %w", err)
+		}
+		want := "delete"
+		if row.Slug != nil {
+			want = *row.Slug
+		}
+		if body.Confirm != want {
+			return errConfirmMismatch
+		}
+		after := map[string]string{}
+		if reason != "" {
+			after["reason"] = reason
+		}
+		if err := s.writeAudit(ctx, q, r, auditEntry{
+			ActorID: &callerID, Action: "event.delete", TargetType: "event", TargetID: eventID.String(),
+			Before: map[string]any{
+				"slug": row.Slug, "status": row.Status, "owner_id": row.OwnerID,
+				"was_soft_deleted": row.DeletedAt != nil, "open_reports": row.OpenReports,
+				"rsvps": row.RsvpCount, "guests": row.GuestCount, "media": row.MediaCount,
+			},
+			After: after,
+		}); err != nil {
+			return err
+		}
+		return jobs.PurgeLockedEvent(ctx, q, s.media, eventID)
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, errAdminEventNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "No such event.")
+		case errors.Is(err, errConfirmMismatch):
+			writeError(w, http.StatusBadRequest, "confirm_mismatch", "That doesn't match the event.")
+		case errors.Is(err, jobs.ErrPurgeFiles):
+			writeStorageError(w, r, err)
+		default:
+			serverError(w, r, fmt.Errorf("admin delete event: %w", err))
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // --- guest media moderation queue ---
 
 var validMediaStatuses = map[string]bool{"pending": true, "approved": true, "rejected": true}

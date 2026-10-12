@@ -19,8 +19,10 @@ import (
 )
 
 var (
-	errTemplateNotFound       = errors.New("admin: template not found")
-	errTemplateVersionPublish = errors.New("admin: template version already published")
+	errTemplateNotFound        = errors.New("admin: template not found")
+	errTemplateVersionPublish  = errors.New("admin: template version already published")
+	errTemplateVersionInvalid  = errors.New("admin: template version manifest invalid")
+	errTemplateVersionNotReady = errors.New("admin: template version missing its asset")
 )
 
 // templateSlugRe mirrors templates.slug's shape: lower-case, hyphenated.
@@ -513,38 +515,39 @@ func (s *Server) handleUploadAdminTemplateBackground(w http.ResponseWriter, r *h
 // --- POST /v1/admin/templates/{id}/versions/{v}/publish ---
 
 // handleAdminPublishTemplateVersion re-validates the manifest (a manifest
-// requiring a background asset must have one committed) before publishing;
-// PublishTemplateVersion itself just flips published_at when the row is
-// still a draft.
+// requiring a background asset must have one committed) before publishing.
+// The row is locked (FOR UPDATE) for the whole transaction so a concurrent
+// manifest or asset edit cannot land between validation and publish: it
+// waits, then fails with version_published.
 func (s *Server) handleAdminPublishTemplateVersion(w http.ResponseWriter, r *http.Request) {
 	templateID, version, ok := parseTemplateVersionParams(w, r)
 	if !ok {
 		return
 	}
 	ctx := r.Context()
-	row, err := s.q.GetTemplateVersion(ctx, store.GetTemplateVersionParams{TemplateID: templateID, Version: version})
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, http.StatusNotFound, "not_found", "No such template version.")
-		return
-	}
-	if err != nil {
-		serverError(w, r, fmt.Errorf("get template version: %w", err))
-		return
-	}
-	manifest, err := content.ValidateManifest(row.Manifest)
-	if err != nil {
-		writeValidationIssues(w, r, err, "This version's manifest is invalid.")
-		return
-	}
-	if manifest.Background != nil && row.AssetsPath == "" {
-		writeError(w, http.StatusConflict, "not_ready", "Upload a background image before publishing.")
-		return
-	}
-
-	callerID, _ := userIDFrom(r.Context())
-	var publishedAt time.Time
-	err = s.inTx(ctx, func(_ pgx.Tx, q *store.Queries) error {
-		var err error
+	callerID, _ := userIDFrom(ctx)
+	var (
+		publishedAt time.Time
+		manifestRaw []byte
+		invalid     error
+	)
+	err := s.inTx(ctx, func(_ pgx.Tx, q *store.Queries) error {
+		row, err := q.GetTemplateVersionForUpdate(ctx, store.GetTemplateVersionForUpdateParams{TemplateID: templateID, Version: version})
+		if err != nil {
+			return err
+		}
+		if row.PublishedAt != nil {
+			return errTemplateVersionPublish
+		}
+		manifest, err := content.ValidateStoredManifest(row.Manifest)
+		if err != nil {
+			invalid = err
+			return errTemplateVersionInvalid
+		}
+		if manifest.UsesBackgroundAsset() && row.AssetsPath == "" {
+			return errTemplateVersionNotReady
+		}
+		manifestRaw = row.Manifest
 		publishedAt, err = q.PublishTemplateVersion(ctx, store.PublishTemplateVersionParams{TemplateID: templateID, Version: version})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errTemplateVersionPublish
@@ -557,16 +560,26 @@ func (s *Server) handleAdminPublishTemplateVersion(w http.ResponseWriter, r *htt
 			TargetID: fmt.Sprintf("%s/%d", templateID, version),
 		})
 	})
-	if err != nil {
-		if errors.Is(err, errTemplateVersionPublish) {
-			writeError(w, http.StatusConflict, "version_published", "This version is already published.")
-			return
-		}
+	switch {
+	case err == nil:
+	case errors.Is(err, pgx.ErrNoRows):
+		writeError(w, http.StatusNotFound, "not_found", "No such template version.")
+		return
+	case errors.Is(err, errTemplateVersionInvalid):
+		writeValidationIssues(w, r, invalid, "This version's manifest is invalid.")
+		return
+	case errors.Is(err, errTemplateVersionNotReady):
+		writeError(w, http.StatusConflict, "not_ready", "Upload a background image before publishing.")
+		return
+	case errors.Is(err, errTemplateVersionPublish):
+		writeError(w, http.StatusConflict, "version_published", "This version is already published.")
+		return
+	default:
 		serverError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, adminTemplateVersionResp{
-		Version: version, Manifest: json.RawMessage(row.Manifest), Status: "published", PublishedAt: &publishedAt,
+		Version: version, Manifest: json.RawMessage(manifestRaw), Status: "published", PublishedAt: &publishedAt,
 	})
 }
 
@@ -590,13 +603,13 @@ func (s *Server) handleAdminPreviewTemplateVersion(w http.ResponseWriter, r *htt
 		serverError(w, r, fmt.Errorf("get template version: %w", err))
 		return
 	}
-	manifest, err := content.ValidateManifest(row.Manifest)
+	manifest, err := content.ValidateStoredManifest(row.Manifest)
 	if err != nil {
 		writeValidationIssues(w, r, err, "This version's manifest is invalid.")
 		return
 	}
 	backgroundSrc := ""
-	if manifest.Background != nil && row.AssetsPath != "" {
+	if manifest.UsesBackgroundAsset() && row.AssetsPath != "" {
 		backgroundSrc = "/media/" + row.AssetsPath + "/background"
 	}
 

@@ -22,6 +22,18 @@ type Theme struct {
 	Palette    PaletteColors    `json:"palette"`
 	Fonts      ThemeFonts       `json:"fonts"`
 	Background *ThemeBackground `json:"background"`
+
+	// Schema-2 (theme engine v2) additions; all omitempty so a v1 theme's
+	// JSON is byte-identical. Every colour is a resolved hex string. For a v2
+	// theme the v1 fields above carry fallbacks for older renderers
+	// (decoration, surface, texture) and AccentInk is the palette's ink.
+	Engine   int       `json:"engine,omitempty"`
+	Layers   []Layer   `json:"layers,omitempty"`
+	Art      []string  `json:"art,omitempty"`
+	Foil     []string  `json:"foil,omitempty"`
+	Ornament *Ornament `json:"ornament,omitempty"`
+	Card     *Card     `json:"card,omitempty"`
+	Motion   string    `json:"motion,omitempty"`
 }
 
 type ThemeFonts struct {
@@ -61,8 +73,10 @@ func ResolveTheme(m Manifest, overridesRaw []byte, backgroundSrc string) Theme {
 		Layout: m.Layout, HeroStyle: m.HeroStyle, Decoration: m.Decoration,
 		Surface: m.Surface, Texture: m.Texture, HeadingScale: m.HeadingScale,
 	}
+	var selected Palette
 	for _, p := range m.Palettes {
 		if p.ID == paletteID {
+			selected = p
 			t.Palette = p.Colors
 			break
 		}
@@ -80,8 +94,96 @@ func ResolveTheme(m Manifest, overridesRaw []byte, backgroundSrc string) Theme {
 	if m.Background != nil && backgroundSrc != "" {
 		t.Background = &ThemeBackground{Src: backgroundSrc, Opacity: m.Background.Opacity}
 	}
+	if m.Schema == 2 {
+		resolveV2(&t, m, selected, backgroundSrc)
+		return t
+	}
 	t.AccentInk = accentInk(t.Palette, t.Surface)
 	return t
+}
+
+// resolveV2 fills the schema-2 part of t from manifest m and the selected
+// palette p: every colour token becomes that palette's hex, the image layer
+// gets its server-built src (and is dropped when there is no asset), and the
+// v1 fields get fallbacks for older renderers. m is assumed valid.
+func resolveV2(t *Theme, m Manifest, p Palette, backgroundSrc string) {
+	glass := m.Card != nil && m.Card.Style == "glass"
+	ink := paletteInk(p, glass)
+
+	t.Engine = 2
+	t.AccentInk = ink
+	t.Art = append([]string(nil), p.Art...)
+	t.Foil = append([]string(nil), p.Foil...)
+	t.Motion = m.Motion
+
+	var o Ornament
+	var c Card
+	if m.Ornament != nil {
+		o = *m.Ornament
+		o.HeroInk = resolveHeroInk(p, &m, glass)
+	}
+	if m.Card != nil {
+		c = *m.Card
+		c.Radius = copyPtr(c.Radius)
+	}
+	t.Ornament = &o
+	t.Card = &c
+
+	hex := func(tok string) string {
+		if tok == "" {
+			return ""
+		}
+		return tokenHex(p, ink, tok)
+	}
+	t.Layers = make([]Layer, 0, len(m.Layers))
+	for _, l := range m.Layers {
+		switch l.Kind {
+		case kindImage:
+			if backgroundSrc == "" {
+				continue
+			}
+			l.Src = backgroundSrc
+		case kindBlock:
+			l.Color = "accent"
+		}
+		// The by-value copy still shares the manifest's pointers and slices;
+		// a resolved theme must never alias manifest memory.
+		l.Opacity, l.GlowOpacity, l.VignetteOpacity = copyPtr(l.Opacity), copyPtr(l.GlowOpacity), copyPtr(l.VignetteOpacity)
+		l.Inset = copyPtr(l.Inset)
+		l.Tone, l.Glow, l.Vignette, l.Color = hex(l.Tone), hex(l.Glow), hex(l.Vignette), hex(l.Color)
+		if l.Colors != nil {
+			cols := make([]string, len(l.Colors))
+			for i, tok := range l.Colors {
+				cols[i] = hex(tok)
+			}
+			l.Colors = cols
+		}
+		t.Layers = append(t.Layers, l)
+	}
+
+	// Fallbacks for a renderer that predates engine 2.
+	t.Decoration = "none"
+	if v1Dividers[o.Divider] {
+		t.Decoration = o.Divider
+	}
+	switch c.Style {
+	case "none":
+		t.Surface = "plain"
+	case "glass":
+		t.Surface = "glass"
+	default:
+		t.Surface = "card"
+	}
+	t.Texture = "none"
+}
+
+// copyPtr returns a pointer to a copy of *p (nil stays nil).
+func copyPtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }
 
 // accentInk implements Theme.AccentInk: the palette's accent colour, unless
@@ -91,9 +193,14 @@ func ResolveTheme(m Manifest, overridesRaw []byte, backgroundSrc string) Theme {
 // resolves to its accent except Confetti "Sunshine" (1.60:1), which falls
 // back to text.
 func accentInk(p PaletteColors, surface string) string {
-	const minInk = 3.0
+	return accentInkMin(p, surface == "glass", 3.0)
+}
+
+// accentInkMin is accentInk with an explicit contrast floor and glass flag;
+// schema 2 uses a 4.5 floor.
+func accentInkMin(p PaletteColors, glass bool, minInk float64) string {
 	backgrounds := []string{p.Background, p.Surface}
-	if surface == "glass" {
+	if glass {
 		backgrounds = append(backgrounds,
 			blendHex(p.Surface, p.Background, glassAlphaWide),
 			blendHex(p.Surface, p.Background, glassAlphaNarrow),

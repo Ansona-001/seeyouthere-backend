@@ -347,13 +347,13 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, fmt.Errorf("parse stored content for event %s: %w", row.ID, err))
 		return
 	}
-	manifest, err := content.ValidateManifest(row.Manifest)
+	manifest, err := content.ValidateStoredManifest(row.Manifest)
 	if err != nil {
 		serverError(w, r, fmt.Errorf("parse manifest for event %s: %w", row.ID, err))
 		return
 	}
 	backgroundSrc := ""
-	if manifest.Background != nil && row.AssetsPath != "" {
+	if manifest.UsesBackgroundAsset() && row.AssetsPath != "" {
 		backgroundSrc = "/media/" + row.AssetsPath + "/background"
 	}
 	theme := content.ResolveTheme(manifest, row.Overrides, backgroundSrc)

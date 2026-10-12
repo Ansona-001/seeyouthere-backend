@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,11 +25,14 @@ import (
 // without it).
 func dbTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	url := os.Getenv("DATABASE_URL")
-	if url == "" {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
 		t.Skip("DATABASE_URL not set")
 	}
-	pool, err := pgxpool.New(context.Background(), url)
+	if u, err := url.Parse(dsn); err == nil && strings.TrimPrefix(u.Path, "/") == "seeyouthere" && os.Getenv("ALLOW_DEV_DB") != "1" {
+		t.Fatal("refusing to run DB tests against the dev database (tests leak fixture rows); use scripts/test.sh or scripts/test.ps1, or set ALLOW_DEV_DB=1")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}

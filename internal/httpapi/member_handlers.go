@@ -148,6 +148,16 @@ func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
 			return errCannotAddSelf
 		}
 
+		// The target may be deleted by an admin right after the upsert above;
+		// the lock makes that either wait or fail here instead of adding a
+		// membership to a deleted account.
+		if _, err := q.LockLiveUser(ctx, target.ID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return pgx.ErrNoRows
+			}
+			return fmt.Errorf("lock live user: %w", err)
+		}
+
 		existing, err := q.ListEventMembers(ctx, store.ListEventMembersParams{EventID: eventID, UserID: userID})
 		if err != nil {
 			return fmt.Errorf("list event members: %w", err)

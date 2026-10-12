@@ -3,6 +3,7 @@ package content
 import (
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -60,6 +61,31 @@ func checkField(iss *issues, path, raw string, maxRunes int, required, allowNewl
 	if code, msg, ok := validateText(s, maxRunes, allowNewline); !ok {
 		iss.add(path, code, msg)
 		return ""
+	}
+	return s
+}
+
+// badgeMaxRunes bounds the hero badge (a numeral or monogram such as "50" or "A&T").
+const badgeMaxRunes = 4
+
+// checkBadge validates the hero badge. It is deliberately stricter than
+// checkField and is not trimmed: only Unicode letters and digits plus
+// "&", "·" (U+00B7), "+" and "-" are allowed, so whitespace, control and
+// format characters, bidi overrides, markup and emoji are all rejected.
+// An empty badge is valid.
+func checkBadge(iss *issues, path, s string) string {
+	if s == "" {
+		return ""
+	}
+	if utf8.RuneCountInString(s) > badgeMaxRunes {
+		iss.add(path, "too_long", fmt.Sprintf("must be %d characters or fewer", badgeMaxRunes))
+		return ""
+	}
+	for _, r := range s {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '&' && r != '·' && r != '+' && r != '-' {
+			iss.add(path, "invalid_text", "may only contain letters, digits and & · + -")
+			return ""
+		}
 	}
 	return s
 }

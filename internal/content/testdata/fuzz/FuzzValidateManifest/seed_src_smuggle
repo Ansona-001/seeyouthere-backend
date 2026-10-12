@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"schema\":2,\"layers\":[{\"kind\":\"image\",\"opacity\":0.1,\"src\":\"javascript:alert(1)\"}]}")

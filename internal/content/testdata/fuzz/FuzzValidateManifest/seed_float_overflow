@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"schema\":2,\"layers\":[{\"kind\":\"paper\",\"glow\":\"art1\",\"glow_opacity\":1e999}]}")

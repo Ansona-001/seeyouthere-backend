@@ -1,0 +1,134 @@
+{
+  "schema": 2,
+  "layout": "stacked",
+  "hero_style": "framed",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "sage",
+      "name": "Sage",
+      "colors": {
+        "background": "#F4F3EA",
+        "surface": "#FFFFFB",
+        "text": "#24301F",
+        "muted": "#4F5B47",
+        "accent": "#55714A",
+        "accent_text": "#FFFFFB"
+      },
+      "accent_ink": "#4C673E",
+      "art": [
+        "#A8BF94",
+        "#FFFFFF",
+        "#F2C14E",
+        "#6D8A5B",
+        "#DCE6CF"
+      ]
+    },
+    {
+      "id": "rose",
+      "name": "Rose",
+      "colors": {
+        "background": "#FBF0EE",
+        "surface": "#FFFDFC",
+        "text": "#3D2226",
+        "muted": "#6C4E52",
+        "accent": "#A8425A",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#A8425A",
+      "art": [
+        "#E9A9B2",
+        "#FFFFFF",
+        "#F2C14E",
+        "#7E9A6A",
+        "#F6DADD"
+      ]
+    },
+    {
+      "id": "blue",
+      "name": "Blue",
+      "colors": {
+        "background": "#EFF3F8",
+        "surface": "#FDFEFF",
+        "text": "#1F2B3D",
+        "muted": "#4A586E",
+        "accent": "#3D649A",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#3D649A",
+      "art": [
+        "#9FB8D8",
+        "#FFFFFF",
+        "#F2C14E",
+        "#6E8E6A",
+        "#D9E4F1"
+      ]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "bricolage",
+      "name": "Bricolage and Figtree",
+      "heading": "bricolage_grotesque",
+      "body": "figtree",
+      "accent": ""
+    }
+  ],
+  "defaults": {
+    "palette": "sage",
+    "font": "bricolage"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "tone": "background"
+    },
+    {
+      "kind": "pattern",
+      "pattern": "gingham",
+      "color": "art1",
+      "opacity": 0.32,
+      "origin": "top",
+      "mask": "fade_bottom"
+    },
+    {
+      "kind": "art",
+      "art": "daisies",
+      "placement": "corners",
+      "colors": [
+        "art2",
+        "art3",
+        "art4"
+      ],
+      "density": "normal"
+    },
+    {
+      "kind": "texture",
+      "texture": "linen",
+      "opacity": 0.1,
+      "blend": "multiply"
+    },
+    {
+      "kind": "frame",
+      "frame": "scallop",
+      "inset": 0,
+      "color": "art1"
+    }
+  ],
+  "ornament": {
+    "hero": "none",
+    "divider": "dots",
+    "badge": "none",
+    "ampersand": "none",
+    "hero_ink": ""
+  },
+  "card": {
+    "style": "reply_card",
+    "border": "hairline",
+    "radius": 12,
+    "fields": "boxed",
+    "buttons": "accent"
+  },
+  "motion": "pop_and_settle"
+}
