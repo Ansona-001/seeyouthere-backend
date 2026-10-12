@@ -308,6 +308,34 @@ func TestStore_CommitTemplateAsset(t *testing.T) {
 	})
 }
 
+func TestStore_DeleteTemplateAsset(t *testing.T) {
+	s, b := newTestStoreBlobs(t)
+	templateID := uuid.Must(uuid.NewV7())
+	for _, v := range []int32{3, 4} {
+		out := t.TempDir()
+		writeRenditions(t, out)
+		if _, err := s.CommitTemplateAsset(context.Background(), out, templateID, v); err != nil {
+			t.Fatalf("CommitTemplateAsset v%d: %v", v, err)
+		}
+	}
+
+	if err := s.DeleteTemplateAsset(context.Background(), templateID, 3); err != nil {
+		t.Fatalf("DeleteTemplateAsset: %v", err)
+	}
+	for _, w := range Widths {
+		if b.has(fmt.Sprintf("t/%s/3/%d.jpg", templateID, w)) {
+			t.Errorf("rendition %d of v3 not deleted", w)
+		}
+		if !b.has(fmt.Sprintf("t/%s/4/%d.jpg", templateID, w)) {
+			t.Errorf("rendition %d of v4 deleted", w)
+		}
+	}
+	// Idempotent: missing objects are fine.
+	if err := s.DeleteTemplateAsset(context.Background(), templateID, 3); err != nil {
+		t.Errorf("second delete: %v", err)
+	}
+}
+
 func TestStore_OpenTemplateAsset_Errors(t *testing.T) {
 	s, _ := newTestStoreBlobs(t)
 	id := uuid.Must(uuid.NewV7())

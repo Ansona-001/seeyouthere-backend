@@ -266,6 +266,7 @@ func (s *Server) Routes() http.Handler {
 						r.Post("/versions", s.handleCreateAdminTemplateVersion)
 						r.Route("/versions/{v}", func(r chi.Router) {
 							r.Put("/", s.handleUpdateAdminTemplateVersion)
+							r.Delete("/", s.handleDeleteAdminTemplateVersion)
 							r.Post("/publish", s.handleAdminPublishTemplateVersion)
 							r.Get("/preview", s.handleAdminPreviewTemplateVersion)
 						})

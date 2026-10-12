@@ -131,6 +131,20 @@ func (s *Store) CommitTemplateAsset(ctx context.Context, outDir string, template
 	return fmt.Sprintf("templates/%s/%d", templateID, version), nil
 }
 
+// DeleteTemplateAsset removes every rendition of a template version's
+// background. Missing objects are not an error, so it is idempotent and safe
+// to retry.
+func (s *Store) DeleteTemplateAsset(ctx context.Context, templateID uuid.UUID, version int32) error {
+	keys := make([]string, 0, len(Widths))
+	for _, w := range Widths {
+		keys = append(keys, templateKey(templateID, version, w))
+	}
+	if err := s.blobs.Delete(ctx, keys); err != nil {
+		return fmt.Errorf("media: delete template asset %s/%d: %w", templateID, version, err)
+	}
+	return nil
+}
+
 // Open returns one stored rendition of a media item. width must be one of
 // Widths, otherwise ErrNotFound. ifNoneMatch is forwarded to the backend
 // (ErrNotModified on a match). The caller must close Object.Body.
