@@ -41,6 +41,8 @@ jobs:
     env:
       DATABASE_URL: postgres://seeyouthere:seeyouthere@localhost:5432/seeyouthere?sslmode=disable
       VALKEY_URL: redis://localhost:6379/0
+      # The service database is disposable, so the dev-database guard in the DB tests does not apply.
+      ALLOW_DEV_DB: "1"
     steps:
       - uses: actions/checkout@v4
         with:
