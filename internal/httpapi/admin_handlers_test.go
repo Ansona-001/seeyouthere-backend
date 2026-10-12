@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -744,4 +747,709 @@ func testManifestJSON(t *testing.T) string {
 		"defaults": {"palette":"ivory","font":"classic"},
 		"background": null
 	}`
+}
+
+// --- admin delete / edit user (driven through the real router) ---
+
+// adminAPI drives Routes() with real sessions, so role gating, route wiring
+// and the cookie path are all exercised, not just the handler bodies.
+type adminAPI struct {
+	f                    adminHandlerFixture
+	h                    http.Handler
+	pool                 *pgxpool.Pool
+	superTok, moderatorT string
+}
+
+func newAdminAPI(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client) adminAPI {
+	t.Helper()
+	f := newAdminHandlerFixture(t, pool, rdb)
+	a := adminAPI{f: f, h: f.s.Routes(), pool: pool}
+	a.superTok = a.login(t, f.superAdminID, true)
+	a.moderatorT = a.login(t, f.moderatorID, true)
+	return a
+}
+
+// login starts a real session and returns its cookie token.
+func (a adminAPI) login(t *testing.T, userID uuid.UUID, mfa bool) string {
+	t.Helper()
+	ctx := context.Background()
+	tok, _, err := a.f.s.sessions.Create(ctx, userID, nil, "test")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if mfa {
+		sess, err := a.f.s.sessions.Lookup(ctx, tok)
+		if err != nil {
+			t.Fatalf("lookup session: %v", err)
+		}
+		if err := a.f.s.q.SetSessionMFAVerified(ctx, store.SetSessionMFAVerifiedParams{SessionID: sess.ID, UserID: userID}); err != nil {
+			t.Fatalf("set mfa verified: %v", err)
+		}
+	}
+	return tok
+}
+
+// do sends a JSON request (no Content-Type when body is empty).
+func (a adminAPI) do(method, path, token, body string) *httptest.ResponseRecorder {
+	ct := ""
+	if body != "" {
+		ct = "application/json"
+	}
+	return a.doCT(method, path, token, ct, body)
+}
+
+func (a adminAPI) doCT(method, path, token, contentType, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if token != "" {
+		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: token})
+	}
+	rec := httptest.NewRecorder()
+	a.h.ServeHTTP(rec, req)
+	return rec
+}
+
+// newTarget creates an ordinary user with a name; its rows are removed
+// afterwards (events first, since events.owner_id is RESTRICT).
+func (a adminAPI) newTarget(t *testing.T, label string) (id uuid.UUID, email string) {
+	t.Helper()
+	ctx := context.Background()
+	id = uuid.Must(uuid.NewV7())
+	email = label + "-" + id.String() + "@example.test"
+	if _, err := a.f.s.q.UpsertUserByEmail(ctx, store.UpsertUserByEmailParams{ID: id, Email: email}); err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	if _, err := a.f.s.q.UpdateUserName(ctx, store.UpdateUserNameParams{UserID: id, Name: "Target " + label}); err != nil {
+		t.Fatalf("name target: %v", err)
+	}
+	t.Cleanup(func() {
+		bg := context.Background()
+		_, _ = a.pool.Exec(bg, "DELETE FROM river_job WHERE kind = 'admin_purge_event' AND args->>'event_id' IN (SELECT id::text FROM events WHERE owner_id = $1)", id)
+		_, _ = a.pool.Exec(bg, "DELETE FROM events WHERE owner_id = $1", id)
+		if _, err := a.pool.Exec(bg, "DELETE FROM users WHERE id = $1", id); err != nil {
+			t.Logf("cleanup target %s: %v", id, err)
+		}
+	})
+	return id, email
+}
+
+func sessionCacheKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return "session:" + hex.EncodeToString(sum[:])
+}
+
+func (a adminAPI) sessionCount(t *testing.T, userID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := a.pool.QueryRow(context.Background(), "SELECT count(*) FROM sessions WHERE user_id = $1", userID).Scan(&n); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	return n
+}
+
+func (a adminAPI) jobCount(t *testing.T, sql string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := a.pool.QueryRow(context.Background(), sql, args...).Scan(&n); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	return n
+}
+
+func (a adminAPI) auditRows(t *testing.T, targetType string, id uuid.UUID) []store.AuditLog {
+	t.Helper()
+	rows, err := a.f.s.q.ListAuditForTarget(context.Background(), store.ListAuditForTargetParams{
+		TargetType: targetType, TargetID: id.String(),
+		CursorCreatedAt: time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC), CursorID: uuid.Max, Lim: 20,
+	})
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	return rows
+}
+
+// exhaust uses up a rate-limit key so the next request is denied.
+func (a adminAPI) exhaust(t *testing.T, key string, max int64, window time.Duration) {
+	t.Helper()
+	for i := int64(0); i < max; i++ {
+		if _, err := a.f.s.limiter.Allow(context.Background(), key, max, window); err != nil {
+			t.Fatalf("exhaust %s: %v", key, err)
+		}
+	}
+}
+
+func wantStatusCode(t *testing.T, rec *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if rec.Code != status {
+		t.Fatalf("status = %d, body = %s, want %d", rec.Code, rec.Body.String(), status)
+	}
+	if code != "" && !strings.Contains(rec.Body.String(), `"`+code+`"`) {
+		t.Fatalf("body = %s, want error code %q", rec.Body.String(), code)
+	}
+}
+
+func TestAdminDeleteUser_Rejections(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	ctx := context.Background()
+
+	target, email := a.newTarget(t, "del-reject")
+	a.login(t, target, false)
+	missing := uuid.Must(uuid.NewV7())
+
+	assertIntact := func(t *testing.T) {
+		t.Helper()
+		u, err := a.f.s.q.GetUserByID(ctx, target)
+		if err != nil || u.Email != email {
+			t.Fatalf("target changed: %+v, %v", u, err)
+		}
+		if a.sessionCount(t, target) != 1 {
+			t.Fatal("target sessions were revoked")
+		}
+	}
+	banned, bannedEmail := a.newTarget(t, "del-banned")
+	if _, err := pool.Exec(ctx, "UPDATE users SET status = 'banned' WHERE id = $1", banned); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+	good := `{"confirm_email":"` + email + `"}`
+	path := "/v1/admin/users/" + target.String()
+
+	tests := []struct {
+		name        string
+		token       string
+		path        string
+		contentType string
+		body        string
+		status      int
+		code        string
+	}{
+		{"moderator is forbidden", a.moderatorT, path, "application/json", good, http.StatusForbidden, "forbidden"},
+		{"self is forbidden", a.superTok, "/v1/admin/users/" + a.f.superAdminID.String(), "application/json", good, http.StatusForbidden, "forbidden"},
+		{"malformed id", a.superTok, "/v1/admin/users/not-a-uuid", "application/json", good, http.StatusNotFound, "not_found"},
+		{"missing user", a.superTok, "/v1/admin/users/" + missing.String(), "application/json", good, http.StatusNotFound, "not_found"},
+		{"role holder", a.superTok, "/v1/admin/users/" + a.f.moderatorID.String(), "application/json", `{"confirm_email":"x@example.test"}`, http.StatusConflict, "has_admin_role"},
+		{"banned user", a.superTok, "/v1/admin/users/" + banned.String(), "application/json", `{"confirm_email":"` + bannedEmail + `"}`, http.StatusConflict, "user_banned"},
+		{"wrong confirm email", a.superTok, path, "application/json", `{"confirm_email":"someone-else@example.test"}`, http.StatusBadRequest, "confirm_mismatch"},
+		{"empty confirm email", a.superTok, path, "application/json", `{"confirm_email":""}`, http.StatusBadRequest, "confirm_mismatch"},
+		{"malformed confirm email", a.superTok, path, "application/json", `{"confirm_email":"not an email"}`, http.StatusBadRequest, "confirm_mismatch"},
+		{"unknown field", a.superTok, path, "application/json", `{"confirm_email":"` + email + `","force":true}`, http.StatusBadRequest, "invalid_json"},
+		{"reason too long", a.superTok, path, "application/json", `{"confirm_email":"` + email + `","reason":"` + strings.Repeat("x", 501) + `"}`, http.StatusBadRequest, "validation_failed"},
+		{"not json", a.superTok, path, "text/plain", good, http.StatusUnsupportedMediaType, "unsupported_media_type"},
+		{"no body", a.superTok, path, "", "", http.StatusUnsupportedMediaType, "unsupported_media_type"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wantStatusCode(t, a.doCT(http.MethodDelete, tt.path, tt.token, tt.contentType, tt.body), tt.status, tt.code)
+			assertIntact(t)
+		})
+	}
+	// The banned row keeps its address and status, so the ban stays in force.
+	if u, err := a.f.s.q.GetUserByID(ctx, banned); err != nil || u.Email != bannedEmail || u.Status != "banned" {
+		t.Fatalf("banned user changed: %+v, %v", u, err)
+	}
+	// The role holder's roles and the moderator's row are untouched too.
+	if roles, err := a.f.s.q.ListUserRoles(ctx, a.f.moderatorID); err != nil || len(roles) != 1 {
+		t.Fatalf("moderator roles = %v, %v", roles, err)
+	}
+
+}
+
+func TestAdminDeleteUser_RateLimited(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	target, email := a.newTarget(t, "del-rate")
+
+	a.exhaust(t, "admin:user:delete:"+a.f.superAdminID.String(), 10, time.Hour)
+	rec := a.do(http.MethodDelete, "/v1/admin/users/"+target.String(), a.superTok, `{"confirm_email":"`+email+`"}`)
+	wantStatusCode(t, rec, http.StatusTooManyRequests, "rate_limited")
+	if _, err := a.f.s.q.GetUserByID(context.Background(), target); err != nil {
+		t.Fatalf("target deleted despite the limit: %v", err)
+	}
+}
+
+func TestAdminDeleteUser_Success(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	ctx := context.Background()
+	q := a.f.s.q
+
+	target, email := a.newTarget(t, "del-ok")
+	other, _ := a.newTarget(t, "del-other")
+	tok1 := a.login(t, target, false)
+	tok2 := a.login(t, target, false)
+	for _, tok := range []string{tok1, tok2} {
+		if _, err := a.f.s.sessions.Lookup(ctx, tok); err != nil { // fills the Valkey mirror
+			t.Fatalf("lookup: %v", err)
+		}
+	}
+	if n, _ := rdb.Exists(ctx, sessionCacheKey(tok1), sessionCacheKey(tok2)).Result(); n != 2 {
+		t.Fatalf("cached sessions = %d, want 2", n)
+	}
+
+	live := createTestEvent(t, ctx, q, "birthday", "classic", &target)
+	if _, err := pool.Exec(ctx, "UPDATE events SET status = 'published', slug = $2, published_at = now() WHERE id = $1", live.ID, "del-ok-"+live.ID.String()[:8]); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	softDeleted := createTestEvent(t, ctx, q, "birthday", "classic", &target)
+	if _, err := pool.Exec(ctx, "UPDATE events SET deleted_at = now() - interval '2 days' WHERE id = $1", softDeleted.ID); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "INSERT INTO reports (id, event_id, reporter_ip_hash, reason, status) VALUES ($1, $2, $3, 'spam', 'open')",
+		uuid.Must(uuid.NewV7()), live.ID, []byte(live.ID.String())); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	// An event owned by someone else that the target co-hosts must survive.
+	cohosted := createTestEvent(t, ctx, q, "birthday", "classic", &other)
+	if _, err := pool.Exec(ctx, "INSERT INTO event_members (event_id, user_id, role) VALUES ($1, $2, 'editor')", cohosted.ID, target); err != nil {
+		t.Fatalf("membership: %v", err)
+	}
+
+	var deletedAtBefore time.Time
+	if err := pool.QueryRow(ctx, "SELECT deleted_at FROM events WHERE id = $1", softDeleted.ID).Scan(&deletedAtBefore); err != nil {
+		t.Fatalf("read deleted_at: %v", err)
+	}
+
+	// Case and surrounding spaces in the confirmation do not matter.
+	body := `{"confirm_email":"  ` + strings.ToUpper(email) + ` ","reason":"abuse"}`
+	rec := a.do(http.MethodDelete, "/v1/admin/users/"+target.String(), a.superTok, body)
+	wantStatusCode(t, rec, http.StatusAccepted, "")
+	// Only the live event is queued; the soft-deleted one is already hidden
+	// and left to the retention purge.
+	if !strings.Contains(rec.Body.String(), `"events_queued":1`) {
+		t.Fatalf("body = %s, want events_queued 1", rec.Body.String())
+	}
+
+	// The account is a scrubbed placeholder.
+	row, err := q.GetUserAdmin(ctx, target)
+	if err != nil {
+		t.Fatalf("get user admin: %v", err)
+	}
+	if row.DeletedAt == nil || row.Name != "" || row.Email != "deleted+"+target.String()+"@deleted.invalid" {
+		t.Errorf("user not scrubbed: %+v", row)
+	}
+	if _, err := q.GetUserByID(ctx, target); err == nil {
+		t.Error("GetUserByID still finds the deleted user")
+	}
+
+	// Sessions: rows, Valkey mirror and the old cookie are all dead.
+	if a.sessionCount(t, target) != 0 {
+		t.Error("sessions survived")
+	}
+	if n, _ := rdb.Exists(ctx, sessionCacheKey(tok1), sessionCacheKey(tok2)).Result(); n != 0 {
+		t.Errorf("%d Valkey session keys survived", n)
+	}
+	if _, err := a.f.s.sessions.Lookup(ctx, tok1); !errors.Is(err, auth.ErrNoSession) {
+		t.Errorf("old token lookup error = %v, want ErrNoSession", err)
+	}
+	wantStatusCode(t, a.do(http.MethodGet, "/v1/me", tok1, ""), http.StatusUnauthorized, "")
+
+	// Owned events are soft-deleted (an earlier deleted_at is kept); only the
+	// one that was live gets a purge job; the co-hosted event and its owner remain.
+	for _, ev := range []struct {
+		id   uuid.UUID
+		jobs int
+	}{{live.ID, 1}, {softDeleted.ID, 0}} {
+		var del *time.Time
+		if err := pool.QueryRow(ctx, "SELECT deleted_at FROM events WHERE id = $1", ev.id).Scan(&del); err != nil || del == nil {
+			t.Errorf("event %s deleted_at = %v, %v", ev.id, del, err)
+		}
+		if n := a.jobCount(t, "SELECT count(*) FROM river_job WHERE kind = 'admin_purge_event' AND args->>'event_id' = $1", ev.id.String()); n != ev.jobs {
+			t.Errorf("purge jobs for %s = %d, want %d", ev.id, n, ev.jobs)
+		}
+	}
+	var del *time.Time
+	if err := pool.QueryRow(ctx, "SELECT deleted_at FROM events WHERE id = $1", softDeleted.ID).Scan(&del); err != nil || !del.Equal(deletedAtBefore) {
+		t.Errorf("earlier deleted_at replaced: %v, %v", del, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT deleted_at FROM events WHERE id = $1", cohosted.ID).Scan(&del); err != nil || del != nil {
+		t.Errorf("co-hosted event touched: deleted_at = %v, %v", del, err)
+	}
+	if n := a.jobCount(t, "SELECT count(*) FROM event_members WHERE user_id = $1", target); n != 0 {
+		t.Errorf("memberships left: %d", n)
+	}
+	if n := a.jobCount(t, "SELECT count(*) FROM river_job WHERE kind = 'admin_purge_event' AND args->>'event_id' = $1", cohosted.ID.String()); n != 0 {
+		t.Errorf("purge job queued for a co-hosted event")
+	}
+	if _, err := q.GetUserByID(ctx, other); err != nil {
+		t.Errorf("other user affected: %v", err)
+	}
+
+	// Audit: counts and reason, but neither email nor name.
+	rows := a.auditRows(t, "user", target)
+	var found bool
+	for _, r := range rows {
+		if r.Action != "user.delete" {
+			continue
+		}
+		found = true
+		var before map[string]any
+		if err := json.Unmarshal(r.Before, &before); err != nil {
+			t.Fatalf("before json: %v", err)
+		}
+		if before["status"] != "active" || before["owned_events"] != float64(2) || before["open_reports"] != float64(1) {
+			t.Errorf("audit before = %s", r.Before)
+		}
+		if !strings.Contains(string(r.After), `"reason": "abuse"`) {
+			t.Errorf("audit after = %s, want the reason", r.After)
+		}
+		for _, field := range []string{string(r.Before), string(r.After)} {
+			if strings.Contains(strings.ToLower(field), strings.ToLower(email)) || strings.Contains(field, "Target del-ok") {
+				t.Errorf("audit row leaks PII: %s", field)
+			}
+		}
+	}
+	if !found {
+		t.Error("no user.delete audit row")
+	}
+
+	// The detail endpoint now reports deleted_at; a second delete is 404.
+	rec = a.do(http.MethodGet, "/v1/admin/users/"+target.String(), a.superTok, "")
+	wantStatusCode(t, rec, http.StatusOK, "")
+	var detail struct {
+		DeletedAt *time.Time `json:"deleted_at"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil || detail.DeletedAt == nil {
+		t.Errorf("detail deleted_at = %v, %v (body %s)", detail.DeletedAt, err, rec.Body.String())
+	}
+	wantStatusCode(t, a.do(http.MethodGet, "/v1/admin/users/"+other.String(), a.superTok, ""), http.StatusOK, "")
+	wantStatusCode(t, a.do(http.MethodDelete, "/v1/admin/users/"+target.String(), a.superTok, body), http.StatusNotFound, "not_found")
+
+	// The address is free again.
+	if _, err := q.UpsertUserByEmail(ctx, store.UpsertUserByEmailParams{ID: uuid.Must(uuid.NewV7()), Email: email}); err != nil {
+		t.Errorf("address not reusable after delete: %v", err)
+	}
+	_, _ = pool.Exec(ctx, "DELETE FROM users WHERE email = $1", email)
+}
+
+func TestAdminDeleteUser_NoOwnedEvents(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	target, email := a.newTarget(t, "del-none")
+
+	rec := a.do(http.MethodDelete, "/v1/admin/users/"+target.String(), a.superTok, `{"confirm_email":"`+email+`"}`)
+	wantStatusCode(t, rec, http.StatusAccepted, "")
+	if !strings.Contains(rec.Body.String(), `"events_queued":0`) {
+		t.Fatalf("body = %s, want events_queued 0", rec.Body.String())
+	}
+}
+
+func TestAdminDeleteUser_RoleGrantedConcurrentlyBlocksDelete(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	ctx := context.Background()
+	target, email := a.newTarget(t, "del-race")
+
+	// A role grant holds the roles lock; the delete must wait for it and then
+	// see the role instead of deleting an admin.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	qtx := a.f.s.q.WithTx(tx)
+	if err := qtx.LockRoles(ctx); err != nil {
+		t.Fatalf("lock roles: %v", err)
+	}
+	if _, err := qtx.GrantRole(ctx, store.GrantRoleParams{UserID: target, Role: "support"}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- a.do(http.MethodDelete, "/v1/admin/users/"+target.String(), a.superTok, `{"confirm_email":"`+email+`"}`)
+	}()
+	select {
+	case rec := <-done:
+		t.Fatalf("delete finished while the roles lock was held: %d %s", rec.Code, rec.Body.String())
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit grant: %v", err)
+	}
+	wantStatusCode(t, <-done, http.StatusConflict, "has_admin_role")
+	if _, err := a.f.s.q.GetUserByID(ctx, target); err != nil {
+		t.Fatalf("role holder was deleted: %v", err)
+	}
+}
+
+func TestAdminUpdateUser_Rejections(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	ctx := context.Background()
+
+	target, email := a.newTarget(t, "edit-rej")
+	_, takenEmail := a.newTarget(t, "edit-taken")
+	missing := uuid.Must(uuid.NewV7())
+	deleted, _ := a.newTarget(t, "edit-gone")
+	if err := a.f.s.q.SoftDeleteUser(ctx, deleted); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	path := "/v1/admin/users/" + target.String()
+
+	tests := []struct {
+		name        string
+		token       string
+		path        string
+		contentType string
+		body        string
+		status      int
+		code        string
+	}{
+		{"moderator cannot change email", a.moderatorT, path, "application/json", `{"email":"new@example.org"}`, http.StatusForbidden, "forbidden"},
+		{"moderator cannot change email with name", a.moderatorT, path, "application/json", `{"name":"X","email":"new@example.org"}`, http.StatusForbidden, "forbidden"},
+		{"moderator cannot edit a role holder", a.moderatorT, "/v1/admin/users/" + a.f.superAdminID.String(), "application/json", `{"name":"Hacked"}`, http.StatusForbidden, "forbidden"},
+		{"moderator cannot edit self", a.moderatorT, "/v1/admin/users/" + a.f.moderatorID.String(), "application/json", `{"name":"Me"}`, http.StatusForbidden, "forbidden"},
+		{"super admin cannot change a role holder's email", a.superTok, "/v1/admin/users/" + a.f.moderatorID.String(), "application/json", `{"email":"takeover@example.org"}`, http.StatusConflict, "has_admin_role"},
+		{"super admin cannot change a role holder's name and email", a.superTok, "/v1/admin/users/" + a.f.moderatorID.String(), "application/json", `{"name":"X","email":"takeover@example.org"}`, http.StatusConflict, "has_admin_role"},
+		{"super admin cannot edit self", a.superTok, "/v1/admin/users/" + a.f.superAdminID.String(), "application/json", `{"name":"Me"}`, http.StatusForbidden, "forbidden"},
+		{"malformed id", a.superTok, "/v1/admin/users/nope", "application/json", `{"name":"X"}`, http.StatusNotFound, "not_found"},
+		{"missing user", a.superTok, "/v1/admin/users/" + missing.String(), "application/json", `{"name":"X"}`, http.StatusNotFound, "not_found"},
+		{"deleted user", a.superTok, "/v1/admin/users/" + deleted.String(), "application/json", `{"name":"X"}`, http.StatusNotFound, "not_found"},
+		{"empty object", a.superTok, path, "application/json", `{}`, http.StatusBadRequest, "validation_failed"},
+		{"unknown field", a.superTok, path, "application/json", `{"name":"X","status":"banned"}`, http.StatusBadRequest, "invalid_json"},
+		{"empty name", a.superTok, path, "application/json", `{"name":"   "}`, http.StatusBadRequest, "validation_failed"},
+		{"name too long", a.superTok, path, "application/json", `{"name":"` + strings.Repeat("a", 81) + `"}`, http.StatusBadRequest, "validation_failed"},
+		{"name with control character", a.superTok, path, "application/json", `{"name":"a\u0007b"}`, http.StatusBadRequest, "validation_failed"},
+		{"null name and email", a.superTok, path, "application/json", `{"name":null,"email":null}`, http.StatusBadRequest, "validation_failed"},
+		{"malformed email", a.superTok, path, "application/json", `{"email":"nope"}`, http.StatusBadRequest, "validation_failed"},
+		{"email with display name", a.superTok, path, "application/json", `{"email":"A <a@example.org>"}`, http.StatusBadRequest, "validation_failed"},
+		{"email too long", a.superTok, path, "application/json", `{"email":"` + strings.Repeat("a", 250) + `@example.org"}`, http.StatusBadRequest, "validation_failed"},
+		{"invalid TLD placeholder domain", a.superTok, path, "application/json", `{"email":"deleted+x@deleted.invalid"}`, http.StatusBadRequest, "validation_failed"},
+		{"invalid TLD in any case", a.superTok, path, "application/json", `{"email":"X@Example.INVALID"}`, http.StatusBadRequest, "validation_failed"},
+		{"email taken", a.superTok, path, "application/json", `{"email":"` + takenEmail + `"}`, http.StatusConflict, "email_taken"},
+		{"email taken in other case", a.superTok, path, "application/json", `{"email":"` + strings.ToUpper(takenEmail) + `"}`, http.StatusConflict, "email_taken"},
+		{"not json", a.superTok, path, "text/plain", `{"name":"X"}`, http.StatusUnsupportedMediaType, "unsupported_media_type"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wantStatusCode(t, a.doCT(http.MethodPatch, tt.path, tt.token, tt.contentType, tt.body), tt.status, tt.code)
+		})
+	}
+
+	u, err := a.f.s.q.GetUserByID(ctx, target)
+	if err != nil || u.Email != email || u.Name != "Target edit-rej" {
+		t.Fatalf("target changed by a rejected edit: %+v, %v", u, err)
+	}
+	if mod, err := a.f.s.q.GetUserByID(ctx, a.f.moderatorID); err != nil || mod.Name == "X" || strings.HasPrefix(mod.Email, "takeover") {
+		t.Fatalf("role holder changed by a rejected edit: %+v, %v", mod, err)
+	}
+	if len(a.auditRows(t, "user", target)) != 0 {
+		t.Error("rejected edits wrote audit rows")
+	}
+}
+
+func TestAdminUpdateUser_RateLimited(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	target, _ := a.newTarget(t, "edit-rate")
+	path := "/v1/admin/users/" + target.String()
+
+	t.Run("per target email limit", func(t *testing.T) {
+		a.exhaust(t, "admin:user:email:target:"+target.String(), 3, 24*time.Hour)
+		wantStatusCode(t, a.do(http.MethodPatch, path, a.superTok, `{"email":"rate1@example.org"}`), http.StatusTooManyRequests, "rate_limited")
+		// A name-only edit is not subject to the email limits.
+		wantStatusCode(t, a.do(http.MethodPatch, path, a.superTok, `{"name":"Still Fine"}`), http.StatusOK, "")
+	})
+	t.Run("per admin email limit", func(t *testing.T) {
+		other, _ := a.newTarget(t, "edit-rate2")
+		a.exhaust(t, "admin:user:email:"+a.f.superAdminID.String(), 10, time.Hour)
+		wantStatusCode(t, a.do(http.MethodPatch, "/v1/admin/users/"+other.String(), a.superTok, `{"email":"rate2@example.org"}`), http.StatusTooManyRequests, "rate_limited")
+	})
+	t.Run("edit limit", func(t *testing.T) {
+		a.exhaust(t, "admin:user:edit:"+a.f.moderatorID.String(), 60, time.Hour)
+		wantStatusCode(t, a.do(http.MethodPatch, path, a.moderatorT, `{"name":"Nope"}`), http.StatusTooManyRequests, "rate_limited")
+	})
+}
+
+func TestAdminUpdateUser_ModeratorEditsName(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	ctx := context.Background()
+	target, email := a.newTarget(t, "edit-name")
+	tok := a.login(t, target, false)
+
+	rec := a.do(http.MethodPatch, "/v1/admin/users/"+target.String(), a.moderatorT, `{"name":"  New Name  "}`)
+	wantStatusCode(t, rec, http.StatusOK, "")
+	var resp struct {
+		User adminUserSummaryResp `json:"user"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.User.ID != target || resp.User.Name != "New Name" || resp.User.Email != email {
+		t.Errorf("response user = %+v", resp.User)
+	}
+	// A name edit leaves sessions and mail alone.
+	if a.sessionCount(t, target) != 1 {
+		t.Error("name edit revoked sessions")
+	}
+	if _, err := a.f.s.sessions.Lookup(ctx, tok); err != nil {
+		t.Errorf("session lookup after name edit: %v", err)
+	}
+	if n := a.jobCount(t, "SELECT count(*) FROM river_job WHERE kind = 'send_email' AND args->>'to' = $1", email); n != 0 {
+		t.Errorf("name edit queued %d emails", n)
+	}
+	rows := a.auditRows(t, "user", target)
+	if len(rows) != 1 || rows[0].Action != "user.update" || string(rows[0].After) != `{"fields": ["name"]}` {
+		t.Fatalf("audit rows = %+v", rows)
+	}
+	if strings.Contains(string(rows[0].After), "New Name") || strings.Contains(string(rows[0].After), email) {
+		t.Errorf("audit leaks PII: %s", rows[0].After)
+	}
+	if rows[0].ActorID == nil || *rows[0].ActorID != a.f.moderatorID {
+		t.Errorf("audit actor = %v, want the moderator", rows[0].ActorID)
+	}
+
+	// A super admin may edit a role holder.
+	wantStatusCode(t, a.do(http.MethodPatch, "/v1/admin/users/"+a.f.moderatorID.String(), a.superTok, `{"name":"Mod Renamed"}`), http.StatusOK, "")
+}
+
+func TestAdminUpdateUser_EmailChangeOnRoleHolderRacesGrant(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	ctx := context.Background()
+	target, email := a.newTarget(t, "edit-race")
+
+	// A role grant holds the roles lock; the email change must wait for it and
+	// then see the role instead of re-pointing an admin's account.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	qtx := a.f.s.q.WithTx(tx)
+	if err := qtx.LockRoles(ctx); err != nil {
+		t.Fatalf("lock roles: %v", err)
+	}
+	if _, err := qtx.GrantRole(ctx, store.GrantRoleParams{UserID: target, Role: "support"}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- a.do(http.MethodPatch, "/v1/admin/users/"+target.String(), a.superTok, `{"email":"race-`+target.String()+`@example.org"}`)
+	}()
+	select {
+	case rec := <-done:
+		t.Fatalf("edit finished while the roles lock was held: %d %s", rec.Code, rec.Body.String())
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit grant: %v", err)
+	}
+	wantStatusCode(t, <-done, http.StatusConflict, "has_admin_role")
+	if u, err := a.f.s.q.GetUserByID(ctx, target); err != nil || u.Email != email {
+		t.Fatalf("role holder's email changed: %+v, %v", u, err)
+	}
+}
+
+func TestAdminUpdateUser_NoOpWritesNothing(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	ctx := context.Background()
+	target, email := a.newTarget(t, "edit-noop")
+	a.login(t, target, false)
+	before, err := a.f.s.q.GetUserByID(ctx, target)
+	if err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+
+	body := `{"name":"` + before.Name + `","email":"  ` + strings.ToUpper(email) + `"}`
+	wantStatusCode(t, a.do(http.MethodPatch, "/v1/admin/users/"+target.String(), a.superTok, body), http.StatusOK, "")
+
+	after, err := a.f.s.q.GetUserByID(ctx, target)
+	if err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Error("no-op edit touched updated_at")
+	}
+	if a.sessionCount(t, target) != 1 {
+		t.Error("no-op edit revoked sessions")
+	}
+	if len(a.auditRows(t, "user", target)) != 0 {
+		t.Error("no-op edit wrote an audit row")
+	}
+	if n := a.jobCount(t, "SELECT count(*) FROM river_job WHERE kind = 'send_email' AND args->>'to' = $1", email); n != 0 {
+		t.Errorf("no-op edit queued %d emails", n)
+	}
+}
+
+func TestAdminUpdateUser_EmailChange(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	a := newAdminAPI(t, pool, rdb)
+	ctx := context.Background()
+	target, oldEmail := a.newTarget(t, "edit-mail")
+	tok1, tok2 := a.login(t, target, false), a.login(t, target, false)
+	for _, tok := range []string{tok1, tok2} {
+		if _, err := a.f.s.sessions.Lookup(ctx, tok); err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+	}
+	newEmail := "changed-" + target.String() + "@example.org"
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DELETE FROM river_job WHERE kind = 'send_email' AND args->>'to' = $1", oldEmail)
+	})
+
+	rec := a.do(http.MethodPatch, "/v1/admin/users/"+target.String(), a.superTok, `{"name":"Renamed","email":"  `+strings.ToUpper(newEmail)+`"}`)
+	wantStatusCode(t, rec, http.StatusOK, "")
+	var resp struct {
+		User adminUserSummaryResp `json:"user"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.User.Email != newEmail || resp.User.Name != "Renamed" {
+		t.Errorf("response user = %+v, want email %q (lower-cased)", resp.User, newEmail)
+	}
+
+	// Every session is gone, rows and Valkey mirror alike.
+	if a.sessionCount(t, target) != 0 {
+		t.Error("sessions survived an email change")
+	}
+	if n, _ := rdb.Exists(ctx, sessionCacheKey(tok1), sessionCacheKey(tok2)).Result(); n != 0 {
+		t.Errorf("%d Valkey session keys survived", n)
+	}
+	if _, err := a.f.s.sessions.Lookup(ctx, tok1); !errors.Is(err, auth.ErrNoSession) {
+		t.Errorf("old token lookup error = %v, want ErrNoSession", err)
+	}
+
+	// Exactly one notice, to the OLD address, and the new one appears nowhere in it.
+	if n := a.jobCount(t, "SELECT count(*) FROM river_job WHERE kind = 'send_email' AND args->>'to' = $1", oldEmail); n != 1 {
+		t.Fatalf("notices to the old address = %d, want 1", n)
+	}
+	if n := a.jobCount(t, "SELECT count(*) FROM river_job WHERE kind = 'send_email' AND args::text ILIKE '%' || $1 || '%'", newEmail); n != 0 {
+		t.Errorf("%d queued emails mention the new address", n)
+	}
+	if n := a.jobCount(t, "SELECT count(*) FROM river_job WHERE kind = 'send_email' AND args->>'to' = $1", newEmail); n != 0 {
+		t.Errorf("%d emails queued to the new address", n)
+	}
+
+	rows := a.auditRows(t, "user", target)
+	if len(rows) != 1 || rows[0].Action != "user.update" || string(rows[0].After) != `{"fields": ["name", "email"]}` {
+		t.Fatalf("audit rows = %+v", rows)
+	}
+	for _, field := range []string{string(rows[0].Before), string(rows[0].After)} {
+		if strings.Contains(field, oldEmail) || strings.Contains(field, newEmail) || strings.Contains(field, "Renamed") {
+			t.Errorf("audit leaks PII: %s", field)
+		}
+	}
+
+	// The old address is free for others; the new one signs in as this user.
+	u, err := a.f.s.q.GetUserByID(ctx, target)
+	if err != nil || u.Email != newEmail {
+		t.Fatalf("stored user = %+v, %v", u, err)
+	}
 }

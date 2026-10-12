@@ -185,7 +185,10 @@ func (s *Server) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
 	// here must never fail the login itself.
 	if hash, ok := draftCookieHash(r); ok {
 		claimed, err := s.claimAnonDrafts(r.Context(), user.ID, hash)
-		if err != nil {
+		if errors.Is(err, errUserGone) {
+			// Deleted or banned between the lookup and the claim: nothing is claimed.
+			slog.WarnContext(r.Context(), "claim anon drafts for a gone user", "user_id", user.ID)
+		} else if err != nil {
 			slog.ErrorContext(r.Context(), "claim anon drafts", "err", err, "user_id", user.ID)
 		} else {
 			respBody["claimed_event_ids"] = claimed
@@ -201,6 +204,12 @@ func (s *Server) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
 func (s *Server) claimAnonDrafts(ctx context.Context, userID uuid.UUID, cookieHash []byte) ([]uuid.UUID, error) {
 	var claimed []uuid.UUID
 	err := s.inTx(ctx, func(_ pgx.Tx, q *store.Queries) error {
+		// First: a user deleted or banned meanwhile must not gain events.
+		if _, err := q.LockLiveUser(ctx, userID); errors.Is(err, pgx.ErrNoRows) {
+			return errUserGone
+		} else if err != nil {
+			return fmt.Errorf("lock live user: %w", err)
+		}
 		ids, err := q.ClaimAnonDrafts(ctx, store.ClaimAnonDraftsParams{UserID: userID, CookieHash: cookieHash})
 		if err != nil {
 			return fmt.Errorf("claim anon drafts: %w", err)

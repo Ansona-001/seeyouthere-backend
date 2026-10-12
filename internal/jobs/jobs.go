@@ -421,6 +421,7 @@ func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *
 	river.AddWorker(workers, &NotifyTakedownWorker{Queries: queries, Sender: sender, SiteURL: siteURL})
 	river.AddWorker(workers, &SendRSVPConfirmationWorker{Queries: queries, Sender: sender, CalendarSender: calendarSender, Tokens: tokens, Limiter: limiter, SiteURL: siteURL})
 	river.AddWorker(workers, &NotifyRSVPsWorker{Queries: queries, Sender: sender, SiteURL: siteURL})
+	river.AddWorker(workers, &AdminPurgeEventWorker{Pool: pool, Queries: queries, Media: mediaStore})
 
 	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
 		Logger: slog.Default(),

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,13 +15,21 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/riverqueue/river"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/jobs"
+	"github.com/ansonarose/seeyouthere-backend/internal/mail"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 )
 
 var (
 	errAdminUserNotFound = errors.New("admin: user not found")
+	errHasAdminRole      = errors.New("admin: user holds an admin role")
+	errConfirmMismatch   = errors.New("admin: confirmation does not match")
+	errUserBanned        = errors.New("admin: user is banned")
+	errNeedsSuperAdmin   = errors.New("admin: target holds a role, super admin required")
+	errEmailTaken        = errors.New("admin: email already in use")
 	errLastSuperAdmin    = errors.New("admin: cannot remove the last super_admin")
 	errCannotReverseBan  = errors.New("admin: only a super admin can reverse a ban")
 )
@@ -213,7 +222,8 @@ func (s *Server) handleGetAdminUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user": adminUserSummaryResp{row.ID, row.Email, row.Name, row.Status, row.Roles, row.CreatedAt},
+		"user":       adminUserSummaryResp{row.ID, row.Email, row.Name, row.Status, row.Roles, row.CreatedAt},
+		"deleted_at": row.DeletedAt,
 		"counts": map[string]int64{
 			"events":   row.LiveEvents,
 			"sessions": row.ActiveSessions,
@@ -540,4 +550,327 @@ func (s *Server) handleAdminResetUserMFA(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- DELETE /v1/admin/users/{id} ---
+
+// handleAdminDeleteUser (super_admin only) deletes an account the way the
+// owner's own DELETE /v1/me does (scrubbed placeholder row, memberships and
+// sessions gone, address freed), except that the events the user owns are not
+// merely soft-deleted: each gets an admin_purge_event job that removes its
+// files and rows, so nothing unbounded runs in this request. Co-hosted events
+// stay; only the membership goes. A target holding any admin role is refused
+// (revoke the roles first, which keeps the last-super_admin guard in one
+// place). The role check, the typed-email confirmation and every write share
+// one transaction under the roles lock, so a concurrent grant cannot slip a
+// role onto the user mid-delete.
+func (s *Server) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
+	targetID, err := parseUUIDParam(r, "id")
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such user.")
+		return
+	}
+	callerID, _ := userIDFrom(r.Context())
+	if targetID == callerID {
+		writeError(w, http.StatusForbidden, "forbidden", "You can't delete your own account here.")
+		return
+	}
+	if !s.allow(w, r, limit{"admin:user:delete:" + callerID.String(), 10, time.Hour}) {
+		return
+	}
+
+	var body struct {
+		ConfirmEmail string `json:"confirm_email"`
+		Reason       string `json:"reason"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	reason, ok := validateAdminReason(body.Reason, 500)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "validation_failed", "Check the reason field.")
+		return
+	}
+	confirm, _ := normalizeEmail(body.ConfirmEmail)
+
+	ctx := r.Context()
+	var sessionHashes [][]byte
+	var queued int
+	err = s.inTx(ctx, func(tx pgx.Tx, q *store.Queries) error {
+		if err := q.LockRoles(ctx); err != nil {
+			return fmt.Errorf("lock roles: %w", err)
+		}
+		user, err := q.GetUserForAdminDelete(ctx, targetID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errAdminUserNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("get user for delete: %w", err)
+		}
+		roles, err := q.ListUserRoles(ctx, targetID)
+		if err != nil {
+			return fmt.Errorf("list user roles: %w", err)
+		}
+		if len(roles) > 0 {
+			return errHasAdminRole
+		}
+		// A banned account's row (and so the ban) must outlive the deletion.
+		if user.Status == "banned" {
+			return errUserBanned
+		}
+		if confirm == "" || confirm != user.Email {
+			return errConfirmMismatch
+		}
+
+		openReports, err := q.CountOpenReportsForOwner(ctx, targetID)
+		if err != nil {
+			return fmt.Errorf("count open reports: %w", err)
+		}
+		marked, err := q.MarkOwnedEventsForAdminPurge(ctx, targetID)
+		if err != nil {
+			return fmt.Errorf("mark owned events: %w", err)
+		}
+		// Only events that were live get a purge job; already soft-deleted
+		// ones are hidden and left to the normal retention purge, which keeps
+		// this tx bounded by the per-user live-event cap.
+		params := make([]river.InsertManyParams, 0, len(marked))
+		for _, ev := range marked {
+			if ev.WasLive {
+				params = append(params, river.InsertManyParams{Args: jobs.AdminPurgeEventArgs{EventID: ev.ID}})
+			}
+		}
+		if len(params) > 0 {
+			if _, err := s.jobs.InsertManyTx(ctx, tx, params); err != nil {
+				return fmt.Errorf("enqueue admin purge: %w", err)
+			}
+		}
+		if err := q.DeleteMembershipsByUser(ctx, targetID); err != nil {
+			return fmt.Errorf("delete memberships: %w", err)
+		}
+		hashes, err := q.DeleteAllUserSessions(ctx, targetID)
+		if err != nil {
+			return fmt.Errorf("delete sessions: %w", err)
+		}
+		if err := q.SoftDeleteUser(ctx, targetID); err != nil {
+			return fmt.Errorf("soft delete user: %w", err)
+		}
+		after := map[string]string{}
+		if reason != "" {
+			after["reason"] = reason
+		}
+		if err := s.writeAudit(ctx, q, r, auditEntry{
+			ActorID: &callerID, Action: "user.delete", TargetType: "user", TargetID: targetID.String(),
+			Before: map[string]any{"status": user.Status, "owned_events": user.OwnedEvents, "open_reports": openReports},
+			After:  after,
+		}); err != nil {
+			return err
+		}
+		sessionHashes, queued = hashes, len(params)
+		return nil
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, errAdminUserNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "No such user.")
+		case errors.Is(err, errHasAdminRole):
+			writeError(w, http.StatusConflict, "has_admin_role", "Remove this user's admin roles before deleting the account.")
+		case errors.Is(err, errUserBanned):
+			writeError(w, http.StatusConflict, "user_banned", "Banned accounts are kept so the ban stays in force. Unban first if you really need to delete.")
+		case errors.Is(err, errConfirmMismatch):
+			writeError(w, http.StatusBadRequest, "confirm_mismatch", "That email doesn't match the account.")
+		default:
+			serverError(w, r, fmt.Errorf("admin delete user: %w", err))
+		}
+		return
+	}
+	// Postgres already committed: a Valkey failure only delays the cache
+	// entries' own expiry, so it is logged, not surfaced. The request context
+	// may already be cancelled (client gone), which must not skip the revoke.
+	s.revokeAfterCommit(ctx, sessionHashes, targetID)
+	writeJSON(w, http.StatusAccepted, map[string]int{"events_queued": queued})
+}
+
+// revokeAfterCommit drops the Valkey session mirror for hashes whose rows a
+// committed transaction already deleted. It runs on a context detached from
+// the request, so a client that hangs up cannot leave cache entries behind,
+// and with its own short timeout. A failure is logged, not surfaced.
+func (s *Server) revokeAfterCommit(ctx context.Context, hashes [][]byte, userID uuid.UUID) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	if err := s.sessions.RevokeHashes(rctx, hashes); err != nil {
+		slog.WarnContext(rctx, "revoke session cache entries", "err", err, "user_id", userID)
+	}
+}
+
+// --- PATCH /v1/admin/users/{id} ---
+
+// handleAdminUpdateUser (moderator+) edits a user's display name, and, for a
+// super_admin only, their sign-in email. Like status changes, nobody edits
+// themselves and only a super_admin edits a user who holds a role, and nobody
+// changes the email of a role holder (409 has_admin_role). A changed
+// email revokes every session and notifies the OLD address only (the new
+// address is never sent anywhere), so a hijacked change cannot go unnoticed.
+// Values equal to the current ones change nothing: no write, audit row or
+// mail.
+func (s *Server) handleAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
+	targetID, err := parseUUIDParam(r, "id")
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such user.")
+		return
+	}
+	callerID, _ := userIDFrom(r.Context())
+	if targetID == callerID {
+		writeError(w, http.StatusForbidden, "forbidden", "You can't edit your own account here.")
+		return
+	}
+
+	var body struct {
+		Name  *string `json:"name"`
+		Email *string `json:"email"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.Name == nil && body.Email == nil {
+		writeError(w, http.StatusBadRequest, "validation_failed", "Nothing to change.")
+		return
+	}
+	isSuper := hasMinRole(adminRolesFrom(r.Context()), "super_admin")
+	if body.Email != nil && !isSuper {
+		writeError(w, http.StatusForbidden, "forbidden", "Only a super admin can change a user's email.")
+		return
+	}
+	var name, email string
+	if body.Name != nil {
+		var ok bool
+		if name, ok = validateUserName(*body.Name); !ok {
+			writeError(w, http.StatusBadRequest, "validation_failed", "Check the name field.")
+			return
+		}
+	}
+	if body.Email != nil {
+		var ok bool
+		// ".invalid" is where scrubbed (deleted) accounts' placeholder
+		// addresses live; a real account must never collide with one.
+		if email, ok = normalizeEmail(*body.Email); !ok || strings.HasSuffix(email, ".invalid") {
+			writeError(w, http.StatusBadRequest, "validation_failed", "Check the email field.")
+			return
+		}
+	}
+
+	limits := []limit{{"admin:user:edit:" + callerID.String(), 60, time.Hour}}
+	if body.Email != nil {
+		limits = append(limits,
+			limit{"admin:user:email:" + callerID.String(), 10, time.Hour},
+			limit{"admin:user:email:target:" + targetID.String(), 3, 24 * time.Hour},
+		)
+	}
+	if !s.allow(w, r, limits...) {
+		return
+	}
+
+	ctx := r.Context()
+	current, err := s.q.GetUserByID(ctx, targetID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "No such user.")
+		return
+	}
+	if err != nil {
+		serverError(w, r, fmt.Errorf("get user: %w", err))
+		return
+	}
+	var sessionHashes [][]byte
+	err = s.inTx(ctx, func(tx pgx.Tx, q *store.Queries) error {
+		// Role check under the roles lock, so a concurrent grant cannot slip
+		// past it. An email change on any role holder would be an admin
+		// takeover path, so it is refused outright, even for a super admin.
+		if !isSuper || body.Email != nil {
+			if err := q.LockRoles(ctx); err != nil {
+				return fmt.Errorf("lock roles: %w", err)
+			}
+			targetRoles, err := q.ListUserRoles(ctx, targetID)
+			if err != nil {
+				return fmt.Errorf("list user roles: %w", err)
+			}
+			if len(targetRoles) > 0 {
+				if !isSuper {
+					return errNeedsSuperAdmin
+				}
+				return errHasAdminRole
+			}
+		}
+		fields := make([]string, 0, 2)
+		if body.Name != nil && name != current.Name {
+			if _, err := q.UpdateUserName(ctx, store.UpdateUserNameParams{Name: name, UserID: targetID}); errors.Is(err, pgx.ErrNoRows) {
+				return errAdminUserNotFound
+			} else if err != nil {
+				return fmt.Errorf("update user name: %w", err)
+			}
+			fields = append(fields, "name")
+		}
+		if body.Email != nil && email != current.Email {
+			row, err := q.UpdateUserEmailAdmin(ctx, store.UpdateUserEmailAdminParams{Email: email, TargetID: targetID})
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errAdminUserNotFound
+			}
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "users_email_key" {
+				return errEmailTaken
+			}
+			if err != nil {
+				return fmt.Errorf("update user email: %w", err)
+			}
+			// A concurrent edit may already have set this address.
+			if row.OldEmail != row.NewEmail {
+				hashes, err := q.DeleteAllUserSessions(ctx, targetID)
+				if err != nil {
+					return fmt.Errorf("delete user sessions: %w", err)
+				}
+				sessionHashes = hashes
+				if _, err := s.jobs.InsertTx(ctx, tx, jobs.SendEmailArgs{Message: mail.Message{
+					To:      row.OldEmail,
+					Subject: "The sign-in email on your See You There account was changed",
+					Text: "The sign-in email on your See You There account was changed by our support team, " +
+						"and you have been signed out everywhere.\n\n" +
+						"If you did not expect this, reply to this email and we will look into it.\n\n" +
+						"See You There\n",
+				}}, nil); err != nil {
+					return fmt.Errorf("enqueue email change notice: %w", err)
+				}
+				fields = append(fields, "email")
+			}
+		}
+		if len(fields) == 0 {
+			return nil
+		}
+		return s.writeAudit(ctx, q, r, auditEntry{
+			ActorID: &callerID, Action: "user.update", TargetType: "user", TargetID: targetID.String(),
+			After: map[string][]string{"fields": fields},
+		})
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, errAdminUserNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "No such user.")
+		case errors.Is(err, errNeedsSuperAdmin):
+			writeError(w, http.StatusForbidden, "forbidden", "Only a super admin can act on a user who holds a role.")
+		case errors.Is(err, errHasAdminRole):
+			writeError(w, http.StatusConflict, "has_admin_role", "An admin's email can't be changed here. Remove their admin roles first.")
+		case errors.Is(err, errEmailTaken):
+			writeError(w, http.StatusConflict, "email_taken", "That email is already in use.")
+		default:
+			serverError(w, r, fmt.Errorf("admin update user: %w", err))
+		}
+		return
+	}
+	s.revokeAfterCommit(ctx, sessionHashes, targetID)
+
+	row, err := s.q.GetUserAdmin(ctx, targetID)
+	if err != nil {
+		serverError(w, r, fmt.Errorf("get user admin: %w", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user": adminUserSummaryResp{row.ID, row.Email, row.Name, row.Status, row.Roles, row.CreatedAt},
+	})
 }

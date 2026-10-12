@@ -123,6 +123,37 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 	return i, err
 }
 
+const getUserForAdminDelete = `-- name: GetUserForAdminDelete :one
+SELECT u.id, u.email, u.status,
+       (SELECT count(*) FROM events e WHERE e.owner_id = u.id) AS owned_events
+FROM users u
+WHERE u.id = $1 AND u.deleted_at IS NULL
+FOR UPDATE OF u
+`
+
+type GetUserForAdminDeleteRow struct {
+	ID          uuid.UUID `json:"id"`
+	Email       string    `json:"email"`
+	Status      string    `json:"status"`
+	OwnedEvents int64     `json:"owned_events"`
+}
+
+// Admin user delete: locks the live row FOR UPDATE, so concurrent edits and status changes wait.
+// Writers that attach new rows to a user (event create, draft claim, add co-host) take
+// LockLiveUser first, which conflicts with this lock and then finds the user gone.
+// Returns the numbers for the audit row. No row: user missing or already deleted.
+func (q *Queries) GetUserForAdminDelete(ctx context.Context, userID uuid.UUID) (GetUserForAdminDeleteRow, error) {
+	row := q.db.QueryRow(ctx, getUserForAdminDelete, userID)
+	var i GetUserForAdminDeleteRow
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Status,
+		&i.OwnedEvents,
+	)
+	return i, err
+}
+
 const getUserTOTP = `-- name: GetUserTOTP :one
 SELECT id, email, totp_secret, totp_confirmed_at, totp_last_step
 FROM users
@@ -196,6 +227,22 @@ func (q *Queries) ListUserRoles(ctx context.Context, userID uuid.UUID) ([]string
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockLiveUser = `-- name: LockLiveUser :one
+SELECT id FROM users
+WHERE id = $1 AND deleted_at IS NULL AND status = 'active'
+FOR KEY SHARE
+`
+
+// Taken first by a transaction that is about to attach rows (events, memberships) to a user.
+// FOR KEY SHARE conflicts with GetUserForAdminDelete's FOR UPDATE: under READ COMMITTED it waits
+// for an in-flight admin delete and then returns no row. No row: user missing, deleted or not active.
+func (q *Queries) LockLiveUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockLiveUser, userID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const lockRoles = `-- name: LockRoles :exec
@@ -559,6 +606,39 @@ WHERE id = $1 AND deleted_at IS NULL
 func (q *Queries) SoftDeleteUser(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, softDeleteUser, userID)
 	return err
+}
+
+const updateUserEmailAdmin = `-- name: UpdateUserEmailAdmin :one
+WITH prev AS (
+    SELECT x.id, x.email FROM users x
+    WHERE x.id = $2 AND x.deleted_at IS NULL
+    FOR NO KEY UPDATE
+)
+UPDATE users u
+SET email = $1, updated_at = now()
+FROM prev
+WHERE u.id = prev.id
+RETURNING prev.email AS old_email, u.email AS new_email
+`
+
+type UpdateUserEmailAdminParams struct {
+	Email    string    `json:"email"`
+	TargetID uuid.UUID `json:"target_id"`
+}
+
+type UpdateUserEmailAdminRow struct {
+	OldEmail string `json:"old_email"`
+	NewEmail string `json:"new_email"`
+}
+
+// Returns the address before and after. The caller compares them: an unchanged address writes
+// nothing worth auditing. No row: user missing or deleted. A taken address fails with 23505 on
+// users_email_key (live rows only).
+func (q *Queries) UpdateUserEmailAdmin(ctx context.Context, arg UpdateUserEmailAdminParams) (UpdateUserEmailAdminRow, error) {
+	row := q.db.QueryRow(ctx, updateUserEmailAdmin, arg.Email, arg.TargetID)
+	var i UpdateUserEmailAdminRow
+	err := row.Scan(&i.OldEmail, &i.NewEmail)
+	return i, err
 }
 
 const updateUserName = `-- name: UpdateUserName :one

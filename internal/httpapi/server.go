@@ -233,6 +233,7 @@ func (s *Server) Routes() http.Handler {
 				// POST .../status is moderator-gated here; ban is
 				// additionally restricted to super_admin inside the handler.
 				r.Post("/users/{id}/status", s.handleSetAdminUserStatus)
+				r.Patch("/users/{id}", s.handleAdminUpdateUser)
 				r.Get("/reports", s.handleListAdminReports)
 				r.Post("/reports/{id}/dismiss", s.handleDismissReport)
 				r.Post("/events/{id}/takedown", s.handleAdminTakedownEvent)
@@ -254,6 +255,8 @@ func (s *Server) Routes() http.Handler {
 				r.Delete("/users/{id}/roles/{role}", s.handleAdminUserRole)
 				r.Post("/users/{id}/mfa/reset", s.handleAdminResetUserMFA)
 				r.Patch("/events/{id}/flags", s.handleAdminSetEventFlags)
+				r.Delete("/events/{id}", s.handleAdminDeleteEvent)
+				r.Delete("/users/{id}", s.handleAdminDeleteUser)
 				r.Route("/templates", func(r chi.Router) {
 					r.Get("/", s.handleListAdminTemplates)
 					r.Post("/", s.handleCreateAdminTemplate)
