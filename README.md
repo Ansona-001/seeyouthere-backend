@@ -62,7 +62,7 @@ Errors look like `{"error": {"code": "invalid_code", "message": "..."}}`.
 
 ## Deploying
 
-Pushing to `main` in this repo (API) or `seeyouthere-frontend` (web) runs tests, builds a `linux/amd64` image on a GitHub runner, pushes it to GHCR (`ghcr.io/ansona-001/seeyouthere-api` / `-web`, tags `<full sha>` and `latest`) and SSHes to the VM. The VM never builds; it only pulls and runs. Workflows: `.github/workflows/deploy.yml` in each repo. Actions are pinned to major version tags (not commit SHAs); Dependabot proposes updates weekly.
+Pushing to `main` in this repo (API) or `seeyouthere-frontend` (web) runs tests, builds a `linux/amd64` image on a GitHub runner, pushes it to GHCR (`ghcr.io/ansona-001/seeyouthere-api` / `-web`, tags `<full sha>` and `latest`) and SSHes to the VM. The VM never builds; it only pulls and runs. Workflows: `.github/workflows/deploy.yml` in each repo. Actions are pinned to major version tags (not commit SHAs); bump them by hand from time to time.
 
 On the VM the deploy key's forced command is a root-owned copy of `deploy/ssh-entry.sh`. It accepts only `api|web <40-hex sha>`, takes a lock (`~/.syt-deploy.lock`, so deploys never overlap), runs `git pull --ff-only` in this repo, then runs the repo's `deploy/deploy.sh`, which:
 
