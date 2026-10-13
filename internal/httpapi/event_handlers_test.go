@@ -600,6 +600,17 @@ func TestHandleDeleteEvent_EnqueuesMediaVisibilityJob(t *testing.T) {
 		return n
 	}
 
+	countPurgeJobs := func(eventID uuid.UUID) int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			"SELECT count(*) FROM river_job WHERE kind = 'admin_purge_event' AND args->>'event_id' = $1 AND (args->>'keep_if_held')::bool",
+			eventID.String(),
+		).Scan(&n); err != nil {
+			t.Fatalf("count admin_purge_event jobs: %v", err)
+		}
+		return n
+	}
+
 	t.Run("owner delete", func(t *testing.T) {
 		req := requestAs(http.MethodDelete, "/", f.ownerID)
 		req = withRouteID(req, f.eventID)
@@ -610,6 +621,9 @@ func TestHandleDeleteEvent_EnqueuesMediaVisibilityJob(t *testing.T) {
 		}
 		if n := countMediaJobs(f.eventID); n != 1 {
 			t.Errorf("media_visibility jobs for %s = %d, want 1", f.eventID, n)
+		}
+		if n := countPurgeJobs(f.eventID); n != 1 {
+			t.Errorf("immediate purge jobs for %s = %d, want 1", f.eventID, n)
 		}
 	})
 
@@ -641,6 +655,9 @@ func TestHandleDeleteEvent_EnqueuesMediaVisibilityJob(t *testing.T) {
 		}
 		if n := countMediaJobs(draft.ID); n != 1 {
 			t.Errorf("media_visibility jobs for %s = %d, want 1", draft.ID, n)
+		}
+		if n := countPurgeJobs(draft.ID); n != 1 {
+			t.Errorf("immediate purge jobs for %s = %d, want 1", draft.ID, n)
 		}
 	})
 }

@@ -13,11 +13,18 @@ SELECT EXISTS (
 ) AS blocked;
 
 -- name: SlugTaken :one
--- exclude_event_id lets an event keep its own slug. Deleted events keep their slug reserved.
-SELECT EXISTS (
-    SELECT 1 FROM events e
-    WHERE e.slug = @slug::text AND e.id IS DISTINCT FROM sqlc.narg(exclude_event_id)::uuid
-) AS taken;
+-- exclude_event_id lets an event keep its own slug. Soft-deleted events keep their slug reserved, and
+-- so does a hard-deleted published event's slug for 30 days (retired_slugs, written by a trigger).
+SELECT (
+    EXISTS (
+        SELECT 1 FROM events e
+        WHERE e.slug = @slug::text AND e.id IS DISTINCT FROM sqlc.narg(exclude_event_id)::uuid
+    )
+    OR EXISTS (
+        SELECT 1 FROM retired_slugs r
+        WHERE r.slug = @slug::text AND r.retired_at > now() - interval '30 days'
+    )
+)::boolean AS taken;
 
 -- name: ListBlocklist :many
 -- Keyset on term; first page passes after_term = ''.

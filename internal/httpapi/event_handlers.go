@@ -1443,6 +1443,20 @@ func (s *Server) handleUnpublishEvent(w http.ResponseWriter, r *http.Request) {
 
 // --- DELETE /v1/events/{id} ---
 
+// enqueueImmediatePurge queues the hard delete of an event the caller just soft-deleted, in the same
+// transaction: its files in object storage go first, then the rows (children cascade), within moments
+// instead of after the retention grace period. The media-visibility job stays for events a moderation
+// hold keeps around (taken down, or an open report), where the purge deliberately does nothing.
+func (s *Server) enqueueImmediatePurge(ctx context.Context, tx pgx.Tx, eventID uuid.UUID) error {
+	if _, err := s.jobs.InsertTx(ctx, tx, jobs.MediaVisibilityArgs{EventID: eventID}, nil); err != nil {
+		return fmt.Errorf("enqueue media visibility: %w", err)
+	}
+	if _, err := s.jobs.InsertTx(ctx, tx, jobs.AdminPurgeEventArgs{EventID: eventID, KeepIfHeld: true}, nil); err != nil {
+		return fmt.Errorf("enqueue event purge: %w", err)
+	}
+	return nil
+}
+
 func (s *Server) handleDeleteEvent(w http.ResponseWriter, r *http.Request) {
 	eventID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -1456,8 +1470,7 @@ func (s *Server) handleDeleteEvent(w http.ResponseWriter, r *http.Request) {
 			if _, err := q.SoftDeleteEvent(ctx, store.SoftDeleteEventParams{EventID: eventID, UserID: userID}); err != nil {
 				return err
 			}
-			_, err := s.jobs.InsertTx(ctx, tx, jobs.MediaVisibilityArgs{EventID: eventID}, nil)
-			return err
+			return s.enqueueImmediatePurge(ctx, tx, eventID)
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "not_found", "No such event.")
@@ -1480,8 +1493,7 @@ func (s *Server) handleDeleteEvent(w http.ResponseWriter, r *http.Request) {
 		if _, err := q.SoftDeleteAnonDraft(ctx, store.SoftDeleteAnonDraftParams{EventID: eventID, CookieHash: hash}); err != nil {
 			return err
 		}
-		_, err := s.jobs.InsertTx(ctx, tx, jobs.MediaVisibilityArgs{EventID: eventID}, nil)
-		return err
+		return s.enqueueImmediatePurge(ctx, tx, eventID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "not_found", "No such event.")

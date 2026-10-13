@@ -106,10 +106,16 @@ func (q *Queries) SlugBlocked(ctx context.Context, slug string) (bool, error) {
 }
 
 const slugTaken = `-- name: SlugTaken :one
-SELECT EXISTS (
-    SELECT 1 FROM events e
-    WHERE e.slug = $1::text AND e.id IS DISTINCT FROM $2::uuid
-) AS taken
+SELECT (
+    EXISTS (
+        SELECT 1 FROM events e
+        WHERE e.slug = $1::text AND e.id IS DISTINCT FROM $2::uuid
+    )
+    OR EXISTS (
+        SELECT 1 FROM retired_slugs r
+        WHERE r.slug = $1::text AND r.retired_at > now() - interval '30 days'
+    )
+)::boolean AS taken
 `
 
 type SlugTakenParams struct {
@@ -117,7 +123,8 @@ type SlugTakenParams struct {
 	ExcludeEventID *uuid.UUID `json:"exclude_event_id"`
 }
 
-// exclude_event_id lets an event keep its own slug. Deleted events keep their slug reserved.
+// exclude_event_id lets an event keep its own slug. Soft-deleted events keep their slug reserved, and
+// so does a hard-deleted published event's slug for 30 days (retired_slugs, written by a trigger).
 func (q *Queries) SlugTaken(ctx context.Context, arg SlugTakenParams) (bool, error) {
 	row := q.db.QueryRow(ctx, slugTaken, arg.Slug, arg.ExcludeEventID)
 	var taken bool

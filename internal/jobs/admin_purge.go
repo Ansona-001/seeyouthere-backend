@@ -21,12 +21,17 @@ import (
 // storage problem from a database one.
 var ErrPurgeFiles = errors.New("purge event files")
 
-// AdminPurgeEventArgs hard-deletes one event an admin removed (directly, or
-// through deleting its owner). Enqueued by the admin user delete in the same
-// transaction that soft-deletes the event. Unique by event while queued or
-// running, so a repeated delete never queues a second purge.
+// AdminPurgeEventArgs hard-deletes one event right after it was soft-deleted:
+// an admin removing it (directly, or through deleting its owner), or an owner
+// deleting their own event. Enqueued in the same transaction as the soft
+// delete. Unique by event while queued or running, so a repeated delete never
+// queues a second purge.
 type AdminPurgeEventArgs struct {
 	EventID uuid.UUID `json:"event_id"`
+	// KeepIfHeld is set for an owner's delete: an event taken down by moderation or with an open report
+	// is kept soft-deleted (the scheduled purge honours those holds), because deleting it would destroy
+	// moderation evidence. An admin delete leaves it false and overrides the holds.
+	KeepIfHeld bool `json:"keep_if_held,omitempty"`
 }
 
 func (AdminPurgeEventArgs) Kind() string { return "admin_purge_event" }
@@ -71,7 +76,7 @@ func PurgeLockedEvent(ctx context.Context, q *store.Queries, files mediaDeleter,
 	return nil
 }
 
-// AdminPurgeEventWorker purges an event soft-deleted by an admin user delete.
+// AdminPurgeEventWorker purges an event right after it was soft-deleted (an admin delete or an owner's delete).
 // A missing row is done (an earlier attempt or another purge got there). A row
 // that is not soft-deleted is left alone and logged: the job is only ever
 // enqueued together with the soft delete, so this means something restored it
@@ -101,6 +106,19 @@ func (w *AdminPurgeEventWorker) Work(ctx context.Context, job *river.Job[AdminPu
 		if row.DeletedAt == nil {
 			slog.ErrorContext(ctx, "admin purge event: event is not soft-deleted, keeping it", "event_id", eventID)
 			return nil
+		}
+		if job.Args.KeepIfHeld {
+			// LockEventForAdminDelete's report count used the statement snapshot taken before the row lock,
+			// so a report committed meanwhile would be missed. FilterLockedPurgeable runs as a new statement
+			// with the lock held and also rejects taken-down events.
+			purgeable, err := q.FilterLockedPurgeable(ctx, []uuid.UUID{eventID})
+			if err != nil {
+				return fmt.Errorf("recheck moderation holds: %w", err)
+			}
+			if len(purgeable) == 0 {
+				slog.InfoContext(ctx, "purge event: moderation hold, keeping it soft-deleted", "event_id", eventID)
+				return nil
+			}
 		}
 		return PurgeLockedEvent(ctx, q, w.Media, eventID)
 	})

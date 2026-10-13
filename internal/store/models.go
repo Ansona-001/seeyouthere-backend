@@ -126,6 +126,11 @@ type Report struct {
 	CreatedAt      time.Time  `json:"created_at"`
 }
 
+type RetiredSlug struct {
+	Slug      string    `json:"slug"`
+	RetiredAt time.Time `json:"retired_at"`
+}
+
 type Rsvp struct {
 	ID               uuid.UUID  `json:"id"`
 	EventID          uuid.UUID  `json:"event_id"`
