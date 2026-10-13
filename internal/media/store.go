@@ -11,10 +11,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// minFreeBytes is the free-space floor below which new uploads are refused
-// (507 storage_full) so Postgres always keeps operating headroom on the
-// same volume/host.
-const minFreeBytes = 2 << 30 // 2 GiB
+// defaultMinFreeBytes is the free-space floor below which new uploads are
+// refused (507 storage_full) so Postgres always keeps operating headroom on
+// the same volume/host. Small disks lower it via SetMinFreeBytes
+// (MEDIA_MIN_FREE_MB).
+const defaultMinFreeBytes = 2 << 30 // 2 GiB
 
 // cleanupTimeout bounds the best-effort delete after a failed Commit, which
 // runs on a context detached from the (possibly cancelled) request.
@@ -29,12 +30,14 @@ const cleanupTimeout = 10 * time.Second
 type Store struct {
 	root  string
 	blobs Blobs
+	// minFree is the free-space floor CheckFree enforces.
+	minFree uint64
 }
 
 // NewStore creates (if missing) tmp/ under root and verifies root is
 // writable.
 func NewStore(root string, blobs Blobs) (*Store, error) {
-	s := &Store{root: root, blobs: blobs}
+	s := &Store{root: root, blobs: blobs, minFree: defaultMinFreeBytes}
 	if err := os.MkdirAll(s.tmpDir(), 0o755); err != nil {
 		return nil, fmt.Errorf("media: create tmp: %w", err)
 	}
@@ -45,6 +48,10 @@ func NewStore(root string, blobs Blobs) (*Store, error) {
 	_ = os.Remove(probe)
 	return s, nil
 }
+
+// SetMinFreeBytes overrides the free-space floor. Call it before the store is
+// shared; it is not safe to change while uploads are running.
+func (s *Store) SetMinFreeBytes(n uint64) { s.minFree = n }
 
 func (s *Store) tmpDir() string { return filepath.Join(s.root, "tmp") }
 
@@ -61,13 +68,13 @@ func (s *Store) NewOutputDir() (string, error) {
 }
 
 // CheckFree reports ErrDiskFull when the filesystem holding root has less
-// than minFreeBytes available.
+// than the configured floor available.
 func (s *Store) CheckFree() error {
 	free, err := freeBytes(s.root)
 	if err != nil {
 		return fmt.Errorf("media: check free space: %w", err)
 	}
-	if free < minFreeBytes {
+	if free < s.minFree {
 		return ErrDiskFull
 	}
 	return nil

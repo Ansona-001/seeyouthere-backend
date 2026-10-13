@@ -109,6 +109,7 @@ func runServer(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) error
 	if err != nil {
 		return fmt.Errorf("media store: %w", err)
 	}
+	mediaStore.SetMinFreeBytes(uint64(cfg.MediaMinFreeBytes))
 
 	tokens, err := token.NewKeys(cfg.AuthSecret)
 	if err != nil {

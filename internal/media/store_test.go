@@ -449,3 +449,16 @@ func TestStore_DeleteEventFiles(t *testing.T) {
 		delete(b.objs, bad)
 	})
 }
+
+func TestStore_CheckFree_Floor(t *testing.T) {
+	s := newTestStore(t)
+	// An impossibly high floor must refuse; a floor of zero must accept.
+	s.SetMinFreeBytes(1 << 62)
+	if err := s.CheckFree(); !errors.Is(err, ErrDiskFull) {
+		t.Errorf("CheckFree with huge floor = %v, want ErrDiskFull", err)
+	}
+	s.SetMinFreeBytes(0)
+	if err := s.CheckFree(); err != nil {
+		t.Errorf("CheckFree with zero floor: %v", err)
+	}
+}

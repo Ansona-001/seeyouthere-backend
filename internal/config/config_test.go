@@ -201,3 +201,31 @@ func TestLoad_MediaQuotas(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_MediaMinFree(t *testing.T) {
+	cases := []struct {
+		name, val string
+		wantErr   bool
+		want      int64
+	}{
+		{"default", "", false, 2_048_000_000},
+		{"custom", "500", false, 500_000_000},
+		{"lower bound", "100", false, 100_000_000},
+		{"below bound", "99", true, 0},
+		{"too big", "1000001", true, 0},
+		{"nan", "1.5", true, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("MEDIA_MIN_FREE_MB", tc.val)
+			c, err := Load()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Load() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err == nil && c.MediaMinFreeBytes != tc.want {
+				t.Errorf("MediaMinFreeBytes = %d, want %d", c.MediaMinFreeBytes, tc.want)
+			}
+		})
+	}
+}

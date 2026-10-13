@@ -65,6 +65,9 @@ type Config struct {
 	// caps all photos (keeps the bucket inside the free tier). Decimal MB.
 	MediaUserQuotaBytes  int64
 	MediaTotalQuotaBytes int64
+	// MediaMinFreeBytes is the local-disk free-space floor below which uploads
+	// are refused (uploads are staged on local disk even when photos live in R2).
+	MediaMinFreeBytes int64
 	// TOTPKey seals/opens admin TOTP secrets at rest (AES-256-GCM). Exactly 32 bytes.
 	TOTPKey []byte
 	// AdminAlertEmail receives notify_report emails. Empty disables them.
@@ -189,6 +192,13 @@ func Load() (Config, error) {
 	} else {
 		c.MediaUserQuotaBytes = userMB * megabyte
 		c.MediaTotalQuotaBytes = totalMB * megabyte
+	}
+
+	minFreeMB, err := strconv.ParseInt(env("MEDIA_MIN_FREE_MB", "2048"), 10, 64)
+	if err != nil || minFreeMB < 100 || minFreeMB > 1_000_000 {
+		errs = append(errs, errors.New("MEDIA_MIN_FREE_MB must be an integer between 100 and 1000000"))
+	} else {
+		c.MediaMinFreeBytes = minFreeMB * megabyte
 	}
 
 	if raw := os.Getenv("TOTP_KEY"); raw == "" {
