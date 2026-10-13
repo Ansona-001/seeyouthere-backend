@@ -23,6 +23,8 @@ var (
 	errTemplateVersionPublish  = errors.New("admin: template version already published")
 	errTemplateVersionInvalid  = errors.New("admin: template version manifest invalid")
 	errTemplateVersionNotReady = errors.New("admin: template version missing its asset")
+	errTemplateLastVersion     = errors.New("admin: last template version")
+	errTemplateVersionFiles    = errors.New("admin: template version files")
 )
 
 // templateSlugRe mirrors templates.slug's shape: lower-case, hyphenated.
@@ -444,6 +446,74 @@ func (s *Server) handleUpdateAdminTemplateVersion(w http.ResponseWriter, r *http
 		return
 	}
 	writeJSON(w, http.StatusOK, adminTemplateVersionResp{Version: version, Manifest: json.RawMessage(canon), Status: "draft"})
+}
+
+// --- DELETE /v1/admin/templates/{id}/versions/{v} ---
+
+// handleDeleteAdminTemplateVersion deletes a draft version. The template row
+// is locked first (so concurrent deletes see each other for the last-version
+// check), then the version row with the same lock publish takes (so a
+// concurrent publish either wins and this answers version_published, or waits
+// and finds the row gone). Background files go before the row, in the same
+// transaction: a storage failure rolls back and keeps the row for a retry.
+func (s *Server) handleDeleteAdminTemplateVersion(w http.ResponseWriter, r *http.Request) {
+	templateID, version, ok := parseTemplateVersionParams(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	callerID, _ := userIDFrom(ctx)
+	err := s.inTx(ctx, func(_ pgx.Tx, q *store.Queries) error {
+		if _, err := q.LockTemplateForVersionDelete(ctx, templateID); err != nil {
+			return err
+		}
+		row, err := q.GetTemplateVersionForUpdate(ctx, store.GetTemplateVersionForUpdateParams{TemplateID: templateID, Version: version})
+		if err != nil {
+			return err
+		}
+		if row.PublishedAt != nil {
+			return errTemplateVersionPublish
+		}
+		n, err := q.CountTemplateVersions(ctx, templateID)
+		if err != nil {
+			return fmt.Errorf("count template versions: %w", err)
+		}
+		if n <= 1 {
+			return errTemplateLastVersion
+		}
+		hasBackground := row.AssetsPath != ""
+		if hasBackground {
+			if err := s.media.DeleteTemplateAsset(ctx, templateID, version); err != nil {
+				return fmt.Errorf("%w: %w", errTemplateVersionFiles, err)
+			}
+		}
+		deleted, err := q.DeleteTemplateVersion(ctx, store.DeleteTemplateVersionParams{TemplateID: templateID, Version: version})
+		if err != nil {
+			return fmt.Errorf("delete template version: %w", err)
+		}
+		if deleted != 1 {
+			return fmt.Errorf("delete template version: %d rows deleted, want 1", deleted)
+		}
+		return s.writeAudit(ctx, q, r, auditEntry{
+			ActorID: &callerID, Action: "template_version.delete", TargetType: "template_version",
+			TargetID: fmt.Sprintf("%s/%d", templateID, version),
+			Before:   map[string]any{"template_id": templateID, "version": version, "had_background": hasBackground},
+		})
+	})
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, pgx.ErrNoRows):
+		writeError(w, http.StatusNotFound, "not_found", "No such template version.")
+	case errors.Is(err, errTemplateVersionPublish):
+		writeError(w, http.StatusConflict, "version_published", "This version is published and can't be deleted.")
+	case errors.Is(err, errTemplateLastVersion):
+		writeError(w, http.StatusConflict, "last_version", "A template must keep at least one version.")
+	case errors.Is(err, errTemplateVersionFiles):
+		writeStorageError(w, r, err)
+	default:
+		serverError(w, r, fmt.Errorf("delete template version: %w", err))
+	}
 }
 
 // --- POST /v1/admin/templates/{id}/versions/{v}/background ---

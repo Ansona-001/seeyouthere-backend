@@ -24,6 +24,18 @@ func (q *Queries) CountPublishedVersions(ctx context.Context, templateID uuid.UU
 	return count, err
 }
 
+const countTemplateVersions = `-- name: CountTemplateVersions :one
+SELECT count(*) FROM template_versions
+WHERE template_id = $1
+`
+
+func (q *Queries) CountTemplateVersions(ctx context.Context, templateID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countTemplateVersions, templateID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createTemplate = `-- name: CreateTemplate :one
 INSERT INTO templates (id, slug, name, tags, is_premium)
 VALUES ($1, $2, $3, $4, $5)
@@ -98,6 +110,26 @@ func (q *Queries) CreateTemplateVersion(ctx context.Context, arg CreateTemplateV
 		&i.PublishedAt,
 	)
 	return i, err
+}
+
+const deleteTemplateVersion = `-- name: DeleteTemplateVersion :execrows
+DELETE FROM template_versions
+WHERE template_id = $1 AND version = $2 AND published_at IS NULL
+`
+
+type DeleteTemplateVersionParams struct {
+	TemplateID uuid.UUID `json:"template_id"`
+	Version    int32     `json:"version"`
+}
+
+// Draft only; the caller holds the GetTemplateVersionForUpdate lock, so zero rows is unexpected.
+// A published row is never matched (the template_versions_immutable trigger would reject it).
+func (q *Queries) DeleteTemplateVersion(ctx context.Context, arg DeleteTemplateVersionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteTemplateVersion, arg.TemplateID, arg.Version)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getTemplateAdmin = `-- name: GetTemplateAdmin :one
@@ -286,6 +318,20 @@ func (q *Queries) ListTemplatesAdmin(ctx context.Context) ([]ListTemplatesAdminR
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockTemplateForVersionDelete = `-- name: LockTemplateForVersionDelete :one
+SELECT id FROM templates WHERE id = $1
+FOR NO KEY UPDATE
+`
+
+// Serialises version deletes of one template (so two concurrent deletes cannot each see the
+// other version and leave none) without blocking version creates or publishes.
+func (q *Queries) LockTemplateForVersionDelete(ctx context.Context, templateID uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockTemplateForVersionDelete, templateID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const publishTemplateVersion = `-- name: PublishTemplateVersion :one

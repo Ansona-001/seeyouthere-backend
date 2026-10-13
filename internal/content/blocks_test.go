@@ -260,6 +260,46 @@ func TestValidateContent_MediaRefs(t *testing.T) {
 	}
 }
 
+func TestValidateContent_HeroMediaID(t *testing.T) {
+	occ := sampleOccasion(t)
+	heroID := "018f0000-0000-7000-8000-000000000001"
+	otherID := "018f0000-0000-7000-8000-000000000002"
+	heroImg := func(image any) map[string]any {
+		return map[string]any{"id": "h1", "type": "hero", "title": "T", "subtitle": "", "image": image}
+	}
+	image := map[string]any{"id": "i1", "type": "image", "media_id": otherID, "alt": "", "caption": ""}
+
+	cases := []struct {
+		name    string
+		content []map[string]any
+		want    string // "" = nil
+	}{
+		{"hero with image", []map[string]any{heroImg(map[string]any{"media_id": heroID, "alt": ""})}, heroID},
+		{"hero without image", []map[string]any{heroImg(nil)}, ""},
+		{"hero with empty media id", []map[string]any{heroImg(map[string]any{"media_id": "", "alt": ""})}, ""},
+		{"image block only is not the hero", []map[string]any{heroImg(nil), image}, ""},
+		{"hero image alongside other media", []map[string]any{image, heroImg(map[string]any{"media_id": heroID, "alt": ""})}, heroID},
+		{"no hero block", []map[string]any{image}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			saved, err := ValidateContent(mustJSON(t, tc.content), occ)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.want == "" {
+				if saved.HeroMediaID != nil {
+					t.Fatalf("HeroMediaID = %v, want nil", *saved.HeroMediaID)
+				}
+				return
+			}
+			if saved.HeroMediaID == nil || saved.HeroMediaID.String() != tc.want {
+				t.Fatalf("HeroMediaID = %v, want %s", saved.HeroMediaID, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateContent_TooManyMediaRefs(t *testing.T) {
 	occ := sampleOccasion(t)
 	occ.OptionalBlocks = append(occ.OptionalBlocks, "gallery")

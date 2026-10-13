@@ -60,6 +60,8 @@ type Event struct {
 	RetentionFrom           *time.Time `json:"retention_from"`
 	RetentionRemindedAt     *time.Time `json:"retention_reminded_at"`
 	RetentionReminderSentAt *time.Time `json:"retention_reminder_sent_at"`
+	ShareImage              string     `json:"share_image"`
+	ShareMediaID            *uuid.UUID `json:"share_media_id"`
 }
 
 type EventMember struct {

@@ -76,7 +76,33 @@ type publicEventResp struct {
 	Content        json.RawMessage          `json:"content"`
 	Theme          content.Theme            `json:"theme"`
 	Media          map[string]mediaItemResp `json:"media"`
-	RSVP           publicRsvpConfigResp     `json:"rsvp"`
+	// ShareImage is the link-preview image, nil when the page should use
+	// the site's default image (see resolveShareImage).
+	ShareImage *mediaItemResp       `json:"share_image"`
+	RSVP       publicRsvpConfigResp `json:"rsvp"`
+}
+
+// resolveShareImage picks the link-preview image from the event's choice:
+// "custom" uses its own image and "hero" the hero image, each only while
+// that image is approved (present in media); anything else, including
+// "site" or a custom image that was deleted or rejected, is nil so the
+// page falls back to the site default.
+func resolveShareImage(source string, shareMediaID, heroMediaID *uuid.UUID, media map[string]mediaItemResp) *mediaItemResp {
+	var id *uuid.UUID
+	switch source {
+	case "custom":
+		id = shareMediaID
+	case "hero":
+		id = heroMediaID
+	}
+	if id == nil {
+		return nil
+	}
+	m, ok := media[id.String()]
+	if !ok {
+		return nil
+	}
+	return &m
 }
 
 // --- visibility gate (§4.4) ---
@@ -358,7 +384,11 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	theme := content.ResolveTheme(manifest, row.Overrides, backgroundSrc)
 
-	media, err := s.buildPublicMedia(ctx, row.ID, saved.MediaIDs)
+	lookup := saved.MediaIDs
+	if row.ShareImage == "custom" && row.ShareMediaID != nil {
+		lookup = append(lookup[:len(lookup):len(lookup)], *row.ShareMediaID)
+	}
+	media, err := s.buildPublicMedia(ctx, row.ID, lookup)
 	if err != nil {
 		serverError(w, r, err)
 		return
@@ -384,7 +414,9 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 		Visibility: row.Visibility, RsvpMode: row.RsvpMode, StartsAt: row.StartsAt,
 		EndsAt:    saved.EndsAt,
 		Indexable: row.Visibility == "public", RemoveBranding: row.RemoveBranding,
-		Content: saved.JSON, Theme: theme, Media: media, RSVP: rsvpCfg,
+		Content: saved.JSON, Theme: theme, Media: media,
+		ShareImage: resolveShareImage(row.ShareImage, row.ShareMediaID, saved.HeroMediaID, media),
+		RSVP:       rsvpCfg,
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"event":  resp,

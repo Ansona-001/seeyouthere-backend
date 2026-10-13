@@ -61,8 +61,11 @@ type Saved struct {
 	// timezone maths (see event_handlers.go/public_handlers.go ends_at).
 	EndsAt   *time.Time
 	MediaIDs []uuid.UUID
-	RSVP     *RSVPBlock
-	Photos   *GuestPhotosBlock
+	// HeroMediaID is the hero block's image, nil when there is no hero
+	// image. Used to resolve the default ("hero") link-preview image.
+	HeroMediaID *uuid.UUID
+	RSVP        *RSVPBlock
+	Photos      *GuestPhotosBlock
 }
 
 // EffectiveEnd is the instant the event is over for retention purposes: nil
@@ -361,20 +364,22 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 	counts := make(map[string]int, len(in))
 	out := make([]any, len(in))
 	var mediaIDs []uuid.UUID
+	var heroMediaID *uuid.UUID
 	var heroTitle, firstHeading string
 	var rsvpBlock *RSVPBlock
 	var photosBlock *GuestPhotosBlock
 
-	addMedia := func(path, raw string) {
+	addMedia := func(path, raw string) (uuid.UUID, bool) {
 		if raw == "" {
-			return
+			return uuid.Nil, false
 		}
 		id, err := uuid.Parse(raw)
 		if err != nil {
 			iss.add(path, "invalid_media_id", "Not a valid media reference.")
-			return
+			return uuid.Nil, false
 		}
 		mediaIDs = append(mediaIDs, id)
+		return id, true
 	}
 
 	for i, rawBlock := range in {
@@ -415,7 +420,9 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 			b.Badge = checkBadge(iss, path+".badge", b.Badge)
 			if b.Image != nil {
 				b.Image.Alt = checkField(iss, path+".image.alt", b.Image.Alt, 200, false, false)
-				addMedia(path+".image.media_id", b.Image.MediaID)
+				if id, ok := addMedia(path+".image.media_id", b.Image.MediaID); ok {
+					heroMediaID = &id
+				}
 			}
 			if b.Title != "" {
 				heroTitle = b.Title
@@ -823,13 +830,14 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 	}
 
 	return Saved{
-		JSON:     canon,
-		Title:    title,
-		StartsAt: dtStart,
-		EndsAt:   dtEnd,
-		MediaIDs: mediaIDs,
-		RSVP:     rsvpBlock,
-		Photos:   photosBlock,
+		JSON:        canon,
+		Title:       title,
+		StartsAt:    dtStart,
+		EndsAt:      dtEnd,
+		MediaIDs:    mediaIDs,
+		HeroMediaID: heroMediaID,
+		RSVP:        rsvpBlock,
+		Photos:      photosBlock,
 	}, nil
 }
 

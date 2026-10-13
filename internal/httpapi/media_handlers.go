@@ -732,6 +732,10 @@ func (s *Server) handleDeleteEventMedia(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusForbidden, "forbidden", "You don't have access to remove media.")
 		return
 	}
+	if row.Event.ShareMediaID != nil && *row.Event.ShareMediaID == mediaID {
+		writeError(w, http.StatusConflict, "media_in_use", "This image is used as the link preview.")
+		return
+	}
 
 	occ, err := s.loadOccasion(ctx, s.q, row.Event.OccasionSlug)
 	if err != nil {

@@ -94,3 +94,19 @@ SELECT template_id, version, manifest
 FROM template_versions
 ORDER BY template_id, version
 LIMIT 500;
+
+-- name: LockTemplateForVersionDelete :one
+-- Serialises version deletes of one template (so two concurrent deletes cannot each see the
+-- other version and leave none) without blocking version creates or publishes.
+SELECT id FROM templates WHERE id = @template_id
+FOR NO KEY UPDATE;
+
+-- name: CountTemplateVersions :one
+SELECT count(*) FROM template_versions
+WHERE template_id = @template_id;
+
+-- name: DeleteTemplateVersion :execrows
+-- Draft only; the caller holds the GetTemplateVersionForUpdate lock, so zero rows is unexpected.
+-- A published row is never matched (the template_versions_immutable trigger would reject it).
+DELETE FROM template_versions
+WHERE template_id = @template_id AND version = @version AND published_at IS NULL;
