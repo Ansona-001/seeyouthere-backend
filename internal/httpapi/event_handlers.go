@@ -232,7 +232,57 @@ type eventResp struct {
 	Overrides   content.Overrides        `json:"overrides"`
 	Theme       content.Theme            `json:"theme"`
 	Media       map[string]mediaItemResp `json:"media"`
+	ShareImage  shareImageResp           `json:"share_image"`
 	URL         *string                  `json:"url"`
+}
+
+// shareImageResp is the host view of the link-preview image choice. MediaID
+// is set only for "custom", and is nil there too once the image was deleted;
+// when set and still approved, the image is in eventResp.Media.
+type shareImageResp struct {
+	Source  string     `json:"source"`
+	MediaID *uuid.UUID `json:"media_id"`
+}
+
+// shareImageReq is the optional share_image part of PATCH /v1/events/{id}.
+// MediaID is a string so a malformed id gets a field-level issue rather than
+// a generic JSON error.
+type shareImageReq struct {
+	Source  string  `json:"source"`
+	MediaID *string `json:"media_id"`
+}
+
+var validShareImageSources = map[string]bool{"hero": true, "site": true, "custom": true}
+
+// validateShareImage checks a share_image request's shape and returns the
+// parsed media id ("custom" only). Whether that media is usable is checked
+// against the database by the caller.
+func validateShareImage(req shareImageReq) (*uuid.UUID, *content.Issue) {
+	if !validShareImageSources[req.Source] {
+		return nil, &content.Issue{Path: "share_image.source", Code: "invalid", Message: "Must be hero, site or custom."}
+	}
+	if req.Source != "custom" {
+		if req.MediaID != nil {
+			return nil, &content.Issue{Path: "share_image.media_id", Code: "not_allowed", Message: "Only allowed with a custom image."}
+		}
+		return nil, nil
+	}
+	if req.MediaID == nil || *req.MediaID == "" {
+		return nil, &content.Issue{Path: "share_image.media_id", Code: "required", Message: "This field is required."}
+	}
+	id, err := uuid.Parse(*req.MediaID)
+	if err != nil {
+		return nil, &content.Issue{Path: "share_image.media_id", Code: "invalid_media_id", Message: "Not a valid media reference."}
+	}
+	return &id, nil
+}
+
+// writeInvalidShareMedia answers a custom share image that isn't an approved
+// image of this event (checked up front, or caught by events_share_media_fkey
+// when the media was deleted in between).
+func writeInvalidShareMedia(w http.ResponseWriter) {
+	writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "That image isn't available.",
+		[]content.Issue{{Path: "share_image.media_id", Code: "invalid_media_id", Message: "Not a valid media reference."}})
 }
 
 // buildEventResponse assembles the host view of an event: it re-derives the
@@ -260,9 +310,13 @@ func (s *Server) buildEventResponse(ctx context.Context, q *store.Queries, row e
 	}
 	theme := content.ResolveTheme(manifest, e.Overrides, backgroundSrc)
 
+	lookup := saved.MediaIDs
+	if e.ShareMediaID != nil {
+		lookup = append(lookup[:len(lookup):len(lookup)], *e.ShareMediaID)
+	}
 	media := map[string]mediaItemResp{}
-	if len(saved.MediaIDs) > 0 {
-		rows, err := q.ApprovedMediaByIDs(ctx, store.ApprovedMediaByIDsParams{EventID: e.ID, MediaIds: uniqueUUIDs(saved.MediaIDs)})
+	if len(lookup) > 0 {
+		rows, err := q.ApprovedMediaByIDs(ctx, store.ApprovedMediaByIDsParams{EventID: e.ID, MediaIds: uniqueUUIDs(lookup)})
 		if err != nil {
 			return eventResp{}, fmt.Errorf("load media for event %s: %w", e.ID, err)
 		}
@@ -297,7 +351,9 @@ func (s *Server) buildEventResponse(ctx context.Context, q *store.Queries, row e
 			ID: e.TemplateID, Slug: row.TemplateSlug, Name: row.TemplateName,
 			Version: e.TemplateVersion, LatestVersion: row.LatestVersion,
 		},
-		Content: saved.JSON, Overrides: ov, Theme: theme, Media: media, URL: url,
+		Content: saved.JSON, Overrides: ov, Theme: theme, Media: media,
+		ShareImage: shareImageResp{Source: e.ShareImage, MediaID: e.ShareMediaID},
+		URL:        url,
 	}, nil
 }
 
@@ -685,6 +741,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 		Content      json.RawMessage `json:"content"`
 		Overrides    json.RawMessage `json:"overrides"`
 		TemplateSlug *string         `json:"template_slug"`
+		ShareImage   *shareImageReq  `json:"share_image"`
 	}
 	if !decodeJSONMax(w, r, &body, maxPatchBodyBytes) {
 		return
@@ -693,6 +750,17 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 		writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "version is required.",
 			[]content.Issue{{Path: "version", Code: "required", Message: "This field is required."}})
 		return
+	}
+	var shareSource *string
+	var shareMediaID *uuid.UUID
+	shareChanged := body.ShareImage != nil
+	if shareChanged {
+		id, issue := validateShareImage(*body.ShareImage)
+		if issue != nil {
+			writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the link preview image.", []content.Issue{*issue})
+			return
+		}
+		shareSource, shareMediaID = &body.ShareImage.Source, id
 	}
 
 	row, ok, err := s.loadEventRow(r, eventID)
@@ -765,6 +833,38 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		contentJSON, title, startsAt, endsAt, mediaIDs = saved.JSON, saved.Title, saved.StartsAt, saved.EffectiveEnd(), saved.MediaIDs
+	} else if shareChanged {
+		// The media sync below needs the content's references. Without new
+		// content they come from the row loaded above, which is the row the
+		// update writes only if its version is the one sent (the update is
+		// version-guarded, so a match here still holds at write time).
+		if row.Event.Version != body.Version {
+			writeEventWriteError(w, r, &versionConflictError{current: row.Event.Version})
+			return
+		}
+		occ, err := s.loadOccasion(ctx, s.q, row.Event.OccasionSlug)
+		if err != nil {
+			serverError(w, r, err)
+			return
+		}
+		saved, err := content.ParseStored(row.Event.Content, occ)
+		if err != nil {
+			serverError(w, r, fmt.Errorf("parse stored content for event %s: %w", eventID, err))
+			return
+		}
+		mediaIDs = saved.MediaIDs
+	}
+
+	if shareMediaID != nil {
+		approved, err := s.q.ApprovedMediaByIDs(ctx, store.ApprovedMediaByIDsParams{EventID: eventID, MediaIds: []uuid.UUID{*shareMediaID}})
+		if err != nil {
+			serverError(w, r, fmt.Errorf("check share image media: %w", err))
+			return
+		}
+		if len(approved) != 1 {
+			writeInvalidShareMedia(w)
+			return
+		}
 	}
 
 	var overridesJSON []byte
@@ -787,6 +887,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 			_, err := q.UpdateEventContent(ctx, store.UpdateEventContentParams{
 				Content: contentJSON, Title: title, StartsAt: startsAt, EndsAt: endsAt, Overrides: overridesJSON,
 				TemplateID: templateID, TemplateVersion: templateVersion,
+				ShareImage: shareSource, ShareMediaID: shareMediaID,
 				EventID: eventID, Version: body.Version, UserID: userID,
 			})
 			if err != nil {
@@ -796,19 +897,25 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 			_, err := q.UpdateAnonDraftContent(ctx, store.UpdateAnonDraftContentParams{
 				Content: contentJSON, Title: title, StartsAt: startsAt, EndsAt: endsAt, Overrides: overridesJSON,
 				TemplateID: templateID, TemplateVersion: templateVersion,
+				ShareImage: shareSource, ShareMediaID: shareMediaID,
 				EventID: eventID, Version: body.Version, CookieHash: cookieHash,
 			})
 			if err != nil {
 				return err
 			}
 		}
-		if contentChanged {
+		if contentChanged || shareChanged {
 			if err := q.SyncMediaDetached(ctx, store.SyncMediaDetachedParams{EventID: eventID, Referenced: mediaIDs}); err != nil {
 				return fmt.Errorf("sync media detached: %w", err)
 			}
 		}
 		return nil
 	})
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == "events_share_media_fkey" {
+		writeInvalidShareMedia(w)
+		return
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		var wErr error
 		if authed {

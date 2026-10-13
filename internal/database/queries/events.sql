@@ -114,6 +114,8 @@ GROUP BY r.event_id;
 -- and clears the reminder so the new end gets its own. A template change must
 -- resolve (with the unchanged half) to a selectable pin; leaving both NULL keeps an existing pin even
 -- if that template has since become premium or retired. An unselectable pin updates no row.
+-- NULL share_image leaves the share image unchanged; otherwise share_image and share_media_id are set
+-- together (the caller checked the media id; events_share_media_fkey is the source of truth).
 UPDATE events e
 SET content = coalesce(sqlc.narg(content), e.content),
     title = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.title ELSE @title::text END,
@@ -135,6 +137,8 @@ SET content = coalesce(sqlc.narg(content), e.content),
     overrides = coalesce(sqlc.narg(overrides), e.overrides),
     template_id = coalesce(sqlc.narg(template_id), e.template_id),
     template_version = coalesce(sqlc.narg(template_version), e.template_version),
+    share_image = coalesce(sqlc.narg(share_image)::text, e.share_image),
+    share_media_id = CASE WHEN sqlc.narg(share_image)::text IS NULL THEN e.share_media_id ELSE sqlc.narg(share_media_id)::uuid END,
     version = e.version + 1,
     updated_at = now()
 WHERE e.id = @event_id
@@ -153,7 +157,7 @@ WHERE e.id = @event_id
 RETURNING e.version, e.updated_at;
 
 -- name: UpdateAnonDraftContent :one
--- Same derived-field and template-pin rules as UpdateEventContent.
+-- Same derived-field, template-pin and share-image rules as UpdateEventContent.
 UPDATE events e
 SET content = coalesce(sqlc.narg(content), e.content),
     title = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.title ELSE @title::text END,
@@ -175,6 +179,8 @@ SET content = coalesce(sqlc.narg(content), e.content),
     overrides = coalesce(sqlc.narg(overrides), e.overrides),
     template_id = coalesce(sqlc.narg(template_id), e.template_id),
     template_version = coalesce(sqlc.narg(template_version), e.template_version),
+    share_image = coalesce(sqlc.narg(share_image)::text, e.share_image),
+    share_media_id = CASE WHEN sqlc.narg(share_image)::text IS NULL THEN e.share_media_id ELSE sqlc.narg(share_media_id)::uuid END,
     version = e.version + 1,
     updated_at = now()
 WHERE e.id = @event_id
@@ -305,6 +311,7 @@ WHERE event_id = ANY(@event_ids::uuid[]) AND owner_id IS NULL;
 -- Public page. password_hash is only for the Go-side gate and must never be serialised.
 SELECT e.id, e.slug, e.title, e.occasion_slug, e.content, e.overrides, e.visibility, e.password_hash,
        e.rsvp_mode, e.remove_branding, e.starts_at, e.template_id, e.template_version,
+       e.share_image, e.share_media_id,
        tv.manifest, tv.assets_path,
        sqlc.embed(o)
 FROM events e

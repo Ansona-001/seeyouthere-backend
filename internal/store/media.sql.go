@@ -265,7 +265,8 @@ type DeleteEventMediaRow struct {
 	ModerationStatus string    `json:"moderation_status"`
 }
 
-// Owner or editor. The caller has already checked the media isn't referenced by content.
+// Owner or editor. The caller has already checked the media isn't referenced by content or set as
+// the share image (a share image set meanwhile is cleared by events_share_media_fkey).
 func (q *Queries) DeleteEventMedia(ctx context.Context, arg DeleteEventMediaParams) (DeleteEventMediaRow, error) {
 	row := q.db.QueryRow(ctx, deleteEventMedia, arg.MediaID, arg.EventID, arg.UserID)
 	var i DeleteEventMediaRow
@@ -873,11 +874,14 @@ func (q *Queries) SetGuestMediaModeration(ctx context.Context, arg SetGuestMedia
 }
 
 const syncMediaDetached = `-- name: SyncMediaDetached :exec
-UPDATE media
-SET detached_at = CASE WHEN id = ANY($1::uuid[]) THEN NULL ELSE now() END
-WHERE event_id = $2
-  AND uploaded_by = 'host'
-  AND (id = ANY($1::uuid[])) = (detached_at IS NOT NULL)
+UPDATE media m
+SET detached_at = CASE WHEN coalesce(m.id = ANY($1::uuid[]), false) OR m.id IS NOT DISTINCT FROM e.share_media_id
+                       THEN NULL ELSE now() END
+FROM events e
+WHERE e.id = $2
+  AND m.event_id = $2
+  AND m.uploaded_by = 'host'
+  AND (coalesce(m.id = ANY($1::uuid[]), false) OR m.id IS NOT DISTINCT FROM e.share_media_id) = (m.detached_at IS NOT NULL)
 `
 
 type SyncMediaDetachedParams struct {
@@ -885,8 +889,10 @@ type SyncMediaDetachedParams struct {
 	EventID    uuid.UUID   `json:"event_id"`
 }
 
-// After a content save: referenced host media are attached, the rest get a detached_at (kept if
-// already set). Only rows whose state actually changes are written.
+// After a content or share-image save: host media referenced by the content or set as the event's
+// share image are attached, the rest get a detached_at (kept if already set). Only rows whose state
+// actually changes are written. Reads share_media_id as written earlier in the same transaction.
+// coalesce: a Go nil slice arrives as a NULL array, and ANY(NULL) is NULL, not false.
 func (q *Queries) SyncMediaDetached(ctx context.Context, arg SyncMediaDetachedParams) error {
 	_, err := q.db.Exec(ctx, syncMediaDetached, arg.Referenced, arg.EventID)
 	return err

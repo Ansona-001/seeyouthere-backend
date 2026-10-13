@@ -163,7 +163,8 @@ RETURNING m.id, m.event_id, m.width, m.height, m.size_bytes, m.uploaded_by, m.mo
           prev.moderation_status AS old_status;
 
 -- name: DeleteEventMedia :one
--- Owner or editor. The caller has already checked the media isn't referenced by content.
+-- Owner or editor. The caller has already checked the media isn't referenced by content or set as
+-- the share image (a share image set meanwhile is cleared by events_share_media_fkey).
 DELETE FROM media m
 WHERE m.id = @media_id::uuid
   AND m.event_id = @event_id::uuid
@@ -177,13 +178,18 @@ FROM media
 WHERE event_id = @event_id AND id = ANY(@media_ids::uuid[]) AND moderation_status = 'approved';
 
 -- name: SyncMediaDetached :exec
--- After a content save: referenced host media are attached, the rest get a detached_at (kept if
--- already set). Only rows whose state actually changes are written.
-UPDATE media
-SET detached_at = CASE WHEN id = ANY(@referenced::uuid[]) THEN NULL ELSE now() END
-WHERE event_id = @event_id
-  AND uploaded_by = 'host'
-  AND (id = ANY(@referenced::uuid[])) = (detached_at IS NOT NULL);
+-- After a content or share-image save: host media referenced by the content or set as the event's
+-- share image are attached, the rest get a detached_at (kept if already set). Only rows whose state
+-- actually changes are written. Reads share_media_id as written earlier in the same transaction.
+-- coalesce: a Go nil slice arrives as a NULL array, and ANY(NULL) is NULL, not false.
+UPDATE media m
+SET detached_at = CASE WHEN coalesce(m.id = ANY(@referenced::uuid[]), false) OR m.id IS NOT DISTINCT FROM e.share_media_id
+                       THEN NULL ELSE now() END
+FROM events e
+WHERE e.id = @event_id
+  AND m.event_id = @event_id
+  AND m.uploaded_by = 'host'
+  AND (coalesce(m.id = ANY(@referenced::uuid[]), false) OR m.id IS NOT DISTINCT FROM e.share_media_id) = (m.detached_at IS NOT NULL);
 
 -- name: ListApprovedGuestPhotos :many
 -- Public photo wall, newest first (media_event_approved_guest_idx).
