@@ -165,9 +165,10 @@ func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) err
 	slog.InfoContext(ctx, "cleanup", "rejected_media_rows", totalRejected)
 
 	// Event retention, on events.retention_from (the end, but never earlier
-	// than the last edit that moved it): remind owners 27+ days after it,
-	// soft-delete 30+ days after it once the reminder was delivered 3+ days
-	// ago (or claimed 10+ days ago), then hard-delete (files first) events
+	// than the last edit that moved it): remind owners retentionAfterEnd -
+	// retentionReminderLead (2 days) after it, soft-delete retentionAfterEnd
+	// (5 days) after it once the reminder was delivered retentionReminderLead
+	// ago (or claimed retentionReminderFallback ago), then hard-delete events
 	// soft-deleted 30+ days ago, or retention-expired ones right away.
 	reminded, err := w.remindRetention(ctx, now)
 	if err != nil {

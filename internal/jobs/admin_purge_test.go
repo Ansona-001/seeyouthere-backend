@@ -17,10 +17,10 @@ func (f retentionFixture) purgeWorker() *AdminPurgeEventWorker {
 	return &AdminPurgeEventWorker{Pool: f.pool, Queries: f.q, Media: f.deleter}
 }
 
-func purgeJob(eventID uuid.UUID, attempt, maxAttempts int) *river.Job[AdminPurgeEventArgs] {
+func purgeJob(eventID uuid.UUID, attempt, maxAttempts int, keepIfHeld bool) *river.Job[AdminPurgeEventArgs] {
 	return &river.Job[AdminPurgeEventArgs]{
 		JobRow: &rivertype.JobRow{Attempt: attempt, MaxAttempts: maxAttempts},
-		Args:   AdminPurgeEventArgs{EventID: eventID},
+		Args:   AdminPurgeEventArgs{EventID: eventID, KeepIfHeld: keepIfHeld},
 	}
 }
 
@@ -40,6 +40,7 @@ func TestAdminPurgeEventWorker(t *testing.T) {
 		// setup prepares the event and returns its id.
 		setup       func(t *testing.T, f retentionFixture, owner uuid.UUID) uuid.UUID
 		failFiles   bool
+		keepIfHeld  bool // an owner's delete: moderation holds keep the event
 		attempt     int
 		wantErr     bool
 		wantGone    bool
@@ -66,6 +67,40 @@ func TestAdminPurgeEventWorker(t *testing.T) {
 				return id
 			},
 			wantGone: true, wantFiles: 1, wantRowSeen: true,
+		},
+		{
+			name: "owner delete: a plain soft-deleted event is purged at once",
+			setup: func(t *testing.T, f retentionFixture, owner uuid.UUID) uuid.UUID {
+				id := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(24 * time.Hour)})
+				f.insertMedia(t, id, "approved")
+				f.exec(t, "UPDATE events SET deleted_at = now() WHERE id = $1", id)
+				return id
+			},
+			keepIfHeld: true,
+			wantGone:   true, wantFiles: 1, wantRowSeen: true,
+		},
+		{
+			name: "owner delete: an open report keeps the event and its files",
+			setup: func(t *testing.T, f retentionFixture, owner uuid.UUID) uuid.UUID {
+				id := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(24 * time.Hour)})
+				f.insertMedia(t, id, "approved")
+				f.report(t, id, "open")
+				f.exec(t, "UPDATE events SET deleted_at = now() WHERE id = $1", id)
+				return id
+			},
+			keepIfHeld: true,
+			wantGone:   false, wantFiles: 0,
+		},
+		{
+			name: "owner delete: a taken-down event is kept as evidence",
+			setup: func(t *testing.T, f retentionFixture, owner uuid.UUID) uuid.UUID {
+				id := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(24 * time.Hour)})
+				f.insertMedia(t, id, "approved")
+				f.exec(t, "UPDATE events SET status = 'taken_down', slug = $2, deleted_at = now() WHERE id = $1", id, "purge-keep-"+id.String()[:8])
+				return id
+			},
+			keepIfHeld: true,
+			wantGone:   false, wantFiles: 0,
 		},
 		{
 			name: "anonymous draft purged when soft-deleted",
@@ -129,7 +164,7 @@ func TestAdminPurgeEventWorker(t *testing.T) {
 			if attempt == 0 {
 				attempt = 1
 			}
-			err := f.purgeWorker().Work(context.Background(), purgeJob(id, attempt, 25))
+			err := f.purgeWorker().Work(context.Background(), purgeJob(id, attempt, 25, tt.keepIfHeld))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Work error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -183,7 +218,7 @@ func TestAdminPurgeEventWorker_RetryAndRerun(t *testing.T) {
 	ctx := context.Background()
 
 	f.deleter.failFor = map[uuid.UUID]bool{id: true}
-	if err := w.Work(ctx, purgeJob(id, 1, 25)); err == nil {
+	if err := w.Work(ctx, purgeJob(id, 1, 25, false)); err == nil {
 		t.Fatal("first attempt with failing storage returned nil")
 	}
 	if !f.eventExists(t, id) {
@@ -191,7 +226,7 @@ func TestAdminPurgeEventWorker_RetryAndRerun(t *testing.T) {
 	}
 
 	f.deleter.failFor = nil
-	if err := w.Work(ctx, purgeJob(id, 2, 25)); err != nil {
+	if err := w.Work(ctx, purgeJob(id, 2, 25, false)); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	if f.eventExists(t, id) {
@@ -199,7 +234,7 @@ func TestAdminPurgeEventWorker_RetryAndRerun(t *testing.T) {
 	}
 
 	calls := len(f.deleter.calls)
-	if err := w.Work(ctx, purgeJob(id, 1, 25)); err != nil {
+	if err := w.Work(ctx, purgeJob(id, 1, 25, false)); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
 	if len(f.deleter.calls) != calls {
@@ -278,7 +313,7 @@ func TestEventScopedWorkers_NoopForDeletedEvent(t *testing.T) {
 	f.exec(t, "UPDATE events SET deleted_at = now() WHERE id = $1", id)
 	run(t, "soft-deleted")
 
-	if err := f.purgeWorker().Work(ctx, purgeJob(id, 1, 25)); err != nil {
+	if err := f.purgeWorker().Work(ctx, purgeJob(id, 1, 25, false)); err != nil {
 		t.Fatalf("purge: %v", err)
 	}
 	if f.eventExists(t, id) {

@@ -143,7 +143,7 @@ func createTestEvent(t *testing.T, ctx context.Context, q *store.Queries, occasi
 	// birthday's setup question "name" is required (title_template
 	// "{name}'s birthday"); other seeded occasions have their own required
 	// answers, so this helper is only exercised with occasionSlug "birthday".
-	built, err := content.BuildInitialContent(occ, map[string]string{"name": "Sam"})
+	built, err := content.BuildInitialContent(occ, map[string]string{"name": "Sam", "venue": "The Hall"})
 	if err != nil {
 		t.Fatalf("build initial content: %v", err)
 	}
@@ -600,6 +600,17 @@ func TestHandleDeleteEvent_EnqueuesMediaVisibilityJob(t *testing.T) {
 		return n
 	}
 
+	countPurgeJobs := func(eventID uuid.UUID) int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			"SELECT count(*) FROM river_job WHERE kind = 'admin_purge_event' AND args->>'event_id' = $1 AND (args->>'keep_if_held')::bool",
+			eventID.String(),
+		).Scan(&n); err != nil {
+			t.Fatalf("count admin_purge_event jobs: %v", err)
+		}
+		return n
+	}
+
 	t.Run("owner delete", func(t *testing.T) {
 		req := requestAs(http.MethodDelete, "/", f.ownerID)
 		req = withRouteID(req, f.eventID)
@@ -610,6 +621,9 @@ func TestHandleDeleteEvent_EnqueuesMediaVisibilityJob(t *testing.T) {
 		}
 		if n := countMediaJobs(f.eventID); n != 1 {
 			t.Errorf("media_visibility jobs for %s = %d, want 1", f.eventID, n)
+		}
+		if n := countPurgeJobs(f.eventID); n != 1 {
+			t.Errorf("immediate purge jobs for %s = %d, want 1", f.eventID, n)
 		}
 	})
 
@@ -641,6 +655,9 @@ func TestHandleDeleteEvent_EnqueuesMediaVisibilityJob(t *testing.T) {
 		}
 		if n := countMediaJobs(draft.ID); n != 1 {
 			t.Errorf("media_visibility jobs for %s = %d, want 1", draft.ID, n)
+		}
+		if n := countPurgeJobs(draft.ID); n != 1 {
+			t.Errorf("immediate purge jobs for %s = %d, want 1", draft.ID, n)
 		}
 	})
 }
@@ -725,5 +742,49 @@ func TestHandlePatchEvent_EndsAt(t *testing.T) {
 		case st.wantEnds != nil && (ends == nil || !ends.Equal(*st.wantEnds)):
 			t.Errorf("%s: ends_at = %v, want %v", st.name, ends, st.wantEnds)
 		}
+	}
+}
+
+// TestSeededOccasionsRequireVenue guards migration 00012: every occasion that asks for a venue (or the
+// housewarming address) must refuse an empty answer.
+func TestSeededOccasionsRequireVenue(t *testing.T) {
+	pool := dbTestPool(t)
+	ctx := context.Background()
+	q := store.New(pool)
+
+	// occasion slug -> the required answers other than the venue, and the venue question's key.
+	cases := []struct {
+		slug    string
+		answers map[string]string
+		venue   string
+	}{
+		{"wedding", map[string]string{"name_1": "Ada", "name_2": "Grace"}, "venue"},
+		{"engagement", map[string]string{"name_1": "Ada", "name_2": "Grace"}, "venue"},
+		{"birthday", map[string]string{"name": "Sam"}, "venue"},
+		{"baby-shower", map[string]string{"name": "Sam"}, "venue"},
+		{"housewarming", map[string]string{"host": "Sam"}, "address"},
+		{"party", map[string]string{"title": "Summer party"}, "venue"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.slug, func(t *testing.T) {
+			row, err := q.GetOccasion(ctx, tc.slug)
+			if err != nil {
+				t.Fatalf("get occasion: %v", err)
+			}
+			occ, err := content.ParseOccasion(row)
+			if err != nil {
+				t.Fatalf("parse occasion: %v", err)
+			}
+			if _, err := content.BuildInitialContent(occ, tc.answers); err == nil {
+				t.Errorf("created without %s, want a required error", tc.venue)
+			}
+			withVenue := map[string]string{tc.venue: "The Hall"}
+			for k, v := range tc.answers {
+				withVenue[k] = v
+			}
+			if _, err := content.BuildInitialContent(occ, withVenue); err != nil {
+				t.Errorf("creating with %s: %v", tc.venue, err)
+			}
+		})
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/content"
 	"github.com/ansonarose/seeyouthere-backend/internal/jobs"
@@ -123,6 +124,13 @@ func (s *Server) handleCreateReport(w http.ResponseWriter, r *http.Request) {
 		_, err = s.jobs.InsertTx(ctx, tx, jobs.NotifyReportArgs{EventID: row.ID}, nil)
 		return err
 	})
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+		// The event was purged between the lookup and the insert (an owner delete finishes within moments);
+		// same answer as for an unknown event.
+		writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+		return
+	}
 	if err != nil {
 		serverError(w, r, err)
 		return
