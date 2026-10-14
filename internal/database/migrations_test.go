@@ -445,7 +445,8 @@ func TestMigration00007_SeedV2Themes(t *testing.T) {
 		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
 	}
 
-	if _, err := provider.Up(ctx); err != nil {
+	// Stop at 7: later migrations retag the seeded templates, which checkSeeded compares against 00007's tags.
+	if _, err := provider.UpTo(ctx, 7); err != nil {
 		t.Fatalf("up again: %v", err)
 	}
 	checkSeeded()

@@ -143,7 +143,7 @@ func createTestEvent(t *testing.T, ctx context.Context, q *store.Queries, occasi
 	// birthday's setup question "name" is required (title_template
 	// "{name}'s birthday"); other seeded occasions have their own required
 	// answers, so this helper is only exercised with occasionSlug "birthday".
-	built, err := content.BuildInitialContent(occ, map[string]string{"name": "Sam", "venue": "The Hall"})
+	built, err := content.BuildInitialContent(occ, map[string]string{"name": "Sam", "date": seedTestDate, "venue": "The Hall"})
 	if err != nil {
 		t.Fatalf("build initial content: %v", err)
 	}
@@ -745,8 +745,11 @@ func TestHandlePatchEvent_EndsAt(t *testing.T) {
 	}
 }
 
-// TestSeededOccasionsRequireVenue guards migration 00012: every occasion that asks for a venue (or the
-// housewarming address) must refuse an empty answer.
+// seedTestDate is a valid "date" setup answer (wall-clock local format) for tests that create events.
+const seedTestDate = "2099-06-12T18:00"
+
+// TestSeededOccasionsRequireVenue guards migrations 00012 and 00013: every occasion must refuse an empty
+// venue (or the housewarming address) and an empty date.
 func TestSeededOccasionsRequireVenue(t *testing.T) {
 	pool := dbTestPool(t)
 	ctx := context.Background()
@@ -775,15 +778,23 @@ func TestSeededOccasionsRequireVenue(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse occasion: %v", err)
 			}
-			if _, err := content.BuildInitialContent(occ, tc.answers); err == nil {
+			// Each required answer is refused when missing on its own; the full set is accepted.
+			withDate := map[string]string{"date": seedTestDate}
+			withVenue := map[string]string{tc.venue: "The Hall"}
+			full := map[string]string{"date": seedTestDate, tc.venue: "The Hall"}
+			for k, v := range tc.answers {
+				withDate[k] = v
+				withVenue[k] = v
+				full[k] = v
+			}
+			if _, err := content.BuildInitialContent(occ, withDate); err == nil {
 				t.Errorf("created without %s, want a required error", tc.venue)
 			}
-			withVenue := map[string]string{tc.venue: "The Hall"}
-			for k, v := range tc.answers {
-				withVenue[k] = v
+			if _, err := content.BuildInitialContent(occ, withVenue); err == nil {
+				t.Error("created without a date, want a required error")
 			}
-			if _, err := content.BuildInitialContent(occ, withVenue); err != nil {
-				t.Errorf("creating with %s: %v", tc.venue, err)
+			if _, err := content.BuildInitialContent(occ, full); err != nil {
+				t.Errorf("creating with %s and a date: %v", tc.venue, err)
 			}
 		})
 	}
