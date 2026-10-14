@@ -60,7 +60,7 @@ func ownedEventCount(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) int {
 }
 
 func createEventRequest(userID uuid.UUID) *http.Request {
-	req := httptest.NewRequest(http.MethodPost, "/", newJSONBody(`{"occasion_slug":"birthday","answers":{"name":"Sam"}}`))
+	req := httptest.NewRequest(http.MethodPost, "/", newJSONBody(`{"occasion_slug":"birthday","answers":{"name":"Sam","venue":"The Hall"}}`))
 	req.Header.Set("Content-Type", "application/json")
 	return req.WithContext(contextWithUser(req.Context(), userID))
 }

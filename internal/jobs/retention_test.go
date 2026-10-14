@@ -243,21 +243,21 @@ func TestRemindRetention(t *testing.T) {
 	now := time.Now()
 	owner, _ := f.newUser(t)
 
-	due := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-28 * day)})
-	tooRecent := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-26 * day)})
-	takenDown := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-28 * day)})
+	due := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-3 * day)})
+	tooRecent := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-1 * day)})
+	takenDown := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-3 * day)})
 	f.exec(t, "UPDATE events SET status = 'taken_down', slug = 'rt-' || id::text WHERE id = $1", takenDown)
-	ownerless := f.newEvent(t, retentionEvent{endsAt: now.Add(-28 * day)})
-	softDeleted := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-28 * day)})
+	ownerless := f.newEvent(t, retentionEvent{endsAt: now.Add(-3 * day)})
+	softDeleted := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-3 * day)})
 	f.exec(t, "UPDATE events SET deleted_at = now() WHERE id = $1", softDeleted)
 	// Back-dated at creation: its end is long past but its retention clock
 	// started now, so it must not be reminded.
 	backDated := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-60 * day), createdAnchor: true})
-	openReport := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-28 * day)})
+	openReport := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-3 * day)})
 	f.report(t, openReport, "open")
-	reviewing := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-28 * day)})
+	reviewing := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-3 * day)})
 	f.report(t, reviewing, "reviewing")
-	dismissed := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-28 * day)})
+	dismissed := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-3 * day)})
 	f.report(t, dismissed, "dismissed")
 
 	if _, err := f.worker.remindRetention(ctx, now); err != nil {
@@ -286,7 +286,7 @@ func TestRemindRetention(t *testing.T) {
 	}
 
 	for name, id := range map[string]uuid.UUID{
-		"ended 26 days ago": tooRecent, "taken down": takenDown, "ownerless": ownerless, "soft-deleted": softDeleted,
+		"ended 1 day ago": tooRecent, "taken down": takenDown, "ownerless": ownerless, "soft-deleted": softDeleted,
 		"back-dated at creation": backDated, "open report": openReport, "reviewing report": reviewing,
 	} {
 		if n, _, _ := f.reminderJobs(t, id); n != 0 {
@@ -325,22 +325,22 @@ func TestExpireEndedEvents(t *testing.T) {
 	now := time.Now()
 	owner, _ := f.newUser(t)
 
-	ended := now.Add(-31 * day)
+	ended := now.Add(-8 * day)
 	at := func(ago time.Duration) *time.Time { t := now.Add(-ago); return &t }
 
 	ready := f.newEvent(t, retentionEvent{owner: &owner, endsAt: ended})
 	f.remind(t, ready, now.Add(-4*day), at(4*day))
 	sentTooRecently := f.newEvent(t, retentionEvent{owner: &owner, endsAt: ended})
 	f.remind(t, sentTooRecently, now.Add(-4*day), at(2*day))
-	// Claimed 4 days ago but the email never went out: kept until the fallback.
+	// Claimed 3 days ago but the email never went out: kept until the fallback (4 days).
 	undelivered := f.newEvent(t, retentionEvent{owner: &owner, endsAt: ended})
-	f.remind(t, undelivered, now.Add(-4*day), nil)
+	f.remind(t, undelivered, now.Add(-3*day), nil)
 	undeliveredLong := f.newEvent(t, retentionEvent{owner: &owner, endsAt: ended})
-	f.remind(t, undeliveredLong, now.Add(-11*day), nil)
+	f.remind(t, undeliveredLong, now.Add(-5*day), nil)
 	undeliveredFallbackNotYet := f.newEvent(t, retentionEvent{owner: &owner, endsAt: ended})
-	f.remind(t, undeliveredFallbackNotYet, now.Add(-9*day), nil)
+	f.remind(t, undeliveredFallbackNotYet, now.Add(-2*day), nil)
 	neverReminded := f.newEvent(t, retentionEvent{owner: &owner, endsAt: ended})
-	notEndedLongEnough := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-29 * day)})
+	notEndedLongEnough := f.newEvent(t, retentionEvent{owner: &owner, endsAt: now.Add(-4 * day)})
 	f.remind(t, notEndedLongEnough, now.Add(-4*day), at(4*day))
 	openReport := f.newEvent(t, retentionEvent{owner: &owner, endsAt: ended})
 	f.remind(t, openReport, now.Add(-4*day), at(4*day))
@@ -358,16 +358,16 @@ func TestExpireEndedEvents(t *testing.T) {
 		t.Fatalf("expireEndedEvents: %v", err)
 	}
 	for name, id := range map[string]uuid.UUID{
-		"delivered 4d ago": ready, "undelivered, claimed 11d ago": undeliveredLong, "dismissed report": dismissed,
+		"delivered 4d ago": ready, "undelivered, claimed 5d ago": undeliveredLong, "dismissed report": dismissed,
 	} {
 		if !slices.Contains(ids, id) {
 			t.Errorf("%s: not expired, want expired; got %v", name, ids)
 		}
 	}
 	for name, id := range map[string]uuid.UUID{
-		"delivered 2d ago": sentTooRecently, "undelivered, claimed 4d ago": undelivered,
-		"undelivered, claimed 9d ago": undeliveredFallbackNotYet, "never reminded": neverReminded,
-		"ended 29d ago": notEndedLongEnough, "open report": openReport, "back-dated": backDated,
+		"delivered 2d ago": sentTooRecently, "undelivered, claimed 3d ago": undelivered,
+		"undelivered, claimed 2d ago": undeliveredFallbackNotYet, "never reminded": neverReminded,
+		"ended 4d ago": notEndedLongEnough, "open report": openReport, "back-dated": backDated,
 	} {
 		if slices.Contains(ids, id) {
 			t.Errorf("%s: expired, want kept", name)
@@ -617,15 +617,15 @@ func TestRetentionReminderWorker(t *testing.T) {
 	t.Cleanup(func() { rdb.Del(context.Background(), globalKey) })
 	owner, ownerEmail := f.newUser(t)
 
-	// An event that ended long ago: its end+30d is in the past, so the
+	// An event that ended long ago: its end+5d is in the past, so the
 	// stated deletion date is the clamp, retentionReminderLead from now.
 	endsAt := time.Now().Add(-50 * day)
 	remindedOnTime := time.Now().Add(-3 * day)
 	remindedLate := remindedOnTime.Add(day)
 	sentAt := remindedOnTime.Add(time.Minute)
-	// An event that ended 10 days ago is deleted on end+30d, which is later
+	// An event that ended 1 day ago is deleted on end+5d, which is later
 	// than the clamp.
-	recentEnd := time.Now().Add(-10 * day)
+	recentEnd := time.Now().Add(-1 * day)
 
 	tests := []struct {
 		name     string
@@ -645,7 +645,7 @@ func TestRetentionReminderWorker(t *testing.T) {
 		{name: "no timezone falls back to UTC", tz: "", reminded: &remindedOnTime, wantSend: true},
 		{name: "unknown timezone falls back to UTC", tz: "Not/AZone", reminded: &remindedOnTime, wantSend: true},
 		{name: "Local falls back to UTC", tz: "Local", reminded: &remindedOnTime, wantSend: true},
-		{name: "date is end plus 30 days when that is later", tz: "UTC", endsAt: recentEnd, reminded: &remindedOnTime, wantSend: true, wantAt: recentEnd.Add(retentionAfterEnd)},
+		{name: "date is end plus retention period when that is later", tz: "UTC", endsAt: recentEnd, reminded: &remindedOnTime, wantSend: true, wantAt: recentEnd.Add(retentionAfterEnd)},
 		{name: "CR and LF stripped from title", tz: "UTC", title: "Party\r\nBcc: evil@example.invalid", reminded: &remindedOnTime, wantSend: true},
 		{name: "not reminded", tz: "UTC", reminded: nil},
 		{name: "stale claim stamp", tz: "UTC", reminded: &remindedOnTime, stamp: &remindedLate},

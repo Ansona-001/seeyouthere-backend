@@ -20,7 +20,7 @@ import (
 
 const (
 	// retentionAfterEnd is how long after an event ends it is deleted.
-	retentionAfterEnd = 30 * 24 * time.Hour
+	retentionAfterEnd = 5 * 24 * time.Hour
 	// retentionReminderLead is how long before deletion the owner is
 	// reminded: an event is reminded once it ended retentionAfterEnd -
 	// retentionReminderLead ago, and deleted once it has also been reminded
@@ -29,7 +29,7 @@ const (
 	// retentionReminderFallback is how long after the claim an event expires
 	// even though its reminder was never delivered (undeliverable address,
 	// persistent SMTP failure), so it cannot be kept forever.
-	retentionReminderFallback = 10 * 24 * time.Hour
+	retentionReminderFallback = 4 * 24 * time.Hour
 	// deletedEventGrace is how long a soft-deleted event is kept before its
 	// rows and files are hard-deleted.
 	deletedEventGrace = 30 * 24 * time.Hour
@@ -109,7 +109,7 @@ func (w *RetentionReminderWorker) Timeout(*river.Job[RetentionReminderArgs]) tim
 // after would double-send whenever the mark fails.
 //
 // Trade-off: a marked claim counts as delivered, so the event expires
-// retentionReminderLead after the mark (once its 30 days are up), not through
+// retentionReminderLead after the mark (once its retention period is up), not through
 // the fallback, which only applies to claims that were never marked. A crash
 // between the mark and the send, a context error during the send, or a failed
 // unmark after a failed send can therefore delete the event that long after
@@ -195,11 +195,11 @@ func (w *RetentionReminderWorker) Work(ctx context.Context, job *river.Job[Reten
 		To:      row.OwnerEmail,
 		Subject: fmt.Sprintf("Your event will be deleted soon: %s", title),
 		Text: fmt.Sprintf(
-			"Your event \"%s\" has ended. Events are deleted 30 days after they end, together with their "+
+			"Your event \"%s\" has ended. Events are deleted %d days after they end, together with their "+
 				"guest list, responses and photos. Yours will be deleted on or after %s.\n\n"+
 				"Sign in to save anything you want to keep before then:\n%s/login\n\n"+
 				"See You There\n",
-			title, deleteAt.In(loc).Format("Monday, 2 January 2006"), w.SiteURL,
+			title, int(retentionAfterEnd/(24*time.Hour)), deleteAt.In(loc).Format("Monday, 2 January 2006"), w.SiteURL,
 		),
 	})
 	if err != nil {
