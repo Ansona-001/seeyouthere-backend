@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 )
@@ -162,6 +163,11 @@ func BuildInitialContent(occ Occasion, answers map[string]string) (json.RawMessa
 		switch b["type"] {
 		case "hero":
 			b["title"] = title
+			if cur, _ := b["badge"].(string); cur != "" {
+				if badge := badgeFromAnswers(answers); badge != "" {
+					b["badge"] = badge
+				}
+			}
 			if v, ok := sets["hero.subtitle"]; ok {
 				b["subtitle"] = v
 			}
@@ -191,4 +197,28 @@ func BuildInitialContent(occ Occasion, answers map[string]string) (json.RawMessa
 		return nil, err
 	}
 	return saved.JSON, nil
+}
+
+// badgeFromAnswers derives the hero badge (the monogram themes print on the hero) from the host's
+// names: "A&S" for a couple, "S" for a single host. It returns "" when there are no names to use,
+// so the occasion's default badge stays (e.g. the numeral on a birthday).
+func badgeFromAnswers(answers map[string]string) string {
+	first, second, host := initial(answers["name_1"]), initial(answers["name_2"]), initial(answers["host"])
+	switch {
+	case first != "" && second != "":
+		return first + "&" + second
+	case host != "":
+		return host
+	}
+	return ""
+}
+
+// initial returns the first letter or digit of s, upper-cased, or "".
+func initial(s string) string {
+	for _, r := range normalizeText(s) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return string(unicode.ToUpper(r))
+		}
+	}
+	return ""
 }
