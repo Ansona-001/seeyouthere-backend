@@ -97,7 +97,8 @@ type publicEventOpts struct {
 	rsvpMode    string // default "open"
 	password    string // non-empty sets visibility=password and hashes it (overrides visibility)
 	photosOpen  bool
-	unpublished bool // true leaves the event a draft (no slug gate to test, but useful for the 404 case)
+	wishes      string // "" = no wishes block, "open" or "closed" = a wishes block with that mode
+	unpublished bool   // true leaves the event a draft (no slug gate to test, but useful for the 404 case)
 }
 
 // publicEventFixture is a Server plus one event built and (by default)
@@ -114,13 +115,21 @@ type publicEventFixture struct {
 // (supplies the title), a datetime (supplies starts_at, required to publish),
 // an rsvp block using one of "birthday"'s occasion fields, and a
 // guest_photos block whose open flag the caller controls.
-func testEventContentJSON(photosOpen bool) string {
+func testEventContentJSON(photosOpen bool, wishes string) string {
+	wishesBlock := ""
+	switch wishes {
+	case "open":
+		wishesBlock = `,{"id":"wishes1","type":"wishes","kicker":"","heading":"Wishes","open":true,"items":[]}`
+	case "closed":
+		wishesBlock = `,{"id":"wishes1","type":"wishes","kicker":"","heading":"Wishes","open":false,"items":[{"message":"Hi","author":"Sam"}]}`
+	}
 	return fmt.Sprintf(`[
 		{"id":"hero1","type":"hero","title":"Sam's Party","subtitle":""},
 		{"id":"dt1","type":"datetime","heading":"","start_local":"2027-06-01T18:00","end_local":"","timezone":"America/New_York","all_day":false},
 		{"id":"rsvp1","type":"rsvp","heading":"RSVP","body":"","deadline_local":"","capacity":null,"max_party_size":4,"fields":[{"key":"dietary","required":false}],"questions":[]},
 		{"id":"photos1","type":"guest_photos","heading":"Photos","body":"","open":%t}
-	]`, photosOpen)
+		%s
+	]`, photosOpen, wishesBlock)
 }
 
 func newPublicEventFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, opts publicEventOpts) *publicEventFixture {
@@ -145,7 +154,7 @@ func newPublicEventFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, 
 	if err != nil {
 		t.Fatalf("parse occasion: %v", err)
 	}
-	saved, err := content.ValidateContent([]byte(testEventContentJSON(opts.photosOpen)), occ)
+	saved, err := content.ValidateContent([]byte(testEventContentJSON(opts.photosOpen, opts.wishes)), occ)
 	if err != nil {
 		t.Fatalf("validate content: %v", err)
 	}

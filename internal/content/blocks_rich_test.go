@@ -290,7 +290,7 @@ func TestValidateContent_Video_TooManyBlocks(t *testing.T) {
 func TestValidateContent_Wishes_CountBounds(t *testing.T) {
 	occ := richOccasion(t)
 	if _, err := ValidateContent(mustJSON(t, []map[string]any{wishesBlock("w1")}), occ); !hasIssueCode(err, "invalid_length") {
-		t.Fatalf("0 items should be invalid_length, got %v", err)
+		t.Fatalf("0 items, closed should be invalid_length, got %v", err)
 	}
 	var thirtyOne []map[string]any
 	for i := 0; i < 31; i++ {
@@ -305,6 +305,82 @@ func TestValidateContent_Wishes_CountBounds(t *testing.T) {
 	}
 	if _, err := ValidateContent(mustJSON(t, []map[string]any{wishesBlock("w1", thirty...)}), occ); err != nil {
 		t.Errorf("30 items should be valid: %v", err)
+	}
+}
+
+func TestValidateContent_Wishes_Open(t *testing.T) {
+	occ := richOccasion(t)
+	open := func(open any, items ...map[string]any) []byte {
+		b := wishesBlock("w1", items...)
+		if open != nil {
+			b["open"] = open
+		}
+		return mustJSON(t, []map[string]any{b})
+	}
+	tests := []struct {
+		name     string
+		raw      []byte
+		wantErr  bool
+		wantOpen bool
+	}{
+		{"open, no items", open(true), false, true},
+		{"open, one item", open(true, wish("Hi", "A")), false, true},
+		{"closed, one item", open(false, wish("Hi", "A")), false, false},
+		{"legacy without open field, one item", open(nil, wish("Hi", "A")), false, false},
+		{"closed, no items", open(false), true, false},
+		{"legacy without open field, no items", open(nil), true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			saved, err := ValidateContent(tt.raw, occ)
+			if tt.wantErr {
+				if !hasIssueCode(err, "invalid_length") {
+					t.Fatalf("want invalid_length, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saved.Wishes == nil || saved.Wishes.Open != tt.wantOpen {
+				t.Fatalf("Wishes = %+v, want open=%v", saved.Wishes, tt.wantOpen)
+			}
+			if strings.Contains(string(saved.JSON), `"items":null`) {
+				t.Fatalf("canonical JSON has null items: %s", saved.JSON)
+			}
+		})
+	}
+	saved, err := ValidateContent(mustJSON(t, []map[string]any{{"id": "h1", "type": "hero", "heading": "Hi"}}), occ)
+	if err == nil && saved.Wishes != nil {
+		t.Fatalf("no wishes block should leave Wishes nil")
+	}
+}
+
+func TestCleanText(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		max     int
+		newline bool
+		want    string
+		ok      bool
+	}{
+		{"trims", "  hi  ", 10, false, "hi", true},
+		{"blank", " \n ", 10, true, "", false},
+		{"too long", "abcdef", 5, false, "", false},
+		{"at limit", "abcde", 5, false, "abcde", true},
+		{"newline rejected", "a\nb", 10, false, "", false},
+		{"newline allowed, CRLF normalised", "a\r\nb", 10, true, "a\nb", true},
+		{"control", "a\x00b", 10, true, "", false},
+		{"bidi override", "a\u202eb", 10, true, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := CleanText(tt.in, tt.max, tt.newline)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("got (%q, %v), want (%q, %v)", got, ok, tt.want, tt.ok)
+			}
+		})
 	}
 }
 

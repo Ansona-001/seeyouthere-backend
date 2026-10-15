@@ -158,6 +158,16 @@ func (s *Server) Routes() http.Handler {
 					})
 				})
 
+				r.Route("/wishes", func(r chi.Router) {
+					r.Get("/", s.handleListEventWishes)
+					r.Delete("/", s.handleDeleteWishesByStatus)
+					r.Route("/{wishID}", func(r chi.Router) {
+						r.Post("/approve", s.handleApproveWish)
+						r.Post("/hide", s.handleHideWish)
+						r.Delete("/", s.handleDeleteWish)
+					})
+				})
+
 				r.Route("/guests", func(r chi.Router) {
 					r.Get("/", s.handleListGuests)
 					r.Post("/", s.handleCreateGuest)
@@ -201,6 +211,7 @@ func (s *Server) Routes() http.Handler {
 				r.Post("/unlock", s.handleUnlockPublicEvent)
 				r.Post("/reports", s.handleCreateReport)
 				r.Put("/rsvp", s.handlePutPublicRSVP)
+				r.Post("/wishes", s.handleCreateWish)
 			})
 			r.Post("/invites/accept", s.handleAcceptInvite)
 			r.Post("/rsvp-links/accept", s.handleAcceptRSVPLink)
