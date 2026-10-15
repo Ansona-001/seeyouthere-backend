@@ -36,6 +36,66 @@ func validateText(s string, maxRunes int, allowNewline bool) (code, message stri
 	return "", "", true
 }
 
+// Wish length bounds, shared by the block validator and the guest wish handler.
+const (
+	WishMessageMax = 500
+	WishAuthorMax  = 80
+)
+
+// CleanText normalises raw (trim, canonical line endings) and applies the text
+// rules for a field of at most maxRunes runes. ok is false for blank text, too
+// long text, disallowed control characters, or a line break when
+// allowNewline is false. It is stricter than validateText because it guards
+// guest input: it also rejects C1 controls, line/paragraph separators, format
+// characters other than ZWNJ/ZWJ (needed by several scripts and emoji
+// sequences), runs of more than maxCombiningRun combining marks (Zalgo), and
+// text with no visible letter, number, punctuation or symbol (zero-width or
+// filler-only). The returned string is the stored form.
+func CleanText(raw string, maxRunes int, allowNewline bool) (string, bool) {
+	s := normalizeText(raw)
+	if s == "" {
+		return "", false
+	}
+	if _, _, ok := validateText(s, maxRunes, allowNewline); !ok {
+		return "", false
+	}
+	if !isCleanGuestText(s) {
+		return "", false
+	}
+	return s, true
+}
+
+// maxCombiningRun is the longest run of consecutive nonspacing marks accepted
+// in guest text; real scripts need a handful, stacked "Zalgo" marks need more.
+const maxCombiningRun = 4
+
+// isCleanGuestText applies the extra guest-text rules on top of validateText.
+func isCleanGuestText(s string) bool {
+	visible := false
+	run := 0
+	for _, r := range s {
+		if unicode.Is(unicode.Mn, r) {
+			if run++; run > maxCombiningRun {
+				return false
+			}
+		} else {
+			run = 0
+		}
+		switch {
+		case unicode.Is(unicode.Cc, r) && r != '\n',
+			unicode.Is(unicode.Zl, r), unicode.Is(unicode.Zp, r):
+			return false
+		case unicode.Is(unicode.Cf, r):
+			if r != 0x200C && r != 0x200D {
+				return false
+			}
+		case unicode.IsLetter(r), unicode.IsNumber(r), unicode.IsPunct(r), unicode.IsSymbol(r):
+			visible = true
+		}
+	}
+	return visible
+}
+
 func isDisallowedControl(r rune) bool {
 	return (r < 0x20 && r != '\n') || r == 0x7f
 }

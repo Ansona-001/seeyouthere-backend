@@ -71,6 +71,16 @@ type EventMember struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type EventWish struct {
+	ID        uuid.UUID `json:"id"`
+	EventID   uuid.UUID `json:"event_id"`
+	Author    string    `json:"author"`
+	Message   string    `json:"message"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type Guest struct {
 	ID            uuid.UUID  `json:"id"`
 	EventID       uuid.UUID  `json:"event_id"`

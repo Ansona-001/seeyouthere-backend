@@ -409,6 +409,14 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	wishes := []publicWishResp{}
+	if saved.Wishes != nil {
+		if wishes, err = s.listApprovedWishes(r, row.ID); err != nil {
+			serverError(w, r, err)
+			return
+		}
+	}
+
 	resp := publicEventResp{
 		ID: row.ID, Slug: *row.Slug, Title: row.Title, OccasionSlug: row.OccasionSlug,
 		Visibility: row.Visibility, RsvpMode: row.RsvpMode, StartsAt: row.StartsAt,
@@ -422,6 +430,7 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 		"event":  resp,
 		"viewer": map[string]any{"guest": guest, "rsvp": viewerRSVP},
 		"photos": map[string]any{"items": photos, "next_cursor": nextCursor},
+		"wishes": wishes,
 	})
 }
 

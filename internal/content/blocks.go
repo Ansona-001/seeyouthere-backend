@@ -66,6 +66,7 @@ type Saved struct {
 	HeroMediaID *uuid.UUID
 	RSVP        *RSVPBlock
 	Photos      *GuestPhotosBlock
+	Wishes      *WishesBlock
 }
 
 // EffectiveEnd is the instant the event is over for retention purposes: nil
@@ -96,6 +97,11 @@ type RSVPBlock struct {
 	MaxPartySize int
 	Fields       []RSVPFieldRef
 	Questions    []Field
+}
+
+// WishesBlock is the resolved wishes block: Open means guests may submit wishes.
+type WishesBlock struct {
+	Open bool
 }
 
 // GuestPhotosBlock is the resolved guest_photos block.
@@ -292,6 +298,7 @@ type wishesBlockJSON struct {
 	Type    string     `json:"type"`
 	Kicker  string     `json:"kicker"`
 	Heading string     `json:"heading"`
+	Open    bool       `json:"open"`
 	Items   []wishJSON `json:"items"`
 }
 
@@ -368,6 +375,7 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 	var heroTitle, firstHeading string
 	var rsvpBlock *RSVPBlock
 	var photosBlock *GuestPhotosBlock
+	var wishesBlock *WishesBlock
 
 	addMedia := func(path, raw string) (uuid.UUID, bool) {
 		if raw == "" {
@@ -786,17 +794,21 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 			}
 			b.Kicker = checkField(iss, path+".kicker", b.Kicker, kickerMax, false, false)
 			b.Heading = checkField(iss, path+".heading", b.Heading, headingMax, false, false)
-			if len(b.Items) < 1 || len(b.Items) > 30 {
-				iss.add(path+".items", "invalid_length", "must have between 1 and 30 items")
+			if len(b.Items) > 30 || (len(b.Items) == 0 && !b.Open) {
+				iss.add(path+".items", "invalid_length", "add a wish or let guests send them")
+			}
+			if b.Items == nil {
+				b.Items = []wishJSON{}
 			}
 			for j := range b.Items {
 				ip := fmt.Sprintf("%s.items[%d]", path, j)
-				b.Items[j].Message = checkField(iss, ip+".message", b.Items[j].Message, 500, true, true)
-				b.Items[j].Author = checkField(iss, ip+".author", b.Items[j].Author, 80, true, false)
+				b.Items[j].Message = checkField(iss, ip+".message", b.Items[j].Message, WishMessageMax, true, true)
+				b.Items[j].Author = checkField(iss, ip+".author", b.Items[j].Author, WishAuthorMax, true, false)
 			}
 			if firstHeading == "" && b.Heading != "" {
 				firstHeading = b.Heading
 			}
+			wishesBlock = &WishesBlock{Open: b.Open}
 			out[i] = b
 		}
 	}
@@ -838,6 +850,7 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 		HeroMediaID: heroMediaID,
 		RSVP:        rsvpBlock,
 		Photos:      photosBlock,
+		Wishes:      wishesBlock,
 	}, nil
 }
 
