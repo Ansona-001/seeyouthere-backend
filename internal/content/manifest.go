@@ -113,7 +113,7 @@ var validDecorations = map[string]bool{"none": true, "line": true, "floral": tru
 // value that matches today's rendered look.
 var validSurfaces = map[string]bool{"": true, "plain": true, "card": true, "glass": true}
 var validTextures = map[string]bool{"": true, "none": true, "grid": true, "dots": true}
-var validHeadingScales = map[string]bool{"": true, "regular": true, "display": true}
+var validHeadingScales = map[string]bool{"": true, "regular": true, "display": true, "classic": true}
 
 // glassAlphaWide and glassAlphaNarrow are the two composited opacities a
 // "glass" surface renders at (below md / from md up respectively) — must
