@@ -458,6 +458,12 @@ func TestManifestV2_Contrast(t *testing.T) {
 			c["background"], c["surface"], c["text"], c["muted"] = "#101010", "#FFFFFF", "#2C382D", "#2C382D"
 			palAt(m, 0)["accent_ink"] = "#767676"
 		}, code: "low_contrast"},
+		{name: "invitation hero ink over vignette", base: mimosa, fn: func(m obj) {
+			layerAt(m, 0)["vignette"], layerAt(m, 0)["vignette_opacity"] = "art4", 0.4
+		}, code: "low_contrast", path: "ornament.hero_ink"},
+		{name: "invitation hero ink over glow", base: mimosa, fn: func(m obj) {
+			layerAt(m, 0)["glow"], layerAt(m, 0)["glow_opacity"] = "art4", 0.4
+		}, code: "low_contrast", path: "ornament.hero_ink"},
 		{name: "hero_ink on page hero", fn: func(m obj) { m["ornament"].(obj)["hero_ink"] = "art5" }, code: "low_contrast", path: "ornament.hero_ink"},
 		{name: "hero_ink on color_block hero", base: sprinkles, fn: func(m obj) { m["ornament"].(obj)["hero_ink"] = "accent" }, code: "low_contrast", path: "ornament.hero_ink"},
 		{name: "foil_numeral stop too faint", base: giltNoir, fn: func(m obj) {
@@ -584,6 +590,11 @@ func TestManifestV2_Layers(t *testing.T) {
 		{name: "texture opacity 0.41", fn: withLayers(paper, obj{"kind": "texture", "texture": "grain", "opacity": 0.41}), code: "out_of_range"},
 		{name: "texture opacity 0.01", fn: withLayers(paper, obj{"kind": "texture", "texture": "grain", "opacity": 0.01}), code: "out_of_range"},
 		{name: "texture no opacity", fn: withLayers(paper, obj{"kind": "texture", "texture": "grain"}), code: "missing_value"},
+		{name: "mimosa on corners", base: mimosa, fn: func(m obj) { layerAt(m, 2)["placement"] = "top_corners" }, code: "invalid_combination", path: "layers[2].placement"},
+		{name: "mimosa with colors", base: mimosa, fn: func(m obj) { layerAt(m, 2)["colors"] = []string{"art1"} }, code: "too_many", path: "layers[2].colors"},
+		{name: "ornament date proto", base: mimosa, fn: func(m obj) { m["ornament"].(obj)["date"] = "__proto__" }, code: "invalid_value", path: "ornament.date"},
+		{name: "ornament date number", base: mimosa, fn: func(m obj) { m["ornament"].(obj)["date"] = 1 }, code: "invalid_json"},
+		{name: "ornament date unknown", base: mimosa, fn: func(m obj) { m["ornament"].(obj)["date"] = "Bars" }, code: "invalid_value", path: "ornament.date"},
 		{name: "watercolour with 2 colours", fn: withLayers(paper, obj{"kind": "texture", "texture": "watercolour", "opacity": 0.1, "colors": []string{"art1", "art2"}}), code: "invalid_combination", path: "layers[1].colors"},
 		{name: "watercolour with none", fn: withLayers(paper, obj{"kind": "texture", "texture": "watercolour", "opacity": 0.1}), code: "invalid_combination"},
 		{name: "grain with colours", fn: withLayers(paper, obj{"kind": "texture", "texture": "grain", "opacity": 0.1, "colors": []string{"art1"}}), code: "invalid_combination"},
@@ -798,8 +809,8 @@ func TestArtRegistry(t *testing.T) {
 	if n := len(artRegistry); n > maxArtKeys {
 		t.Fatalf("art registry has %d keys, hard cap is %d", n, maxArtKeys)
 	}
-	if len(artRegistry) != 14 {
-		t.Errorf("art registry has %d keys, spec lists 14", len(artRegistry))
+	if len(artRegistry) != 15 {
+		t.Errorf("art registry has %d keys, spec lists 15", len(artRegistry))
 	}
 	for key, spec := range artRegistry {
 		t.Run(key, func(t *testing.T) {

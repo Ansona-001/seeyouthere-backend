@@ -2,6 +2,8 @@ package content
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -115,6 +117,9 @@ func assertThemeSafe(t *testing.T, th Theme) {
 	enum("ornament.badge", o.Badge, validBadges)
 	enum("ornament.ampersand", o.Ampersand, validAmpersands)
 	hex("ornament.hero_ink", o.HeroInk)
+	if o.Date != "" {
+		enum("ornament.date", o.Date, validDateOrnaments)
+	}
 	enum("card.style", th.Card.Style, validCardStyles)
 	enum("card.border", th.Card.Border, validCardBorders)
 	enum("card.fields", th.Card.Fields, validCardFields)
@@ -338,5 +343,43 @@ func TestResolveThemeV2_UnvalidatedManifestDoesNotPanic(t *testing.T) {
 		if !strictHexRe.MatchString(c) {
 			t.Errorf("unresolvable token produced %q, want a hex fallback", c)
 		}
+	}
+}
+
+// mimosa loads the mimosa seed manifest as a mutable fixture.
+func mimosa() obj {
+	raw, err := os.ReadFile(filepath.Join("testdata", "themes_v2", "mimosa.json"))
+	if err != nil {
+		panic(err)
+	}
+	var m obj
+	if err := json.Unmarshal(raw, &m); err != nil {
+		panic(err)
+	}
+	return m
+}
+
+func TestResolveThemeV2_OrnamentDate(t *testing.T) {
+	m, err := ValidateManifest(mustJSON(t, mimosa()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	th := ResolveTheme(m, nil, "")
+	if th.Ornament.Date != "bars" {
+		t.Errorf("ornament.date = %q, want bars", th.Ornament.Date)
+	}
+	b, _ := json.Marshal(th)
+	if !strings.Contains(string(b), `"date":"bars"`) {
+		t.Errorf("resolved JSON lacks ornament.date: %s", b)
+	}
+
+	// Without a date the key is omitted, so existing themes stay byte-identical.
+	m, err = ValidateManifest(mutated(t, mimosa(), func(m obj) { delete(m["ornament"].(obj), "date") }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ = json.Marshal(ResolveTheme(m, nil, ""))
+	if strings.Contains(string(b), `"date"`) {
+		t.Errorf("empty ornament.date must be omitted: %s", b)
 	}
 }

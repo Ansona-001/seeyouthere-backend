@@ -324,6 +324,7 @@ func advEnumSlots() []advSlot {
 		{name: "ornament.divider", base: oliveS, valid: "olive_sprig", set: advIn("ornament", "divider"), path: "ornament.divider", emptyOK: true},
 		{name: "ornament.badge", base: oliveS, valid: "wax_seal", set: advIn("ornament", "badge"), path: "ornament.badge", emptyOK: true},
 		{name: "ornament.ampersand", base: oliveS, valid: "script", set: advIn("ornament", "ampersand"), path: "ornament.ampersand", emptyOK: true},
+		{name: "ornament.date", base: oliveS, valid: "bars", set: advIn("ornament", "date"), path: "ornament.date", emptyOK: true},
 		{name: "card.style", base: oliveS, valid: "reply_card", set: advIn("card", "style"), path: "card.style", emptyOK: true},
 		{name: "card.border", base: oliveS, valid: "foil_inset", set: advIn("card", "border"), path: "card.border", emptyOK: true},
 		{name: "card.fields", base: oliveS, valid: "underline", set: advIn("card", "fields"), path: "card.fields", emptyOK: true},
@@ -1320,6 +1321,7 @@ func TestAdv_ArtRegistryMatrix(t *testing.T) {
 		"sparkles":         {1, 2, true, true, []string{"scatter", "hero"}},
 		"printers_corners": {1, 1, true, false, []string{"corners"}},
 		"daisies":          {2, 3, false, true, []string{"corners", "edges"}},
+		"mimosa":           {0, 0, false, false, []string{"top"}},
 	}
 	if len(spec) != len(artRegistry) {
 		t.Fatalf("registry has %d keys, spec table %d", len(artRegistry), len(spec))
@@ -2112,22 +2114,23 @@ func TestAdv_AllowlistsMatchSpec(t *testing.T) {
 		{"patterns", validPatterns, []string{"grid", "dots", "halftone", "sunburst", "pinstripe", "gingham", "stripes"}},
 		{"origins", validOrigins, []string{"center", "top", "bottom", "top_left", "top_right", "bottom_left", "bottom_right"}},
 		{"masks", validMasks, []string{"none", "radial", "corner", "fade_bottom"}},
-		{"textures", validTextureV2, []string{"grain", "fibers", "linen", "wood", "watercolour", "foil", "marble", "velvet"}},
+		{"textures", validTextureV2, []string{"grain", "fibers", "linen", "wood", "watercolour", "foil", "marble", "velvet", "cold_press"}},
 		{"blends", validBlends, []string{"normal", "multiply", "screen", "soft-light", "overlay"}},
 		{"densities", validDensities, []string{"sparse", "normal", "dense"}},
 		{"frames", validFrames, []string{"single_hairline", "double_hairline", "double_hairline_deco_corners", "scallop"}},
-		{"v2 hero styles", validHeroStyleV2, []string{"full_bleed", "framed", "text_only", "spotlight", "color_block"}},
+		{"v2 hero styles", validHeroStyleV2, []string{"full_bleed", "framed", "text_only", "spotlight", "color_block", "invitation"}},
 		{"v1 hero styles", validHeroStyles, []string{"full_bleed", "framed", "text_only", "spotlight"}},
 		{"layouts", validLayouts, []string{"centered", "split", "stacked"}},
 		{"hero ornaments", validHeroOrnaments, []string{"none", "wreath_monogram", "sticker_numeral", "foil_numeral", "ring", "cloud", "doorway", "monogram_rule"}},
 		{"dividers", validDividers, []string{"none", "line", "floral", "dots", "heart", "olive_sprig", "squiggle", "deco_diamond", "wave", "sparkle_rule"}},
 		{"badges", validBadges, []string{"none", "starburst_sticker", "wax_seal", "foil_seal"}},
-		{"ampersands", validAmpersands, []string{"none", "script"}},
+		{"ampersands", validAmpersands, []string{"none", "script", "word"}},
+		{"date ornaments", validDateOrnaments, []string{"bars"}},
 		{"card styles", validCardStyles, []string{"none", "soft", "glass", "reply_card", "sticker", "chamfered"}},
 		{"card borders", validCardBorders, []string{"none", "hairline", "ink", "foil", "foil_inset"}},
 		{"card fields", validCardFields, []string{"boxed", "underline"}},
 		{"card buttons", validCardButtons, []string{"accent", "foil"}},
-		{"motions", validMotions, []string{"none", "draw_on", "pop_and_settle", "foil_sheen"}},
+		{"motions", validMotions, []string{"none", "draw_on", "pop_and_settle", "foil_sheen", "sway"}},
 		{"v1 dividers", v1Dividers, []string{"none", "line", "floral", "dots", "heart"}},
 	}
 	for _, s := range sets {
