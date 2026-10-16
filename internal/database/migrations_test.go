@@ -451,3 +451,131 @@ func TestMigration00007_SeedV2Themes(t *testing.T) {
 	}
 	checkSeeded()
 }
+
+// TestMigration00025_Mimosa applies migrations up to 25 and checks the Mimosa seed: a draft wedding
+// template with a published v1 whose stored manifest validates and resolves for every palette and
+// font pair, and that it stays out of the host picker. It then runs 00025's Down with an event
+// pinned to it (must fail by FK and change nothing), unpins it, runs Down again (both rows go),
+// and applies Up again.
+func TestMigration00025_Mimosa(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 24); err != nil {
+		t.Fatalf("migrate to 24: %v", err)
+	}
+	var before int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates").Scan(&before); err != nil {
+		t.Fatalf("count templates: %v", err)
+	}
+	if _, err := provider.UpTo(ctx, 25); err != nil {
+		t.Fatalf("migrate to 25: %v", err)
+	}
+
+	const mimosaID = "01926a00-0000-7000-8000-000000000013"
+	checkSeeded := func() {
+		t.Helper()
+		var (
+			id, name, status, tags string
+			sortOrder              int32
+			premium                bool
+		)
+		err := pool.QueryRow(ctx, `SELECT id::text, name, status, tags::text, sort_order, is_premium
+			FROM templates WHERE slug = 'mimosa'`).Scan(&id, &name, &status, &tags, &sortOrder, &premium)
+		if err != nil {
+			t.Fatalf("read template: %v", err)
+		}
+		if id != mimosaID || name != "Mimosa" || status != "draft" || sortOrder != 15 || premium || tags != `{"occasions": ["wedding"]}` {
+			t.Errorf("template: id=%s name=%q status=%s sort_order=%d premium=%v tags=%s, want id=%s name=Mimosa draft sort_order=15 not premium tags={\"occasions\": [\"wedding\"]}",
+				id, name, status, sortOrder, premium, tags, mimosaID)
+		}
+
+		var (
+			manifest  []byte
+			version   int
+			published bool
+			assets    string
+			size      int
+		)
+		err = pool.QueryRow(ctx, `SELECT version, manifest, published_at IS NOT NULL, assets_path, pg_column_size(manifest)
+			FROM template_versions WHERE template_id = $1`, id).Scan(&version, &manifest, &published, &assets, &size)
+		if err != nil { // also fails if there is more than one version
+			t.Fatalf("read version: %v", err)
+		}
+		if version != 1 || !published || assets != "" || size > 32768 {
+			t.Errorf("version=%d published=%v assets_path=%q manifest size=%d, want v1 published, no assets, <= 32768", version, published, assets, size)
+		}
+		m, err := content.ValidateManifest(manifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest: %v", err)
+		}
+		if m.Schema != 2 || len(m.Palettes) == 0 || len(m.Fonts) == 0 {
+			t.Errorf("manifest schema=%d palettes=%d fonts=%d, want schema 2 with palettes and fonts", m.Schema, len(m.Palettes), len(m.Fonts))
+		}
+		for _, p := range m.Palettes {
+			for _, f := range m.Fonts {
+				overrides := fmt.Sprintf(`{"palette":%q,"font":%q}`, p.ID, f.ID)
+				th := content.ResolveTheme(m, []byte(overrides), "")
+				if th.Engine != 2 || th.Palette != p.Colors || th.Fonts.Heading != f.Heading || th.Fonts.Body != f.Body {
+					t.Errorf("ResolveTheme(%s, %s) = engine %d %+v, want engine 2 with that palette and font pair", p.ID, f.ID, th.Engine, th)
+				}
+			}
+		}
+
+		var templates int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates").Scan(&templates); err != nil || templates != before+1 {
+			t.Errorf("templates = %d (err %v), want %d", templates, err, before+1)
+		}
+		// A draft stays out of the public catalog.
+		listed, err := store.New(pool).ListPublishedTemplates(ctx, nil)
+		if err != nil {
+			t.Fatalf("list published templates: %v", err)
+		}
+		for _, r := range listed {
+			if r.Slug == "mimosa" {
+				t.Errorf("draft template mimosa is listed in the public picker")
+			}
+		}
+	}
+	checkSeeded()
+
+	// Pin an event to Mimosa v1: Down must fail by FK, roll back fully, and leave the rows.
+	eventID := uuid.Must(uuid.NewV7())
+	if _, err := pool.Exec(ctx, `INSERT INTO events (id, occasion_slug, title, content, template_id, template_version)
+		VALUES ($1, 'wedding', 'pinned', '[]', $2, 1)`, eventID, mimosaID); err != nil {
+		t.Fatalf("insert pinned event: %v", err)
+	}
+	_, err := provider.DownTo(ctx, 24)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23503" {
+		t.Fatalf("down with a pinned event: err = %v, want foreign_key_violation", err)
+	}
+	checkSeeded()
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after failed Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+
+	if _, err := pool.Exec(ctx, "DELETE FROM events WHERE id = $1", eventID); err != nil {
+		t.Fatalf("delete pinned event: %v", err)
+	}
+	if _, err := provider.DownTo(ctx, 24); err != nil {
+		t.Fatalf("down to 24: %v", err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates WHERE id = $1 OR slug = 'mimosa'", mimosaID).Scan(&left); err != nil || left != 0 {
+		t.Errorf("mimosa templates after Down = %d (err %v), want 0", left, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions WHERE template_id = $1", mimosaID).Scan(&left); err != nil || left != 0 {
+		t.Errorf("mimosa versions after Down = %d (err %v), want 0", left, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates").Scan(&left); err != nil || left != before {
+		t.Errorf("templates after Down = %d (err %v), want %d", left, err, before)
+	}
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+
+	if _, err := provider.UpTo(ctx, 25); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	checkSeeded()
+}

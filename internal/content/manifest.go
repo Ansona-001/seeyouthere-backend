@@ -131,14 +131,14 @@ var allowedFonts = map[string]bool{
 	"dm_serif_display": true, "lora": true, "fraunces": true, "great_vibes": true,
 	"birthstone": true, "montserrat": true,
 	"bodoni_moda": true, "pinyon_script": true, "bagel_fat_one": true,
-	"limelight": true, "josefin_sans": true,
+	"limelight": true, "josefin_sans": true, "dancing_script": true,
 }
 
 // headingOnlyFonts are display scripts too narrow/decorative for body text:
 // allowed as a font pair's heading or accent, rejected as body.
 var headingOnlyFonts = map[string]bool{
 	"great_vibes": true, "birthstone": true,
-	"pinyon_script": true, "bagel_fat_one": true, "limelight": true,
+	"pinyon_script": true, "bagel_fat_one": true, "limelight": true, "dancing_script": true,
 }
 
 // ValidateManifest decodes and validates a template manifest, normalising

@@ -17,7 +17,7 @@ import (
 // design/src/v2/build.mjs) and seed migration 00007 copies them verbatim.
 var v2SeedSlugs = []string{
 	"olive-grove", "letterpress", "velvet-foil", "sunlit", "sprinkles", "risograph",
-	"cloud-nine", "gingham", "open-door", "terrazzo", "gilt-noir", "mirror-ball",
+	"cloud-nine", "gingham", "open-door", "terrazzo", "gilt-noir", "mirror-ball", "mimosa",
 }
 
 // resolvedHexRe is the only colour form a resolved theme may carry: the
@@ -69,8 +69,13 @@ func TestV2SeedThemes(t *testing.T) {
 			if m.Schema != 2 {
 				t.Fatalf("schema = %d, want 2", m.Schema)
 			}
-			if n := len(m.Palettes); n < 2 || n > 4 {
-				t.Errorf("%d palettes, want 2-4", n)
+			// Mimosa ships one palette: its painted canopy is a single fixed raster.
+			minPalettes := 2
+			if slug == "mimosa" {
+				minPalettes = 1
+			}
+			if n := len(m.Palettes); n < minPalettes || n > 4 {
+				t.Errorf("%d palettes, want %d-4", n, minPalettes)
 			}
 			if m.Defaults.Palette != m.Palettes[0].ID {
 				t.Errorf("default palette %q is not the first palette %q", m.Defaults.Palette, m.Palettes[0].ID)

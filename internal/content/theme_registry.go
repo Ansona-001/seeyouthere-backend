@@ -40,6 +40,7 @@ var artRegistry = map[string]artSpec{
 	"mirror_ball":      {1, 2, true, false, placements("hero_top")},
 	"sparkles":         {1, 2, true, true, placements("scatter", "hero")},
 	"printers_corners": {1, 1, true, false, placements("corners")},
+	"mimosa":           {0, 0, false, false, placements("top")},
 	"daisies":          {2, 3, false, true, placements("corners", "edges")},
 }
 
@@ -113,22 +114,23 @@ var (
 	validPatterns    = fieldSet("grid", "dots", "halftone", "sunburst", "pinstripe", "gingham", "stripes")
 	validOrigins     = fieldSet("center", "top", "bottom", "top_left", "top_right", "bottom_left", "bottom_right")
 	validMasks       = fieldSet("none", "radial", "corner", "fade_bottom")
-	validTextureV2   = fieldSet("grain", "fibers", "linen", "wood", "watercolour", "foil", "marble", "velvet")
+	validTextureV2   = fieldSet("grain", "fibers", "linen", "wood", "watercolour", "foil", "marble", "velvet", "cold_press")
 	validBlends      = fieldSet("normal", "multiply", "screen", "soft-light", "overlay")
 	validDensities   = fieldSet("sparse", "normal", "dense")
 	validFrames      = fieldSet("single_hairline", "double_hairline", "double_hairline_deco_corners", "scallop")
-	validHeroStyleV2 = fieldSet("full_bleed", "framed", "text_only", "spotlight", "color_block")
+	validHeroStyleV2 = fieldSet("full_bleed", "framed", "text_only", "spotlight", "color_block", "invitation")
 
 	validHeroOrnaments = fieldSet("none", "wreath_monogram", "sticker_numeral", "foil_numeral", "ring", "cloud", "doorway", "monogram_rule")
 	validDividers      = fieldSet("none", "line", "floral", "dots", "heart", "olive_sprig", "squiggle", "deco_diamond", "wave", "sparkle_rule")
 	validBadges        = fieldSet("none", "starburst_sticker", "wax_seal", "foil_seal")
-	validAmpersands    = fieldSet("none", "script")
+	validAmpersands    = fieldSet("none", "script", "word")
+	validDateOrnaments = fieldSet("bars")
 
 	validCardStyles  = fieldSet("none", "soft", "glass", "reply_card", "sticker", "chamfered")
 	validCardBorders = fieldSet("none", "hairline", "ink", "foil", "foil_inset")
 	validCardFields  = fieldSet("boxed", "underline")
 	validCardButtons = fieldSet("accent", "foil")
-	validMotions     = fieldSet("none", "draw_on", "pop_and_settle", "foil_sheen")
+	validMotions     = fieldSet("none", "draw_on", "pop_and_settle", "foil_sheen", "sway")
 
 	// v1Dividers are the ornament dividers the v1 DecorationDivider renders;
 	// the fallback v1 `decoration` of a v2 theme is the divider if it is one.

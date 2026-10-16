@@ -47,6 +47,7 @@ type Ornament struct {
 	Badge     string `json:"badge"`
 	Ampersand string `json:"ampersand"`
 	HeroInk   string `json:"hero_ink"`
+	Date      string `json:"date,omitempty"`
 }
 
 // Card styles the RSVP/details card of a schema-2 theme.
@@ -570,6 +571,9 @@ func validateOrnament(iss *issues, o *Ornament) {
 		}
 	}
 	checkToken(iss, "ornament.hero_ink", o.HeroInk, false)
+	if o.Date != "" && !validDateOrnaments[o.Date] {
+		iss.add("ornament.date", "invalid_value", "unknown date ornament")
+	}
 }
 
 func validateCard(iss *issues, c *Card) {
@@ -740,6 +744,29 @@ func checkLayerContrastV2(iss *issues, i int, p *Palette, ink string, m *Manifes
 		case kindPaper:
 			check(path+".glow", "paper glow", l.Glow, l.GlowOpacity)
 			check(path+".vignette", "paper vignette", l.Vignette, l.VignetteOpacity)
+			if m.HeroStyle == "invitation" {
+				// The invitation title sits on the glow and vignette, so
+				// the hero ink must clear 3:1 over each blended onto the page.
+				heroInk := ink
+				if tok := m.Ornament.HeroInk; tok != "" {
+					heroInk = tokenHex(*p, ink, tok)
+				}
+				for _, w := range [...]struct {
+					path, what, tok string
+					opacity         *float64
+				}{
+					{path + ".glow", "paper glow", l.Glow, l.GlowOpacity},
+					{path + ".vignette", "paper vignette", l.Vignette, l.VignetteOpacity},
+				} {
+					if _, known := colourTokens[w.tok]; !known || w.opacity == nil || outOfRange(*w.opacity, 0, 1) {
+						continue
+					}
+					b := blendHex(tokenHex(*p, ink, w.tok), c.Background, *w.opacity)
+					if contrastRatio(heroInk, b) < minLargeContrast {
+						iss.add("ornament.hero_ink", "low_contrast", fmt.Sprintf("hero ink over the %s doesn't meet 3:1 contrast in palette %d", w.what, i))
+					}
+				}
+			}
 		case kindPattern:
 			check(path+".color", "pattern", l.Color, l.Opacity)
 		}
