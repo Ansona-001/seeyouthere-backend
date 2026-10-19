@@ -579,3 +579,99 @@ func TestMigration00025_Mimosa(t *testing.T) {
 	}
 	checkSeeded()
 }
+
+// TestMigration00026_BirthstoneHeadings applies migrations up to 26 and checks that every template whose
+// latest version used Great Vibes as a heading got exactly one new published version using Birthstone
+// there (manifest valid, pair ids and accents unchanged, old versions untouched), that other templates
+// got none, and that Down removes only those versions and Up can run again.
+func TestMigration00026_BirthstoneHeadings(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 25); err != nil {
+		t.Fatalf("migrate to 25: %v", err)
+	}
+	versionCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions").Scan(&n); err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		return n
+	}
+	before := versionCount()
+	if _, err := provider.UpTo(ctx, 26); err != nil {
+		t.Fatalf("migrate to 26: %v", err)
+	}
+
+	check := func() {
+		t.Helper()
+		if got := versionCount(); got != before+2 {
+			t.Errorf("versions = %d, want %d (garden and mimosa get one each)", got, before+2)
+		}
+		for slug, wantVersion := range map[string]int{"mimosa": 2, "garden": 3} {
+			var (
+				manifest, prev []byte
+				version        int
+				published      bool
+			)
+			err := pool.QueryRow(ctx, `SELECT v.version, v.manifest, v.published_at IS NOT NULL
+				FROM template_versions v JOIN templates t ON t.id = v.template_id
+				WHERE t.slug = $1 ORDER BY v.version DESC LIMIT 1`, slug).Scan(&version, &manifest, &published)
+			if err != nil {
+				t.Fatalf("%s: read latest version: %v", slug, err)
+			}
+			if version != wantVersion || !published {
+				t.Errorf("%s: latest version = %d published=%v, want v%d published", slug, version, published, wantVersion)
+			}
+			if err := pool.QueryRow(ctx, `SELECT v.manifest FROM template_versions v JOIN templates t ON t.id = v.template_id
+				WHERE t.slug = $1 AND v.version = $2`, slug, wantVersion-1).Scan(&prev); err != nil {
+				t.Fatalf("%s: read previous version: %v", slug, err)
+			}
+			m, err := content.ValidateManifest(manifest)
+			if err != nil {
+				t.Fatalf("%s: ValidateManifest: %v", slug, err)
+			}
+			old, err := content.ValidateManifest(prev)
+			if err != nil {
+				t.Fatalf("%s: ValidateManifest(previous): %v", slug, err)
+			}
+			if len(m.Fonts) != len(old.Fonts) {
+				t.Fatalf("%s: %d font pairs, previous had %d", slug, len(m.Fonts), len(old.Fonts))
+			}
+			for i, f := range m.Fonts {
+				o := old.Fonts[i]
+				wantHeading := o.Heading
+				if o.Heading == "great_vibes" {
+					wantHeading = "birthstone"
+				}
+				if f.ID != o.ID || f.Heading != wantHeading || f.Body != o.Body || f.Accent != o.Accent {
+					t.Errorf("%s pair %d = %+v, want id/body/accent of %+v with heading %s", slug, i, f, o, wantHeading)
+				}
+				if strings.Contains(f.Name, "Great Vibes") && f.Heading == "birthstone" {
+					t.Errorf("%s pair %q is still named %q", slug, f.ID, f.Name)
+				}
+			}
+		}
+		var left int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM template_versions v
+			WHERE v.version = (SELECT max(version) FROM template_versions WHERE template_id = v.template_id)
+			  AND EXISTS (SELECT 1 FROM jsonb_array_elements(v.manifest->'fonts') f WHERE f->>'heading' = 'great_vibes')`).Scan(&left); err != nil || left != 0 {
+			t.Errorf("latest versions still using Great Vibes as a heading = %d (err %v), want 0", left, err)
+		}
+	}
+	check()
+
+	if _, err := provider.DownTo(ctx, 25); err != nil {
+		t.Fatalf("down to 25: %v", err)
+	}
+	if got := versionCount(); got != before {
+		t.Errorf("versions after Down = %d, want %d", got, before)
+	}
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+	if _, err := provider.UpTo(ctx, 26); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	check()
+}
