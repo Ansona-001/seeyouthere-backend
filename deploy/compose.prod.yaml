@@ -2,6 +2,8 @@
 # api and web are prebuilt by GitHub Actions and pulled from GHCR; deploy.sh retags
 # the wanted build as :deployed and restarts the service. Never `up --build` here.
 # Email is sent through Zoho Mail SMTP (set SMTP_* in .env).
+# TLS and routing are done by the host nginx (deploy/nginx-seeyouthere.conf); api and web
+# listen on 127.0.0.1 only.
 name: seeyouthere
 
 # Rotate container logs; the disk is tiny.
@@ -12,27 +14,13 @@ x-logging: &logging
     max-file: "3"
 
 services:
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    logging: *logging
-    mem_limit: 48m
-    ports: ["80:80", "443:443", "443:443/udp"]
-    environment:
-      SITE_DOMAIN: ${SITE_DOMAIN}
-      ACME_EMAIL: ${ACME_EMAIL}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on: [web, api]
-
   api:
     image: ghcr.io/ansona-001/seeyouthere-api:deployed
     pull_policy: never
     restart: unless-stopped
     logging: *logging
     mem_limit: 200m
+    ports: ["127.0.0.1:8080:8080"]
     environment:
       APP_ENV: production
       DATABASE_URL: postgres://seeyouthere:${POSTGRES_PASSWORD}@postgres:5432/seeyouthere?sslmode=disable
@@ -72,6 +60,7 @@ services:
     restart: unless-stopped
     logging: *logging
     mem_limit: 220m
+    ports: ["127.0.0.1:3000:3000"]
     environment:
       API_INTERNAL_URL: http://api:8080
       NODE_OPTIONS: --max-old-space-size=180
@@ -118,6 +107,4 @@ services:
 volumes:
   pgdata:
   valkeydata:
-  caddy_data:
-  caddy_config:
   media:

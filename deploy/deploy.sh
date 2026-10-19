@@ -20,14 +20,14 @@ dc() { docker compose -f compose.prod.yaml --env-file .env "$@"; }
 
 image=ghcr.io/ansona-001/seeyouthere-$svc
 case $svc in
-  api) health_url=http://api:8080/readyz ;;
-  web) health_url=http://web:3000/robots.txt ;;
+  api) health_url=http://127.0.0.1:8080/readyz ;;
+  web) health_url=http://127.0.0.1:3000/robots.txt ;;
 esac
 
 wait_healthy() {
   local i
   for i in $(seq 1 30); do
-    if dc exec -T caddy wget -q -T 5 -O /dev/null "$health_url" 2>/dev/null; then
+    if curl -fsS -m 5 -o /dev/null "$health_url" 2>/dev/null; then
       return 0
     fi
     echo "deploy: waiting for $svc to become healthy ($i/30)"
@@ -59,8 +59,8 @@ fail() {
 }
 
 had_current=
-echo "deploy: ensuring postgres, valkey and caddy are up"
-dc up -d --wait --wait-timeout 120 --no-deps postgres valkey caddy
+echo "deploy: ensuring postgres and valkey are up"
+dc up -d --wait --wait-timeout 120 --no-deps postgres valkey
 
 echo "deploy: pulling $image:$sha"
 docker pull "$image:$sha" >/dev/null || { echo "deploy: pull failed (is the package public and the build finished?)" >&2; exit 1; }
@@ -84,7 +84,5 @@ if ! wait_healthy; then
 fi
 
 echo "deploy: $svc is healthy"
-dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
-  || echo "deploy: warning: caddy reload failed (config unchanged or invalid)" >&2
 docker image prune -f >/dev/null || true
 echo "deploy: done ($svc @ $sha)"
