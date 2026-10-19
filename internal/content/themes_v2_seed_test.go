@@ -156,6 +156,9 @@ func resolvedColours(th Theme) []colourAt {
 	}
 	if th.Ornament != nil {
 		out = append(out, colourAt{"ornament.hero_ink", th.Ornament.HeroInk})
+		if th.Ornament.LabelInk != "" {
+			out = append(out, colourAt{"ornament.label_ink", th.Ornament.LabelInk})
+		}
 	}
 	for i, l := range th.Layers {
 		for name, v := range map[string]string{"tone": l.Tone, "glow": l.Glow, "vignette": l.Vignette, "color": l.Color} {

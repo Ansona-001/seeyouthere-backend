@@ -117,6 +117,7 @@ func assertThemeSafe(t *testing.T, th Theme) {
 	enum("ornament.badge", o.Badge, validBadges)
 	enum("ornament.ampersand", o.Ampersand, validAmpersands)
 	hex("ornament.hero_ink", o.HeroInk)
+	optHex("ornament.label_ink", o.LabelInk)
 	if o.Date != "" {
 		enum("ornament.date", o.Date, validDateOrnaments)
 	}
@@ -289,6 +290,38 @@ func TestResolveThemeV2_BlockImageAndFallbacks(t *testing.T) {
 		if th.Decoration != c.wantDeco || th.Surface != c.wantSurface {
 			t.Errorf("%+v: decoration=%q surface=%q", c, th.Decoration, th.Surface)
 		}
+	}
+}
+
+func TestResolveThemeV2_LabelInk(t *testing.T) {
+	tests := []struct {
+		name string
+		set  func(m obj)
+		want func(m Manifest) string
+	}{
+		{"unset resolves to empty", func(m obj) {}, func(Manifest) string { return "" }},
+		{"empty string resolves to empty", func(m obj) { m["ornament"].(obj)["label_ink"] = "" }, func(Manifest) string { return "" }},
+		{"art token resolves to hex", func(m obj) { m["ornament"].(obj)["label_ink"] = "art4" }, func(m Manifest) string { return m.Palettes[0].Art[3] }},
+		{"accent token resolves to hex", func(m obj) { m["ornament"].(obj)["label_ink"] = "accent" }, func(m Manifest) string { return m.Palettes[0].Colors.Accent }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := ValidateManifest(mutated(t, oliveGrove(), tc.set))
+			if err != nil {
+				t.Fatal(err)
+			}
+			th := ResolveTheme(m, nil, "")
+			if want := tc.want(m); th.Ornament.LabelInk != want {
+				t.Errorf("label_ink = %q, want %q", th.Ornament.LabelInk, want)
+			}
+			b, err := json.Marshal(th)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(b), `"label_ink":`) {
+				t.Errorf("resolved theme JSON lacks label_ink: %s", b)
+			}
+		})
 	}
 }
 

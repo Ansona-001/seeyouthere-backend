@@ -490,6 +490,16 @@ func TestManifestV2_OrnamentCardMotion(t *testing.T) {
 		{name: "hero_ink hex in token slot", fn: func(m obj) { m["ornament"].(obj)["hero_ink"] = "#FFFFFF" }, code: "unknown_token", path: "ornament.hero_ink"},
 		{name: "hero_ink art9", fn: func(m obj) { m["ornament"].(obj)["hero_ink"] = "art9" }, code: "unknown_token"},
 		{name: "hero_ink art7 beyond palette art", fn: func(m obj) { m["ornament"].(obj)["hero_ink"] = "art7" }, code: "missing_palette_color"},
+		{name: "label_ink hex in token slot", fn: func(m obj) { m["ornament"].(obj)["label_ink"] = "#2F4A37" }, code: "unknown_token", path: "ornament.label_ink"},
+		{name: "label_ink art9", fn: func(m obj) { m["ornament"].(obj)["label_ink"] = "art9" }, code: "unknown_token", path: "ornament.label_ink"},
+		{name: "label_ink art7 beyond palette art", fn: func(m obj) { m["ornament"].(obj)["label_ink"] = "art7" }, code: "missing_palette_color"},
+		{name: "label_ink low contrast on background", fn: func(m obj) { m["ornament"].(obj)["label_ink"] = "art2" }, code: "low_contrast", path: "ornament.label_ink"},
+		{name: "label_ink low contrast on glass blend", base: giltNoir, fn: func(m obj) {
+			m["card"] = obj{"style": "glass", "border": "hairline", "fields": "boxed", "buttons": "accent"}
+			m["ornament"].(obj)["label_ink"] = "text"
+			colorsAt(m, 0)["background"] = "#FFFFFF"
+			colorsAt(m, 0)["surface"] = "#000000"
+		}, code: "low_contrast", path: "ornament.label_ink"},
 		{name: "card style unknown", fn: func(m obj) { m["card"].(obj)["style"] = "neon" }, code: "invalid_value", path: "card.style"},
 		{name: "card border unknown", fn: func(m obj) { m["card"].(obj)["border"] = "dashed" }, code: "invalid_value", path: "card.border"},
 		{name: "card fields unknown", fn: func(m obj) { m["card"].(obj)["fields"] = "pill" }, code: "invalid_value", path: "card.fields"},

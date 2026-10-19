@@ -371,6 +371,7 @@ func advTokenSlotList() []advSlot {
 			layersOf(m)[1] = obj{"kind": "texture", "texture": "watercolour", "opacity": 0.1, "colors": []any{"art1", "art2", v}}
 		}, path: "layers[1].colors[2]", emptyCode: "missing_value"},
 		{name: "ornament.hero_ink", base: oliveS, valid: "accent", set: advIn("ornament", "hero_ink"), path: "ornament.hero_ink", emptyOK: true},
+		{name: "ornament.label_ink", base: oliveS, valid: "text", set: advIn("ornament", "label_ink"), path: "ornament.label_ink", emptyOK: true},
 	}
 }
 
@@ -1520,7 +1521,8 @@ func TestAdv_CrossFieldFoil(t *testing.T) {
 		"texture.colors": func(m obj, tok string) {
 			setLayers(m, obj{"kind": "texture", "texture": "watercolour", "opacity": 0.1, "colors": []string{"art1", "art1", tok}})
 		},
-		"hero_ink": func(m obj, tok string) { setLayers(m, obj{"kind": "paper"}); m["ornament"].(obj)["hero_ink"] = tok },
+		"hero_ink":  func(m obj, tok string) { setLayers(m, obj{"kind": "paper"}); m["ornament"].(obj)["hero_ink"] = tok },
+		"label_ink": func(m obj, tok string) { setLayers(m, obj{"kind": "paper"}); m["ornament"].(obj)["label_ink"] = tok },
 	}
 	for name, set := range slots {
 		t.Run(name+" art8 vs 7 art colours", func(t *testing.T) {
