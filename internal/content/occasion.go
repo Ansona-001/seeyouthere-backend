@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
 )
@@ -150,7 +151,7 @@ func BuildInitialContent(occ Occasion, answers map[string]string) (json.RawMessa
 			continue
 		}
 		if q.Target == "title_var" {
-			title = strings.ReplaceAll(title, "{"+q.Key+"}", ans)
+			title = strings.ReplaceAll(title, "{"+q.Key+"}", capitalizeFirst(ans))
 		} else {
 			sets[q.Target] = ans
 		}
@@ -211,6 +212,16 @@ func badgeFromAnswers(answers map[string]string) string {
 		return host
 	}
 	return ""
+}
+
+// capitalizeFirst upper-cases the first rune of s when it is a lower-case letter, so a name typed as
+// "anson" reads "Anson" in the hero title. The rest is left as typed ("van der Berg" stays intact).
+func capitalizeFirst(s string) string {
+	r, size := utf8.DecodeRuneInString(s)
+	if r == utf8.RuneError || !unicode.IsLower(r) {
+		return s
+	}
+	return string(unicode.ToUpper(r)) + s[size:]
 }
 
 // initial returns the first letter or digit of s, upper-cased, or "".

@@ -59,7 +59,7 @@ Domains: `seeyouthere.at` (site), `api.seeyouthere.at` (API). Limits were raised
 - Bucket `syt-media` (private; API serves every image itself). Env vars (names only): `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` — all four must be set or the API refuses to start. In production the API only accepts endpoints ending in `.r2.cloudflarestorage.com`.
 - Free tier: 10 GB storage, 1M class-A, 10M class-B ops per month. Quotas in code keep us inside it: `MEDIA_USER_QUOTA_MB=200`, `MEDIA_TOTAL_QUOTA_MB=9000`.
 - Uploads are staged on local disk before going to R2; the API refuses uploads (HTTP 507) when free space on the `MEDIA_ROOT` disk is below `MEDIA_MIN_FREE_MB` (default 2048). The 96 GB disk makes this a non-issue.
-- Database backups also go to this bucket under the `backups/db/` prefix (see Backups). Never point any cleanup at the bucket root.
+- Event deletion removes the event's objects from this bucket right away (owner delete queues a purge job within moments; admin delete is synchronous).
 
 ## Link previews (og:image)
 
@@ -72,21 +72,22 @@ Domains: `seeyouthere.at` (site), `api.seeyouthere.at` (API). Limits were raised
 
 `SITE_DOMAIN`, `ACME_EMAIL`, `POSTGRES_PASSWORD`, `AUTH_SECRET`, `SMTP_ADDR`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM`, `TOTP_KEY`, `ADMIN_ALERT_EMAIL`, `MAIL_DAILY_INVITE_CAP`, `MEDIA_USER_QUOTA_MB`, `MEDIA_TOTAL_QUOTA_MB`, `MEDIA_MIN_FREE_MB`, `R2_*` (four). Email goes through Zoho Mail SMTP. See `deploy/.env.example` for the full list and comments. **Back up `deploy/.env` separately** (password manager); it is not in git or in the DB dumps.
 
-## Backups
+## Backups — none (deliberate)
 
-- `deploy/backup.sh` runs nightly at 03:17 UTC from the `ubuntu` crontab: custom-format `pg_dump`, verified with `pg_restore --list`, written to `~/backups/db-<UTC timestamp>.dump` (mode 600, newest 7 kept), then uploaded with `rclone` to `R2:<bucket>/backups/db/` (kept 14 days). Output goes to syslog: `journalctl -t syt-backup` (or `grep syt-backup /var/log/syslog`).
-- Run by hand: `~/seeyouthere/seeyouthere-backend/deploy/backup.sh`. Dumps contain user data; the R2 bucket is private but the dumps are **not** encrypted at rest beyond R2's own encryption.
-- Failures are only visible in the log (no alerting). Check `ls -l ~/backups` occasionally.
-- Restore into a fresh database (verified 2026-10-19 against a scratch DB):
+There are **no database backups**, by decision on 2026-10-19: deleted events and accounts must not survive anywhere after the purge job runs (see event deletion in `internal/jobs/admin_purge.go`). The nightly cron job, the local dumps and the `backups/db/` copies in R2 were removed.
+
+- Consequence: a lost disk, a bad migration or an accidental delete means the data is gone. Revisit this once real users exist.
+- `deploy/backup.sh` is kept in the repo but **not scheduled**. To take a one-off dump by hand, run it (`bash deploy/backup.sh`); it writes `~/backups/db-<stamp>.dump` (mode 600) and uploads to `R2:<bucket>/backups/db/`. Delete both copies afterwards.
+- Restore from a dump into a fresh database:
   ```sh
   cd ~/seeyouthere/seeyouthere-backend/deploy
   dc() { docker compose -f compose.prod.yaml --env-file .env "$@"; }
   dc stop api web
-  dc exec -T postgres pg_restore -U seeyouthere -d seeyouthere --clean --if-exists --no-owner --exit-on-error < ~/backups/db-<stamp>.dump
+  dc exec -T postgres pg_restore -U seeyouthere -d seeyouthere --clean --if-exists --no-owner --exit-on-error < db-<stamp>.dump
   dc exec -T valkey valkey-cli flushall   # drop cached sessions/rate limits
   dc up -d api web
   ```
-- Photos are in R2, the code is in GitHub. Contabo's own snapshot/backup add-ons are not enabled.
+- `deploy/.env` is not in git or in any dump; keep a copy in a password manager.
 
 ## Useful commands (on the VM)
 
