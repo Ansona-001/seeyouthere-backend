@@ -5,7 +5,7 @@
 set -euo pipefail
 export LC_ALL=C
 
-deploy_dir=/home/ansonarose/seeyouthere/seeyouthere-backend/deploy
+deploy_dir=/home/ubuntu/seeyouthere/seeyouthere-backend/deploy
 
 cmd=${SSH_ORIGINAL_COMMAND:-}
 if [[ ! $cmd =~ ^(api|web)\ [0-9a-f]{40}$ ]]; then
