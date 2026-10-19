@@ -579,3 +579,192 @@ func TestMigration00025_Mimosa(t *testing.T) {
 	}
 	checkSeeded()
 }
+
+// TestMigration00026_BirthstoneHeadings applies migrations up to 26 and checks that every template whose
+// latest version used Great Vibes as a heading got exactly one new published version using Birthstone
+// there (manifest valid, pair ids and accents unchanged, old versions untouched), that other templates
+// got none, and that Down removes only those versions and Up can run again.
+func TestMigration00026_BirthstoneHeadings(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 25); err != nil {
+		t.Fatalf("migrate to 25: %v", err)
+	}
+	versionCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions").Scan(&n); err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		return n
+	}
+	before := versionCount()
+	if _, err := provider.UpTo(ctx, 26); err != nil {
+		t.Fatalf("migrate to 26: %v", err)
+	}
+
+	check := func() {
+		t.Helper()
+		if got := versionCount(); got != before+2 {
+			t.Errorf("versions = %d, want %d (garden and mimosa get one each)", got, before+2)
+		}
+		for slug, wantVersion := range map[string]int{"mimosa": 2, "garden": 3} {
+			var (
+				manifest, prev []byte
+				version        int
+				published      bool
+			)
+			err := pool.QueryRow(ctx, `SELECT v.version, v.manifest, v.published_at IS NOT NULL
+				FROM template_versions v JOIN templates t ON t.id = v.template_id
+				WHERE t.slug = $1 ORDER BY v.version DESC LIMIT 1`, slug).Scan(&version, &manifest, &published)
+			if err != nil {
+				t.Fatalf("%s: read latest version: %v", slug, err)
+			}
+			if version != wantVersion || !published {
+				t.Errorf("%s: latest version = %d published=%v, want v%d published", slug, version, published, wantVersion)
+			}
+			if err := pool.QueryRow(ctx, `SELECT v.manifest FROM template_versions v JOIN templates t ON t.id = v.template_id
+				WHERE t.slug = $1 AND v.version = $2`, slug, wantVersion-1).Scan(&prev); err != nil {
+				t.Fatalf("%s: read previous version: %v", slug, err)
+			}
+			m, err := content.ValidateManifest(manifest)
+			if err != nil {
+				t.Fatalf("%s: ValidateManifest: %v", slug, err)
+			}
+			old, err := content.ValidateManifest(prev)
+			if err != nil {
+				t.Fatalf("%s: ValidateManifest(previous): %v", slug, err)
+			}
+			if len(m.Fonts) != len(old.Fonts) {
+				t.Fatalf("%s: %d font pairs, previous had %d", slug, len(m.Fonts), len(old.Fonts))
+			}
+			for i, f := range m.Fonts {
+				o := old.Fonts[i]
+				wantHeading := o.Heading
+				if o.Heading == "great_vibes" {
+					wantHeading = "birthstone"
+				}
+				if f.ID != o.ID || f.Heading != wantHeading || f.Body != o.Body || f.Accent != o.Accent {
+					t.Errorf("%s pair %d = %+v, want id/body/accent of %+v with heading %s", slug, i, f, o, wantHeading)
+				}
+				if strings.Contains(f.Name, "Great Vibes") && f.Heading == "birthstone" {
+					t.Errorf("%s pair %q is still named %q", slug, f.ID, f.Name)
+				}
+			}
+		}
+		var left int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM template_versions v
+			WHERE v.version = (SELECT max(version) FROM template_versions WHERE template_id = v.template_id)
+			  AND EXISTS (SELECT 1 FROM jsonb_array_elements(v.manifest->'fonts') f WHERE f->>'heading' = 'great_vibes')`).Scan(&left); err != nil || left != 0 {
+			t.Errorf("latest versions still using Great Vibes as a heading = %d (err %v), want 0", left, err)
+		}
+	}
+	check()
+
+	if _, err := provider.DownTo(ctx, 25); err != nil {
+		t.Fatalf("down to 25: %v", err)
+	}
+	if got := versionCount(); got != before {
+		t.Errorf("versions after Down = %d, want %d", got, before)
+	}
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+	if _, err := provider.UpTo(ctx, 26); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	check()
+}
+
+// TestMigration00027_MimosaGoldLabels applies migrations up to 27 and checks that Mimosa got exactly one
+// new published version (previous latest + 1) with the deep gold in the art2 slot and
+// ornament.label_ink = art2, that the manifest validates and resolves the gold as the label ink, that
+// no other template got a version, and that Down removes only that version and Up can run again.
+func TestMigration00027_MimosaGoldLabels(t *testing.T) {
+	const gold = "#85690A"
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 26); err != nil {
+		t.Fatalf("migrate to 26: %v", err)
+	}
+	versionCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions").Scan(&n); err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		return n
+	}
+	mimosaLatest := func() (version int, manifest []byte, published bool) {
+		t.Helper()
+		err := pool.QueryRow(ctx, `SELECT v.version, v.manifest, v.published_at IS NOT NULL
+			FROM template_versions v JOIN templates t ON t.id = v.template_id
+			WHERE t.slug = 'mimosa' ORDER BY v.version DESC LIMIT 1`).Scan(&version, &manifest, &published)
+		if err != nil {
+			t.Fatalf("read mimosa latest version: %v", err)
+		}
+		return version, manifest, published
+	}
+	before := versionCount()
+	prevVersion, prevManifest, _ := mimosaLatest()
+	if _, err := provider.UpTo(ctx, 27); err != nil {
+		t.Fatalf("migrate to 27: %v", err)
+	}
+
+	check := func() {
+		t.Helper()
+		if got := versionCount(); got != before+1 {
+			t.Errorf("versions = %d, want %d (only mimosa gets one)", got, before+1)
+		}
+		version, manifest, published := mimosaLatest()
+		if version != prevVersion+1 || !published {
+			t.Errorf("mimosa latest = v%d published=%v, want v%d published", version, published, prevVersion+1)
+		}
+		m, err := content.ValidateManifest(manifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest: %v", err)
+		}
+		old, err := content.ValidateManifest(prevManifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest(previous): %v", err)
+		}
+		if old.Ornament.LabelInk != "" || old.Palettes[0].Art[1] == gold {
+			t.Errorf("previous version was modified: label_ink=%q art2=%q", old.Ornament.LabelInk, old.Palettes[0].Art[1])
+		}
+		if len(m.Palettes) != len(old.Palettes) || m.Palettes[0].ID != old.Palettes[0].ID || m.Defaults != old.Defaults || len(m.Fonts) != len(old.Fonts) {
+			t.Errorf("palette/font ids changed: %+v vs %+v", m.Defaults, old.Defaults)
+		}
+		if got := m.Palettes[0].Art[1]; got != gold {
+			t.Errorf("art2 = %q, want %q", got, gold)
+		}
+		if m.Ornament.LabelInk != "art2" {
+			t.Errorf("ornament.label_ink = %q, want art2", m.Ornament.LabelInk)
+		}
+		if th := content.ResolveTheme(m, nil, ""); th.Ornament == nil || th.Ornament.LabelInk != gold {
+			t.Errorf("resolved label_ink = %+v, want %s", th.Ornament, gold)
+		}
+		var others int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM template_versions v JOIN templates t ON t.id = v.template_id
+			WHERE t.slug <> 'mimosa' AND v.manifest->'ornament' ? 'label_ink' AND v.manifest->'ornament'->>'label_ink' <> ''`).Scan(&others); err != nil || others != 0 {
+			t.Errorf("other templates with label_ink = %d (err %v), want 0", others, err)
+		}
+	}
+	check()
+
+	if _, err := provider.DownTo(ctx, 26); err != nil {
+		t.Fatalf("down to 26: %v", err)
+	}
+	if got := versionCount(); got != before {
+		t.Errorf("versions after Down = %d, want %d", got, before)
+	}
+	if v, _, _ := mimosaLatest(); v != prevVersion {
+		t.Errorf("mimosa latest after Down = v%d, want v%d", v, prevVersion)
+	}
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+	if _, err := provider.UpTo(ctx, 27); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	check()
+}

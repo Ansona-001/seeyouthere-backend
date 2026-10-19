@@ -121,6 +121,9 @@ func resolveV2(t *Theme, m Manifest, p Palette, backgroundSrc string) {
 	if m.Ornament != nil {
 		o = *m.Ornament
 		o.HeroInk = resolveHeroInk(p, &m, glass)
+		if o.LabelInk != "" {
+			o.LabelInk = tokenHex(p, ink, o.LabelInk)
+		}
 	}
 	if m.Card != nil {
 		c = *m.Card

@@ -40,13 +40,16 @@ type Layer struct {
 }
 
 // Ornament selects the decorative pieces of a schema-2 theme. In a manifest
-// HeroInk is a colour token or ""; in a resolved Theme it is a hex colour.
+// HeroInk and LabelInk are colour tokens or ""; in a resolved Theme they are
+// hex colours (LabelInk "" when unset). LabelInk is the ink of the small
+// accent-font section labels only.
 type Ornament struct {
 	Hero      string `json:"hero"`
 	Divider   string `json:"divider"`
 	Badge     string `json:"badge"`
 	Ampersand string `json:"ampersand"`
 	HeroInk   string `json:"hero_ink"`
+	LabelInk  string `json:"label_ink"`
 	Date      string `json:"date,omitempty"`
 }
 
@@ -571,6 +574,7 @@ func validateOrnament(iss *issues, o *Ornament) {
 		}
 	}
 	checkToken(iss, "ornament.hero_ink", o.HeroInk, false)
+	checkToken(iss, "ornament.label_ink", o.LabelInk, false)
 	if o.Date != "" && !validDateOrnaments[o.Date] {
 		iss.add("ornament.date", "invalid_value", "unknown date ornament")
 	}
@@ -631,6 +635,7 @@ func maxArtTokenIndex(m *Manifest) int {
 	}
 	if m.Ornament != nil {
 		note(m.Ornament.HeroInk)
+		note(m.Ornament.LabelInk)
 	}
 	return need
 }
@@ -686,6 +691,16 @@ func checkPaletteContrastV2(iss *issues, i int, p *Palette, m *Manifest, glass b
 		low(path+".accent_ink", p.AccentInk, c.Surface, minTextContrastV2, "accent ink on surface doesn't meet 4.5:1 contrast")
 		for _, b := range blends {
 			low(path+".accent_ink", p.AccentInk, b, minTextContrastV2, "accent ink over the glass card doesn't meet 4.5:1 contrast")
+		}
+	}
+
+	// Label ink is text, so it must meet the accent ink's contrast.
+	if tok := m.Ornament.LabelInk; tok != "" {
+		labelInk := tokenHex(*p, paletteInk(*p, glass), tok)
+		low("ornament.label_ink", labelInk, c.Background, minTextContrastV2, "label ink on background doesn't meet 4.5:1 contrast")
+		low("ornament.label_ink", labelInk, c.Surface, minTextContrastV2, "label ink on surface doesn't meet 4.5:1 contrast")
+		for _, b := range blends {
+			low("ornament.label_ink", labelInk, b, minTextContrastV2, "label ink over the glass card doesn't meet 4.5:1 contrast")
 		}
 	}
 
