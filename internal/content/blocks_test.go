@@ -450,6 +450,37 @@ func TestBuildInitialContent(t *testing.T) {
 	}
 }
 
+func TestBuildInitialContent_CapitalizesNamesInTitle(t *testing.T) {
+	occ := sampleOccasion(t)
+	raw, err := BuildInitialContent(occ, map[string]string{"name_1": "anson", "name_2": "élodie"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	saved, err := ValidateContent(raw, occ)
+	if err != nil {
+		t.Fatalf("built content should validate: %v", err)
+	}
+	if saved.Title != "Anson & Élodie" {
+		t.Errorf("title = %q, want %q", saved.Title, "Anson & Élodie")
+	}
+}
+
+func TestCapitalizeFirst(t *testing.T) {
+	for in, want := range map[string]string{
+		"anson":        "Anson",
+		"Anson":        "Anson",
+		"van der Berg": "Van der Berg",
+		"élodie":       "Élodie",
+		"дмитрий":      "Дмитрий",
+		"3rd floor":    "3rd floor",
+		"":             "",
+	} {
+		if got := capitalizeFirst(in); got != want {
+			t.Errorf("capitalizeFirst(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestBuildInitialContent_RequiredAnswerMissing(t *testing.T) {
 	occ := sampleOccasion(t)
 	if _, err := BuildInitialContent(occ, map[string]string{"name_1": "Ada"}); !hasIssueCode(err, "required") {
