@@ -103,7 +103,7 @@ func checkSchemaFields(iss *issues, m *Manifest) {
 			set  bool
 		}{
 			{"layers", m.Layers != nil}, {"ornament", m.Ornament != nil},
-			{"card", m.Card != nil}, {"motion", m.Motion != ""},
+			{"card", m.Card != nil}, {"motion", m.Motion != ""}, {"music", m.Music != ""},
 		} {
 			if f.set {
 				iss.add(f.name, "schema_mismatch", "this field needs schema 2")
@@ -163,6 +163,9 @@ func validateV2(iss *issues, m *Manifest) {
 	}
 	if !validMotions[m.Motion] {
 		iss.add("motion", "invalid_value", "unknown motion")
+	}
+	if m.Music != "" && !validMusics[m.Music] {
+		iss.add("music", "invalid_value", "unknown music")
 	}
 
 	// Cross references.

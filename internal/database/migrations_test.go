@@ -883,3 +883,92 @@ func TestMigration00028_RetiredSlugOwner(t *testing.T) {
 	}
 	checkUp()
 }
+
+// TestMigration00029_MimosaMusic applies migrations up to 29 and checks that Mimosa got exactly one new
+// published version (previous latest + 1) that differs only by music = music_box, that the manifest
+// validates and resolves the music, that no other template got a version, and that Down removes only
+// that version and Up can run again.
+func TestMigration00029_MimosaMusic(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 28); err != nil {
+		t.Fatalf("migrate to 28: %v", err)
+	}
+	versionCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions").Scan(&n); err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		return n
+	}
+	mimosaLatest := func() (version int, manifest []byte, published bool) {
+		t.Helper()
+		err := pool.QueryRow(ctx, `SELECT v.version, v.manifest, v.published_at IS NOT NULL
+			FROM template_versions v JOIN templates t ON t.id = v.template_id
+			WHERE t.slug = 'mimosa' ORDER BY v.version DESC LIMIT 1`).Scan(&version, &manifest, &published)
+		if err != nil {
+			t.Fatalf("read mimosa latest version: %v", err)
+		}
+		return version, manifest, published
+	}
+	before := versionCount()
+	prevVersion, prevManifest, _ := mimosaLatest()
+	if _, err := provider.UpTo(ctx, 29); err != nil {
+		t.Fatalf("migrate to 29: %v", err)
+	}
+
+	check := func() {
+		t.Helper()
+		if got := versionCount(); got != before+1 {
+			t.Errorf("versions = %d, want %d (only mimosa gets one)", got, before+1)
+		}
+		version, manifest, published := mimosaLatest()
+		if version != prevVersion+1 || !published {
+			t.Errorf("mimosa latest = v%d published=%v, want v%d published", version, published, prevVersion+1)
+		}
+		m, err := content.ValidateManifest(manifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest: %v", err)
+		}
+		old, err := content.ValidateManifest(prevManifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest(previous): %v", err)
+		}
+		if old.Music != "" {
+			t.Errorf("previous version was modified: music=%q", old.Music)
+		}
+		if len(m.Palettes) != len(old.Palettes) || m.Palettes[0].ID != old.Palettes[0].ID || m.Defaults != old.Defaults || len(m.Fonts) != len(old.Fonts) {
+			t.Errorf("palette/font ids changed: %+v vs %+v", m.Defaults, old.Defaults)
+		}
+		if m.Music != "music_box" {
+			t.Errorf("music = %q, want music_box", m.Music)
+		}
+		if th := content.ResolveTheme(m, nil, ""); th.Music != "music_box" {
+			t.Errorf("resolved music = %q, want music_box", th.Music)
+		}
+		var others int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM template_versions v JOIN templates t ON t.id = v.template_id
+			WHERE t.slug <> 'mimosa' AND v.manifest ? 'music'`).Scan(&others); err != nil || others != 0 {
+			t.Errorf("other templates with music = %d (err %v), want 0", others, err)
+		}
+	}
+	check()
+
+	if _, err := provider.DownTo(ctx, 28); err != nil {
+		t.Fatalf("down to 28: %v", err)
+	}
+	if got := versionCount(); got != before {
+		t.Errorf("versions after Down = %d, want %d", got, before)
+	}
+	if v, _, _ := mimosaLatest(); v != prevVersion {
+		t.Errorf("mimosa latest after Down = v%d, want v%d", v, prevVersion)
+	}
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+	if _, err := provider.UpTo(ctx, 29); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	check()
+}

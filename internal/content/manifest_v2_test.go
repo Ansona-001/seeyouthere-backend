@@ -513,6 +513,8 @@ func TestManifestV2_OrnamentCardMotion(t *testing.T) {
 		{name: "foil_sheen without foil", base: sprinkles, fn: func(m obj) { m["motion"] = "foil_sheen" }, code: "missing_palette_color"},
 		{name: "foil_numeral without foil", base: sprinkles, fn: func(m obj) { m["ornament"].(obj)["hero"] = "foil_numeral" }, code: "missing_palette_color"},
 		{name: "motion unknown", fn: func(m obj) { m["motion"] = "wobble" }, code: "invalid_value", path: "motion"},
+		{name: "music unknown", fn: func(m obj) { m["music"] = "jukebox" }, code: "invalid_value", path: "music"},
+		{name: "music number", fn: func(m obj) { m["music"] = 1 }, code: "invalid_json"},
 	})
 }
 

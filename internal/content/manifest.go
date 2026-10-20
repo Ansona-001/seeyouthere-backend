@@ -34,6 +34,7 @@ type Manifest struct {
 	Ornament *Ornament `json:"ornament,omitempty"`
 	Card     *Card     `json:"card,omitempty"`
 	Motion   string    `json:"motion,omitempty"`
+	Music    string    `json:"music,omitempty"`
 }
 
 type Palette struct {

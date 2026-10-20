@@ -110,7 +110,7 @@ func FuzzValidateManifest(f *testing.F) {
 			th := ResolveTheme(m, ov, "/media/abc/background")
 			if m.Schema == 2 {
 				assertThemeSafe(t, th)
-			} else if th.Engine != 0 || th.Layers != nil || th.Ornament != nil || th.Card != nil || th.Motion != "" {
+			} else if th.Engine != 0 || th.Layers != nil || th.Ornament != nil || th.Card != nil || th.Motion != "" || th.Music != "" {
 				t.Fatalf("schema 1 theme carries v2 fields: %+v", th)
 			}
 			j, err := json.Marshal(th)

@@ -131,6 +131,7 @@ var (
 	validCardFields  = fieldSet("boxed", "underline")
 	validCardButtons = fieldSet("accent", "foil")
 	validMotions     = fieldSet("none", "draw_on", "pop_and_settle", "foil_sheen", "sway")
+	validMusics      = fieldSet("none", "music_box")
 
 	// v1Dividers are the ornament dividers the v1 DecorationDivider renders;
 	// the fallback v1 `decoration` of a v2 theme is the divider if it is one.
