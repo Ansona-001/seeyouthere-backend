@@ -2133,6 +2133,7 @@ func TestAdv_AllowlistsMatchSpec(t *testing.T) {
 		{"card fields", validCardFields, []string{"boxed", "underline"}},
 		{"card buttons", validCardButtons, []string{"accent", "foil"}},
 		{"motions", validMotions, []string{"none", "draw_on", "pop_and_settle", "foil_sheen", "sway"}},
+		{"musics", validMusics, []string{"none", "music_box"}},
 		{"v1 dividers", v1Dividers, []string{"none", "line", "floral", "dots", "heart"}},
 	}
 	for _, s := range sets {
@@ -2416,6 +2417,9 @@ func advVariants(tb testing.TB) []advVariant {
 	}
 	for _, v := range advSortedKeys(validMotions) {
 		add("motion/"+v, func(m obj) { m["motion"] = v })
+	}
+	for _, v := range advSortedKeys(validMusics) {
+		add("music/"+v, func(m obj) { m["music"] = v })
 	}
 	for _, v := range advSortedKeys(validHeroOrnaments) {
 		add("ornament.hero/"+v, func(m obj) { m["ornament"].(obj)["hero"] = v })

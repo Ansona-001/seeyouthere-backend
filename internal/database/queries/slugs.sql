@@ -15,6 +15,8 @@ SELECT EXISTS (
 -- name: SlugTaken :one
 -- exclude_event_id lets an event keep its own slug. Soft-deleted events keep their slug reserved, and
 -- so does a hard-deleted published event's slug for 30 days (retired_slugs, written by a trigger).
+-- user_id is the caller's verified session user (NULL when anonymous): the hold does not apply to the
+-- user who owned the deleted event. A tombstone with an unknown owner (NULL) holds against everyone.
 SELECT (
     EXISTS (
         SELECT 1 FROM events e
@@ -23,8 +25,23 @@ SELECT (
     OR EXISTS (
         SELECT 1 FROM retired_slugs r
         WHERE r.slug = @slug::text AND r.retired_at > now() - interval '30 days'
+          AND (r.owner_id = sqlc.narg(user_id)::uuid) IS NOT TRUE
     )
 )::boolean AS taken;
+
+-- name: ClearRetiredSlugOwner :exec
+-- Admin delete of a live event: its owner gets no exemption from the slug's 30-day hold.
+UPDATE retired_slugs SET owner_id = NULL WHERE slug = @slug;
+
+-- name: ClearRetiredSlugOwnerForUser :exec
+-- A user being deleted, suspended or banned loses every exemption (retired_slugs_owner_id_idx). Run it
+-- after the users row update, in the same transaction.
+UPDATE retired_slugs SET owner_id = NULL WHERE owner_id = @owner_id::uuid;
+
+-- name: DeleteExpiredRetiredSlugs :execrows
+-- Cleanup job: a tombstone older than 30 days no longer holds its slug (SlugTaken), so it is dropped.
+-- The table only holds about 30 days of deletes, so this scan stays small.
+DELETE FROM retired_slugs WHERE retired_at <= now() - interval '30 days';
 
 -- name: ListBlocklist :many
 -- Keyset on term; first page passes after_term = ''.

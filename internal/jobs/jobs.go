@@ -110,6 +110,14 @@ func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) err
 	}
 	slog.InfoContext(ctx, "cleanup", "expired_sessions", n)
 
+	// Slug tombstones past their 30-day hold no longer block anything; dropping them bounds the
+	// table and removes the former owners' user ids.
+	n, err = w.Queries.DeleteExpiredRetiredSlugs(ctx)
+	if err != nil {
+		return fmt.Errorf("delete expired retired slugs: %w", err)
+	}
+	slog.InfoContext(ctx, "cleanup", "expired_retired_slugs", n)
+
 	// Expired anonymous drafts: media files first, then the rows (a failed
 	// file delete keeps the row so the next run retries).
 	var totalDrafts int64

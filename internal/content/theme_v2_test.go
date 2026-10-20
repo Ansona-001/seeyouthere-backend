@@ -129,6 +129,9 @@ func assertThemeSafe(t *testing.T, th Theme) {
 		t.Errorf("card.radius = %v", th.Card.Radius)
 	}
 	enum("motion", th.Motion, validMotions)
+	if th.Music != "" {
+		enum("music", th.Music, validMusics)
+	}
 	enum("layout", th.Layout, validLayouts)
 	enum("hero_style", th.HeroStyle, validHeroStyleV2)
 	enum("decoration", th.Decoration, v1Dividers)

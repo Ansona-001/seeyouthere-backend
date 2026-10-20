@@ -768,3 +768,207 @@ func TestMigration00027_MimosaGoldLabels(t *testing.T) {
 	}
 	check()
 }
+
+// TestMigration00028_RetiredSlugOwner applies migrations up to 27, leaves a tombstone, then applies 00028:
+// the old tombstone gets a NULL owner (held against everyone, its owner included), and the trigger now
+// records the deleted event's owner, whom SlugTaken exempts. Down must restore 00011's trigger function
+// exactly and drop the column and its index, with deletes still writing tombstones; Up then runs again.
+func TestMigration00028_RetiredSlugOwner(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 27); err != nil {
+		t.Fatalf("migrate to 27: %v", err)
+	}
+	functionDef := func() string {
+		t.Helper()
+		var def string
+		if err := pool.QueryRow(ctx, "SELECT pg_get_functiondef('events_retire_slug'::regproc)").Scan(&def); err != nil {
+			t.Fatalf("read events_retire_slug: %v", err)
+		}
+		return def
+	}
+	ownerColumns := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.columns WHERE table_name = 'retired_slugs' AND column_name = 'owner_id'").Scan(&n); err != nil {
+			t.Fatalf("count owner_id columns: %v", err)
+		}
+		return n
+	}
+	ownerIndexes := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_indexes WHERE indexname = 'retired_slugs_owner_id_idx'").Scan(&n); err != nil {
+			t.Fatalf("count owner_id indexes: %v", err)
+		}
+		return n
+	}
+	owner := uuid.Must(uuid.NewV7())
+	if _, err := pool.Exec(ctx, "INSERT INTO users (id, email) VALUES ($1, $2)", owner, "mig28-"+owner.String()+"@example.invalid"); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	// publishAndDelete hard-deletes a published event of owner's with slug, leaving a tombstone.
+	publishAndDelete := func(slug string) {
+		t.Helper()
+		id := uuid.Must(uuid.NewV7())
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO events (id, owner_id, occasion_slug, title, content, template_id, template_version, slug, status, published_at)
+			SELECT $1, $2, 'birthday', 'mig28', '[]', t.id, tv.version, $3, 'published', now()
+			FROM templates t JOIN template_versions tv ON tv.template_id = t.id LIMIT 1`, id, owner, slug); err != nil {
+			t.Fatalf("insert published event %s: %v", slug, err)
+		}
+		if _, err := pool.Exec(ctx, "DELETE FROM events WHERE id = $1", id); err != nil {
+			t.Fatalf("delete event %s: %v", slug, err)
+		}
+	}
+	before := functionDef()
+	publishAndDelete("mig28-legacy")
+
+	if _, err := provider.UpTo(ctx, 28); err != nil {
+		t.Fatalf("migrate to 28: %v", err)
+	}
+	q := store.New(pool)
+	taken := func(slug string) bool {
+		t.Helper()
+		got, err := q.SlugTaken(ctx, store.SlugTakenParams{Slug: slug, UserID: &owner})
+		if err != nil {
+			t.Fatalf("SlugTaken(%s): %v", slug, err)
+		}
+		return got
+	}
+	checkUp := func() {
+		t.Helper()
+		var legacyOwner *uuid.UUID
+		if err := pool.QueryRow(ctx, "SELECT owner_id FROM retired_slugs WHERE slug = 'mig28-legacy'").Scan(&legacyOwner); err != nil || legacyOwner != nil {
+			t.Errorf("pre-migration tombstone owner = %v (err %v), want NULL", legacyOwner, err)
+		}
+		if !taken("mig28-legacy") {
+			t.Error("pre-migration tombstone is not held against its former owner, want held (owner unknown)")
+		}
+		publishAndDelete("mig28-new")
+		if taken("mig28-new") {
+			t.Error("new tombstone is held against its owner, want the owner exempt")
+		}
+		if _, err := pool.Exec(ctx, "DELETE FROM retired_slugs WHERE slug = 'mig28-new'"); err != nil {
+			t.Fatalf("clear new tombstone: %v", err)
+		}
+		if n := ownerIndexes(); n != 1 {
+			t.Errorf("retired_slugs_owner_id_idx count = %d, want 1", n)
+		}
+	}
+	checkUp()
+	if functionDef() == before {
+		t.Error("events_retire_slug unchanged by 00028")
+	}
+
+	if _, err := provider.DownTo(ctx, 27); err != nil {
+		t.Fatalf("down to 27: %v", err)
+	}
+	if got := functionDef(); got != before {
+		t.Errorf("events_retire_slug after Down = %q, want 00011's %q", got, before)
+	}
+	if n := ownerColumns(); n != 0 {
+		t.Errorf("owner_id columns after Down = %d, want 0", n)
+	}
+	if n := ownerIndexes(); n != 0 {
+		t.Errorf("owner_id indexes after Down = %d, want 0", n)
+	}
+	publishAndDelete("mig28-down")
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM retired_slugs WHERE slug = 'mig28-down' AND retired_at > now() - interval '1 minute'").Scan(&n); err != nil || n != 1 {
+		t.Errorf("tombstones written after Down = %d (err %v), want 1", n, err)
+	}
+
+	if _, err := provider.UpTo(ctx, 28); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	checkUp()
+}
+
+// TestMigration00029_MimosaMusic applies migrations up to 29 and checks that Mimosa got exactly one new
+// published version (previous latest + 1) that differs only by music = music_box, that the manifest
+// validates and resolves the music, that no other template got a version, and that Down removes only
+// that version and Up can run again.
+func TestMigration00029_MimosaMusic(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 28); err != nil {
+		t.Fatalf("migrate to 28: %v", err)
+	}
+	versionCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions").Scan(&n); err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		return n
+	}
+	mimosaLatest := func() (version int, manifest []byte, published bool) {
+		t.Helper()
+		err := pool.QueryRow(ctx, `SELECT v.version, v.manifest, v.published_at IS NOT NULL
+			FROM template_versions v JOIN templates t ON t.id = v.template_id
+			WHERE t.slug = 'mimosa' ORDER BY v.version DESC LIMIT 1`).Scan(&version, &manifest, &published)
+		if err != nil {
+			t.Fatalf("read mimosa latest version: %v", err)
+		}
+		return version, manifest, published
+	}
+	before := versionCount()
+	prevVersion, prevManifest, _ := mimosaLatest()
+	if _, err := provider.UpTo(ctx, 29); err != nil {
+		t.Fatalf("migrate to 29: %v", err)
+	}
+
+	check := func() {
+		t.Helper()
+		if got := versionCount(); got != before+1 {
+			t.Errorf("versions = %d, want %d (only mimosa gets one)", got, before+1)
+		}
+		version, manifest, published := mimosaLatest()
+		if version != prevVersion+1 || !published {
+			t.Errorf("mimosa latest = v%d published=%v, want v%d published", version, published, prevVersion+1)
+		}
+		m, err := content.ValidateManifest(manifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest: %v", err)
+		}
+		old, err := content.ValidateManifest(prevManifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest(previous): %v", err)
+		}
+		if old.Music != "" {
+			t.Errorf("previous version was modified: music=%q", old.Music)
+		}
+		if len(m.Palettes) != len(old.Palettes) || m.Palettes[0].ID != old.Palettes[0].ID || m.Defaults != old.Defaults || len(m.Fonts) != len(old.Fonts) {
+			t.Errorf("palette/font ids changed: %+v vs %+v", m.Defaults, old.Defaults)
+		}
+		if m.Music != "music_box" {
+			t.Errorf("music = %q, want music_box", m.Music)
+		}
+		if th := content.ResolveTheme(m, nil, ""); th.Music != "music_box" {
+			t.Errorf("resolved music = %q, want music_box", th.Music)
+		}
+		var others int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM template_versions v JOIN templates t ON t.id = v.template_id
+			WHERE t.slug <> 'mimosa' AND v.manifest ? 'music'`).Scan(&others); err != nil || others != 0 {
+			t.Errorf("other templates with music = %d (err %v), want 0", others, err)
+		}
+	}
+	check()
+
+	if _, err := provider.DownTo(ctx, 28); err != nil {
+		t.Fatalf("down to 28: %v", err)
+	}
+	if got := versionCount(); got != before {
+		t.Errorf("versions after Down = %d, want %d", got, before)
+	}
+	if v, _, _ := mimosaLatest(); v != prevVersion {
+		t.Errorf("mimosa latest after Down = v%d, want v%d", v, prevVersion)
+	}
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+	if _, err := provider.UpTo(ctx, 29); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	check()
+}
