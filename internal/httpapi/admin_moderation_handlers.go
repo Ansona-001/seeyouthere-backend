@@ -598,7 +598,18 @@ func (s *Server) handleAdminDeleteEvent(w http.ResponseWriter, r *http.Request) 
 		}); err != nil {
 			return err
 		}
-		return jobs.PurgeLockedEvent(ctx, q, s.media, eventID)
+		if err := jobs.PurgeLockedEvent(ctx, q, s.media, eventID); err != nil {
+			return err
+		}
+		// The delete trigger exempts the owner from the slug's 30-day hold. An admin removing a
+		// live event must not hand its link straight back to that owner; an event the owner had
+		// already deleted only had its purge brought forward, so their exemption stays.
+		if row.Slug != nil && row.DeletedAt == nil {
+			if err := q.ClearRetiredSlugOwner(ctx, *row.Slug); err != nil {
+				return fmt.Errorf("clear retired slug owner: %w", err)
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		switch {

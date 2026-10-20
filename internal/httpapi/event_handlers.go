@@ -1132,7 +1132,9 @@ func (s *Server) handleUpdateEventSettings(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusConflict, "slug_blocked", "That link isn't available.")
 			return
 		}
-		taken, err := s.q.SlugTaken(ctx, store.SlugTakenParams{Slug: norm, ExcludeEventID: &eventID})
+		// UserID is the session user, who is the event's owner here: they may take back the
+		// link of an event of theirs that was deleted, which stays held against everyone else.
+		taken, err := s.q.SlugTaken(ctx, store.SlugTakenParams{Slug: norm, ExcludeEventID: &eventID, UserID: &userID})
 		if err != nil {
 			serverError(w, r, fmt.Errorf("check slug taken: %w", err))
 			return
@@ -1251,7 +1253,8 @@ func (s *Server) handleCheckSlug(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"slug": norm, "available": false, "reason": "blocked"})
 		return
 	}
-	taken, err := s.q.SlugTaken(ctx, store.SlugTakenParams{Slug: norm, ExcludeEventID: nil})
+	// Same rule as the settings write, so the check and the save never disagree for this user.
+	taken, err := s.q.SlugTaken(ctx, store.SlugTakenParams{Slug: norm, ExcludeEventID: nil, UserID: &userID})
 	if err != nil {
 		serverError(w, r, fmt.Errorf("check slug taken: %w", err))
 		return

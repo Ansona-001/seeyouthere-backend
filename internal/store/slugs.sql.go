@@ -31,6 +31,27 @@ func (q *Queries) AddBlockTerm(ctx context.Context, arg AddBlockTermParams) (int
 	return result.RowsAffected(), nil
 }
 
+const clearRetiredSlugOwner = `-- name: ClearRetiredSlugOwner :exec
+UPDATE retired_slugs SET owner_id = NULL WHERE slug = $1
+`
+
+// Admin delete of a live event: its owner gets no exemption from the slug's 30-day hold.
+func (q *Queries) ClearRetiredSlugOwner(ctx context.Context, slug string) error {
+	_, err := q.db.Exec(ctx, clearRetiredSlugOwner, slug)
+	return err
+}
+
+const clearRetiredSlugOwnerForUser = `-- name: ClearRetiredSlugOwnerForUser :exec
+UPDATE retired_slugs SET owner_id = NULL WHERE owner_id = $1::uuid
+`
+
+// A user being deleted, suspended or banned loses every exemption (retired_slugs_owner_id_idx). Run it
+// after the users row update, in the same transaction.
+func (q *Queries) ClearRetiredSlugOwnerForUser(ctx context.Context, ownerID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, clearRetiredSlugOwnerForUser, ownerID)
+	return err
+}
+
 const deleteBlockTerm = `-- name: DeleteBlockTerm :one
 DELETE FROM slug_blocklist
 WHERE term = $1
@@ -47,6 +68,20 @@ func (q *Queries) DeleteBlockTerm(ctx context.Context, term string) (DeleteBlock
 	var i DeleteBlockTermRow
 	err := row.Scan(&i.Term, &i.Reason)
 	return i, err
+}
+
+const deleteExpiredRetiredSlugs = `-- name: DeleteExpiredRetiredSlugs :execrows
+DELETE FROM retired_slugs WHERE retired_at <= now() - interval '30 days'
+`
+
+// Cleanup job: a tombstone older than 30 days no longer holds its slug (SlugTaken), so it is dropped.
+// The table only holds about 30 days of deletes, so this scan stays small.
+func (q *Queries) DeleteExpiredRetiredSlugs(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredRetiredSlugs)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const listBlocklist = `-- name: ListBlocklist :many
@@ -114,6 +149,7 @@ SELECT (
     OR EXISTS (
         SELECT 1 FROM retired_slugs r
         WHERE r.slug = $1::text AND r.retired_at > now() - interval '30 days'
+          AND (r.owner_id = $3::uuid) IS NOT TRUE
     )
 )::boolean AS taken
 `
@@ -121,12 +157,15 @@ SELECT (
 type SlugTakenParams struct {
 	Slug           string     `json:"slug"`
 	ExcludeEventID *uuid.UUID `json:"exclude_event_id"`
+	UserID         *uuid.UUID `json:"user_id"`
 }
 
 // exclude_event_id lets an event keep its own slug. Soft-deleted events keep their slug reserved, and
 // so does a hard-deleted published event's slug for 30 days (retired_slugs, written by a trigger).
+// user_id is the caller's verified session user (NULL when anonymous): the hold does not apply to the
+// user who owned the deleted event. A tombstone with an unknown owner (NULL) holds against everyone.
 func (q *Queries) SlugTaken(ctx context.Context, arg SlugTakenParams) (bool, error) {
-	row := q.db.QueryRow(ctx, slugTaken, arg.Slug, arg.ExcludeEventID)
+	row := q.db.QueryRow(ctx, slugTaken, arg.Slug, arg.ExcludeEventID, arg.UserID)
 	var taken bool
 	err := row.Scan(&taken)
 	return taken, err

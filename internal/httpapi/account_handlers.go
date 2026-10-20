@@ -236,6 +236,9 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		if err := q.SoftDeleteUser(ctx, userID); err != nil {
 			return fmt.Errorf("soft delete user: %w", err)
 		}
+		if err := q.ClearRetiredSlugOwnerForUser(ctx, userID); err != nil {
+			return fmt.Errorf("clear retired slug owner: %w", err)
+		}
 
 		if len(eventIDs) > 0 {
 			params := make([]river.InsertManyParams, len(eventIDs))

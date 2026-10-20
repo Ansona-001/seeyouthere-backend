@@ -328,6 +328,10 @@ func (s *Server) handleSetAdminUserStatus(w http.ResponseWriter, r *http.Request
 				return fmt.Errorf("delete user sessions: %w", err)
 			}
 			revokedHashes = hashes
+			// A suspended or banned owner loses the exemption from their old links' 30-day hold.
+			if err := q.ClearRetiredSlugOwnerForUser(ctx, targetID); err != nil {
+				return fmt.Errorf("clear retired slug owner: %w", err)
+			}
 		}
 		if body.Status == "banned" {
 			eventIDs, err := q.TakeDownEventsByOwner(ctx, targetID)
@@ -653,6 +657,9 @@ func (s *Server) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := q.SoftDeleteUser(ctx, targetID); err != nil {
 			return fmt.Errorf("soft delete user: %w", err)
+		}
+		if err := q.ClearRetiredSlugOwnerForUser(ctx, targetID); err != nil {
+			return fmt.Errorf("clear retired slug owner: %w", err)
 		}
 		after := map[string]string{}
 		if reason != "" {

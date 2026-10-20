@@ -137,8 +137,9 @@ type Report struct {
 }
 
 type RetiredSlug struct {
-	Slug      string    `json:"slug"`
-	RetiredAt time.Time `json:"retired_at"`
+	Slug      string     `json:"slug"`
+	RetiredAt time.Time  `json:"retired_at"`
+	OwnerID   *uuid.UUID `json:"owner_id"`
 }
 
 type Rsvp struct {
