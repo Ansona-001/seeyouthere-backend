@@ -162,6 +162,7 @@ type locationBlockJSON struct {
 type scheduleItemJSON struct {
 	Time        string `json:"time"`
 	Title       string `json:"title"`
+	Location    string `json:"location"`
 	Description string `json:"description"`
 }
 
@@ -323,7 +324,9 @@ func allowedBlockTypes(occ Occasion) map[string]bool {
 // events.starts_at / Saved.EndsAt. It tolerates an invalid datetime block
 // (returns loc=nil); the real validation error for that block is reported by
 // the main pass. end is nil whenever end_local is empty or unparseable.
-func datetimeZone(in []json.RawMessage) (loc *time.Location, start, end *time.Time, present bool) {
+// A non-empty tzOverride (the venue's zone, see venueTimezone) replaces the
+// block's own timezone.
+func datetimeZone(in []json.RawMessage, tzOverride string) (loc *time.Location, start, end *time.Time, present bool) {
 	for _, raw := range in {
 		var meta blockMeta
 		if err := json.Unmarshal(raw, &meta); err != nil || meta.Type != "datetime" {
@@ -333,6 +336,9 @@ func datetimeZone(in []json.RawMessage) (loc *time.Location, start, end *time.Ti
 		var b datetimeBlockJSON
 		if err := strictUnmarshal(raw, &b); err != nil {
 			return nil, nil, nil, true
+		}
+		if tzOverride != "" {
+			b.Timezone = tzOverride
 		}
 		l, err := time.LoadLocation(b.Timezone)
 		if err != nil || b.Timezone == "Local" {
@@ -364,7 +370,10 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 	}
 
 	allowed := allowedBlockTypes(occ)
-	dtLoc, dtStart, dtEnd, haveDatetime := datetimeZone(in)
+	// The event's time zone follows its venue: when the location block's map link carries coordinates,
+	// the datetime block is saved in that zone, whatever zone the client sent.
+	venueTZ := venueTimezone(in)
+	dtLoc, dtStart, dtEnd, haveDatetime := datetimeZone(in, venueTZ)
 
 	iss := &issues{}
 	ids := make(map[string]bool, len(in))
@@ -459,6 +468,9 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 			}
 			b.Kicker = checkField(iss, path+".kicker", b.Kicker, kickerMax, false, false)
 			b.Heading = checkField(iss, path+".heading", b.Heading, headingMax, false, false)
+			if venueTZ != "" {
+				b.Timezone = venueTZ
+			}
 			if b.Timezone == "Local" {
 				iss.add(path+".timezone", "invalid_timezone", "Choose a specific timezone.")
 			} else if _, err := time.LoadLocation(b.Timezone); err != nil {
@@ -528,6 +540,7 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 					}
 				}
 				it.Title = checkField(iss, ip+".title", it.Title, headingMax, true, false)
+				it.Location = checkField(iss, ip+".location", it.Location, 120, false, false)
 				it.Description = checkField(iss, ip+".description", it.Description, 300, false, false)
 			}
 			if firstHeading == "" && b.Heading != "" {

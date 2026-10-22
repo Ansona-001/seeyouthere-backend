@@ -26,7 +26,7 @@ func ExtractCalendarInfo(stored []byte) (start, end *time.Time, location string)
 	if err := json.Unmarshal(stored, &in); err != nil {
 		return nil, nil, ""
 	}
-	_, start, end, _ = datetimeZone(in)
+	_, start, end, _ = datetimeZone(in, "")
 
 	for _, raw := range in {
 		var meta blockMeta

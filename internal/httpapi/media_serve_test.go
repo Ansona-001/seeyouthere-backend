@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,6 +127,41 @@ func TestServeMedia_Matrix(t *testing.T) {
 		}
 		if rec.Header().Get("ETag") != etag || rec.Header().Get("Cache-Control") != "public, max-age=3600" {
 			t.Errorf("304 headers = %v", rec.Header())
+		}
+	})
+
+	t.Run("og.jpg serves the link-preview image, inside 1200x630, with the usual headers and a stable ETag", func(t *testing.T) {
+		rec := getMedia(h, path("og.jpg"), nextTestIP(), nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Type"); got != "image/jpeg" {
+			t.Errorf("Content-Type = %q", got)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "public, max-age=3600" {
+			t.Errorf("Cache-Control = %q", got)
+		}
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(rec.Body.Bytes()))
+		if err != nil || cfg.Width < 1 || cfg.Height < 1 || cfg.Width > media.OGWidth || cfg.Height > media.OGHeight {
+			t.Fatalf("image = %+v (err %v), want a JPEG inside %dx%d", cfg, err, media.OGWidth, media.OGHeight)
+		}
+		etag := rec.Header().Get("ETag")
+		if etag == "" {
+			t.Fatal("missing ETag")
+		}
+		again := getMedia(h, path("og.jpg"), nextTestIP(), map[string]string{"If-None-Match": etag})
+		if again.Code != http.StatusNotModified || again.Body.Len() != 0 {
+			t.Errorf("matching If-None-Match: status = %d, body = %d bytes, want 304 and empty", again.Code, again.Body.Len())
+		}
+	})
+
+	t.Run("og.jpg of a media item that is not servable is the same 404", func(t *testing.T) {
+		other := fmt.Sprintf("/media/%s/%s/og.jpg", otherEvent.ID, mediaID)
+		if rec := getMedia(h, other, nextTestIP(), nil); rec.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", rec.Code)
+		}
+		if rec := getMedia(h, fmt.Sprintf("/media/%s/%s/og.png", f.eventID, mediaID), nextTestIP(), nil); rec.Code != http.StatusNotFound {
+			t.Errorf("og.png: status = %d, want 404", rec.Code)
 		}
 	})
 
