@@ -126,7 +126,7 @@ var (
 	validAmpersands    = fieldSet("none", "script", "word")
 	validDateOrnaments = fieldSet("bars")
 
-	validCardStyles  = fieldSet("none", "soft", "glass", "reply_card", "sticker", "chamfered")
+	validCardStyles  = fieldSet("none", "soft", "glass", "reply_card", "sticker", "chamfered", "open")
 	validCardBorders = fieldSet("none", "hairline", "ink", "foil", "foil_inset")
 	validCardFields  = fieldSet("boxed", "underline")
 	validCardButtons = fieldSet("accent", "foil")

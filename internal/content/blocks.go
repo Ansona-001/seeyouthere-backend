@@ -117,6 +117,91 @@ type mediaRef struct {
 	Alt     string `json:"alt"`
 }
 
+// sectionPhotoJSON is the optional background picture any section except hero and photo can show behind its
+// content. Fade is how strongly it shows: soft, medium or strong.
+type sectionPhotoJSON struct {
+	MediaID string `json:"media_id"`
+	Fade    string `json:"fade"`
+}
+
+// withSectionPhoto marshals a validated block with its section photo added as a `photo` member.
+type withSectionPhoto struct {
+	block any
+	photo sectionPhotoJSON
+}
+
+func (w withSectionPhoto) MarshalJSON() ([]byte, error) {
+	b, err := json.Marshal(w.block)
+	if err != nil {
+		return nil, err
+	}
+	p, err := json.Marshal(w.photo)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) < 2 || b[len(b)-1] != '}' {
+		return nil, errors.New("section photo: block is not a JSON object")
+	}
+	sep := ","
+	if len(b) == 2 {
+		sep = ""
+	}
+	out := make([]byte, 0, len(b)+len(p)+10)
+	out = append(out, b[:len(b)-1]...)
+	out = append(out, sep...)
+	out = append(out, `"photo":`...)
+	out = append(out, p...)
+	return append(out, '}'), nil
+}
+
+// splitSectionPhoto removes and validates the optional background `photo` member of a block. It returns the block without
+// it, plus the normalised photo (nil when absent or null). A malformed block is returned untouched so the
+// per-type decoder reports it. Hero and photo blocks cannot carry one.
+func splitSectionPhoto(path string, raw json.RawMessage, iss *issues, addMedia func(path, raw string) (uuid.UUID, bool)) (json.RawMessage, *sectionPhotoJSON) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw, nil
+	}
+	rawPhoto, ok := fields["photo"]
+	if !ok {
+		return raw, nil
+	}
+	var meta blockMeta
+	_ = json.Unmarshal(raw, &meta)
+	if meta.Type == "hero" || meta.Type == "image" {
+		iss.add(path+".photo", "not_allowed", "This section can't have a photo.")
+		return raw, nil
+	}
+	delete(fields, "photo")
+	stripped, err := json.Marshal(fields)
+	if err != nil {
+		return raw, nil
+	}
+	if string(rawPhoto) == "null" {
+		return stripped, nil
+	}
+	var p sectionPhotoJSON
+	if err := strictUnmarshal(rawPhoto, &p); err != nil {
+		iss.add(path+".photo", "invalid_json", "invalid photo")
+		return stripped, nil
+	}
+	pp := path + ".photo"
+	if p.MediaID == "" {
+		iss.add(pp+".media_id", "required", "This field is required.")
+	}
+	addMedia(pp+".media_id", p.MediaID)
+	switch p.Fade {
+	case "":
+		p.Fade = "medium"
+	case "soft", "medium", "strong":
+		// valid
+	default:
+		iss.add(pp+".fade", "invalid_value", "Unknown background strength.")
+		p.Fade = "medium"
+	}
+	return stripped, &p
+}
+
 type heroBlockJSON struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
@@ -177,6 +262,10 @@ type scheduleBlockJSON struct {
 type imageBlockJSON struct {
 	ID      string `json:"id"`
 	Type    string `json:"type"`
+	Kicker  string `json:"kicker"`
+	Heading string `json:"heading"`
+	Size    string `json:"size"`
+	Ratio   string `json:"ratio"`
 	MediaID string `json:"media_id"`
 	Alt     string `json:"alt"`
 	Caption string `json:"caption"`
@@ -370,10 +459,6 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 	}
 
 	allowed := allowedBlockTypes(occ)
-	// The event's time zone follows its venue: when the location block's map link carries coordinates,
-	// the datetime block is saved in that zone, whatever zone the client sent.
-	venueTZ := venueTimezone(in)
-	dtLoc, dtStart, dtEnd, haveDatetime := datetimeZone(in, venueTZ)
 
 	iss := &issues{}
 	ids := make(map[string]bool, len(in))
@@ -398,6 +483,19 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 		mediaIDs = append(mediaIDs, id)
 		return id, true
 	}
+
+	// Every section except hero and photo may carry an optional `photo`. It is validated and lifted out here so
+	// the per-type decoders below (which reject unknown fields) and the pre-passes never see it, and put back
+	// on the canonical block afterwards.
+	sectionPhotos := make([]*sectionPhotoJSON, len(in))
+	for i := range in {
+		in[i], sectionPhotos[i] = splitSectionPhoto(fmt.Sprintf("content[%d]", i), in[i], iss, addMedia)
+	}
+
+	// The event's time zone follows its venue: when the location block's map link carries coordinates,
+	// the datetime block is saved in that zone, whatever zone the client sent.
+	venueTZ := venueTimezone(in)
+	dtLoc, dtStart, dtEnd, haveDatetime := datetimeZone(in, venueTZ)
 
 	for i, rawBlock := range in {
 		path := fmt.Sprintf("content[%d]", i)
@@ -558,6 +656,26 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 				iss.add(path+".media_id", "required", "This field is required.")
 			}
 			addMedia(path+".media_id", b.MediaID)
+			b.Kicker = checkField(iss, path+".kicker", b.Kicker, kickerMax, false, false)
+			b.Heading = checkField(iss, path+".heading", b.Heading, headingMax, false, false)
+			switch b.Size {
+			case "":
+				b.Size = "large"
+			case "small", "medium", "large", "full":
+				// valid
+			default:
+				iss.add(path+".size", "invalid_value", "Unknown photo size.")
+				b.Size = "large"
+			}
+			switch b.Ratio {
+			case "":
+				b.Ratio = "original"
+			case "original", "square", "landscape", "wide", "portrait":
+				// valid
+			default:
+				iss.add(path+".ratio", "invalid_value", "Unknown photo shape.")
+				b.Ratio = "original"
+			}
 			b.Alt = checkField(iss, path+".alt", b.Alt, 200, false, false)
 			b.Caption = checkField(iss, path+".caption", b.Caption, 200, false, false)
 			out[i] = b
@@ -823,6 +941,9 @@ func ValidateContent(raw json.RawMessage, occ Occasion) (Saved, error) {
 			}
 			wishesBlock = &WishesBlock{Open: b.Open}
 			out[i] = b
+		}
+		if sectionPhotos[i] != nil && out[i] != nil {
+			out[i] = withSectionPhoto{block: out[i], photo: *sectionPhotos[i]}
 		}
 	}
 

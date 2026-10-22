@@ -96,7 +96,7 @@ func ResolveTheme(m Manifest, overridesRaw []byte, backgroundSrc string) Theme {
 		t.Background = &ThemeBackground{Src: backgroundSrc, Opacity: m.Background.Opacity}
 	}
 	if m.Schema == 2 {
-		resolveV2(&t, m, selected, backgroundSrc)
+		resolveV2(&t, m, selected, backgroundSrc, o.Boxes == "off")
 		return t
 	}
 	t.AccentInk = accentInk(t.Palette, t.Surface)
@@ -107,7 +107,7 @@ func ResolveTheme(m Manifest, overridesRaw []byte, backgroundSrc string) Theme {
 // palette p: every colour token becomes that palette's hex, the image layer
 // gets its server-built src (and is dropped when there is no asset), and the
 // v1 fields get fallbacks for older renderers. m is assumed valid.
-func resolveV2(t *Theme, m Manifest, p Palette, backgroundSrc string) {
+func resolveV2(t *Theme, m Manifest, p Palette, backgroundSrc string, open bool) {
 	glass := m.Card != nil && m.Card.Style == "glass"
 	ink := paletteInk(p, glass)
 
@@ -130,6 +130,10 @@ func resolveV2(t *Theme, m Manifest, p Palette, backgroundSrc string) {
 	if m.Card != nil {
 		c = *m.Card
 		c.Radius = copyPtr(c.Radius)
+	}
+	if open {
+		// The event turned its section boxes off: no card background or border, whatever the template's style.
+		c.Style, c.Border = "open", "none"
 	}
 	t.Ornament = &o
 	t.Card = &c
