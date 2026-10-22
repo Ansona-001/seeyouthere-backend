@@ -84,6 +84,9 @@ type ManifestBackground struct {
 type Overrides struct {
 	Palette string `json:"palette"`
 	Font    string `json:"font"`
+	// Boxes is "" (the template's own card style) or "off" (sections sit on the page with no box). Schema-2
+	// templates only.
+	Boxes string `json:"boxes"`
 }
 
 // Manifest size limits. A write (admin create/update) is held to both
@@ -375,6 +378,15 @@ func ValidateOverrides(raw []byte, m Manifest) ([]byte, error) {
 	}
 	if o.Font != "" && !hasFontID(m, o.Font) {
 		iss.add("overrides.font", "invalid_value", "unknown font pair for this template")
+	}
+	switch o.Boxes {
+	case "":
+	case "off":
+		if m.Schema != 2 {
+			iss.add("overrides.boxes", "invalid_value", "section boxes can't be turned off for this template")
+		}
+	default:
+		iss.add("overrides.boxes", "invalid_value", "must be empty or \"off\"")
 	}
 	if err := iss.err(); err != nil {
 		return nil, err

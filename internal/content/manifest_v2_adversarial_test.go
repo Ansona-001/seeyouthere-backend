@@ -2128,7 +2128,7 @@ func TestAdv_AllowlistsMatchSpec(t *testing.T) {
 		{"badges", validBadges, []string{"none", "starburst_sticker", "wax_seal", "foil_seal"}},
 		{"ampersands", validAmpersands, []string{"none", "script", "word"}},
 		{"date ornaments", validDateOrnaments, []string{"bars"}},
-		{"card styles", validCardStyles, []string{"none", "soft", "glass", "reply_card", "sticker", "chamfered"}},
+		{"card styles", validCardStyles, []string{"none", "soft", "glass", "reply_card", "sticker", "chamfered", "open"}},
 		{"card borders", validCardBorders, []string{"none", "hairline", "ink", "foil", "foil_inset"}},
 		{"card fields", validCardFields, []string{"boxed", "underline"}},
 		{"card buttons", validCardButtons, []string{"accent", "foil"}},
