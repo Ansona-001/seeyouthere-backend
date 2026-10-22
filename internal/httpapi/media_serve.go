@@ -78,6 +78,10 @@ var copyBufs = sync.Pool{New: func() any {
 // renditionFiles is the closed set of file names the public routes accept.
 var renditionFiles = map[string]int{"480.jpg": 480, "1080.jpg": 1080, "1920.jpg": 1920}
 
+// ogFile is the extra public file of an event photo: the 1200x630 link-preview
+// card built from the 1080 rendition (media.Store.OpenOG). It is not stored.
+const ogFile = "og.jpg"
+
 // parseCanonicalUUID accepts only the canonical lowercase hyphenated form, so
 // every object has exactly one URL.
 func parseCanonicalUUID(s string) (uuid.UUID, bool) {
@@ -103,17 +107,20 @@ func mediaErrorHeaders(w http.ResponseWriter) {
 	h.Set("X-Content-Type-Options", "nosniff")
 }
 
-// GET /media/{event_id}/{media_id}/{480|1080|1920}.jpg
+// GET /media/{event_id}/{media_id}/{480|1080|1920|og}.jpg
 //
 // Public: anyone with the link can view an approved photo of a live event.
 // The DB gate runs before any object-store call, so probing non-servable ids
-// costs no storage operations.
+// costs no storage operations. og.jpg is composed on request from the 1080
+// rendition, inside the same stream-concurrency and read-budget limits.
 func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 	mediaErrorHeaders(w)
 	eventID, ok1 := parseCanonicalUUID(chi.URLParam(r, "event_id"))
 	mediaID, ok2 := parseCanonicalUUID(chi.URLParam(r, "media_id"))
-	width, ok3 := renditionFiles[chi.URLParam(r, "file")]
-	if !ok1 || !ok2 || !ok3 {
+	file := chi.URLParam(r, "file")
+	width, ok3 := renditionFiles[file]
+	isOG := file == ogFile
+	if !ok1 || !ok2 || !(ok3 || isOG) {
 		notFoundFile(w)
 		return
 	}
@@ -127,6 +134,12 @@ func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		serverError(w, r, fmt.Errorf("get servable media: %w", err))
+		return
+	}
+	if isOG {
+		s.serveObject(w, r, func(ctx context.Context, inm string) (*media.Object, error) {
+			return s.media.OpenOG(ctx, eventID, mediaID, inm)
+		}, publicMediaCache, publicReads)
 		return
 	}
 	s.serveObject(w, r, func(ctx context.Context, inm string) (*media.Object, error) {
