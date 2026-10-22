@@ -31,6 +31,49 @@ func (q *Queries) AddBlockTerm(ctx context.Context, arg AddBlockTermParams) (int
 	return result.RowsAffected(), nil
 }
 
+const adminSetEventSlug = `-- name: AdminSetEventSlug :one
+WITH old AS (
+    SELECT id, slug FROM events
+    WHERE id = $2::uuid AND slug IS NOT NULL AND deleted_at IS NULL
+    FOR UPDATE
+)
+UPDATE events e
+SET slug = $1::text, updated_at = now()
+FROM old
+WHERE e.id = old.id
+RETURNING old.slug AS old_slug, e.slug AS new_slug
+`
+
+type AdminSetEventSlugParams struct {
+	Slug    string    `json:"slug"`
+	EventID uuid.UUID `json:"event_id"`
+}
+
+type AdminSetEventSlugRow struct {
+	OldSlug *string `json:"old_slug"`
+	NewSlug *string `json:"new_slug"`
+}
+
+// Admin only. Locks the live event, gives it a new slug and returns both. No row: unknown, deleted or
+// slug-less event. Uniqueness is the caller's check plus the events_slug_key constraint.
+func (q *Queries) AdminSetEventSlug(ctx context.Context, arg AdminSetEventSlugParams) (AdminSetEventSlugRow, error) {
+	row := q.db.QueryRow(ctx, adminSetEventSlug, arg.Slug, arg.EventID)
+	var i AdminSetEventSlugRow
+	err := row.Scan(&i.OldSlug, &i.NewSlug)
+	return i, err
+}
+
+const allowAdminSlugChange = `-- name: AllowAdminSlugChange :exec
+SELECT set_config('syt.slug_change', 'admin', true)
+`
+
+// Lets the next UPDATE of a published event's slug through the events_slug_immutable trigger. The setting
+// is local to the current transaction, so call it inside the same tx as AdminSetEventSlug.
+func (q *Queries) AllowAdminSlugChange(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, allowAdminSlugChange)
+	return err
+}
+
 const clearRetiredSlugOwner = `-- name: ClearRetiredSlugOwner :exec
 UPDATE retired_slugs SET owner_id = NULL WHERE slug = $1
 `
@@ -82,6 +125,19 @@ func (q *Queries) DeleteExpiredRetiredSlugs(ctx context.Context) (int64, error) 
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const holdRetiredSlug = `-- name: HoldRetiredSlug :exec
+INSERT INTO retired_slugs (slug, owner_id)
+VALUES ($1::text, NULL)
+ON CONFLICT (slug) DO UPDATE SET retired_at = now(), owner_id = NULL
+`
+
+// Reserves a slug for 30 days against everyone (no owner exemption), like the tombstone a deleted
+// published event leaves.
+func (q *Queries) HoldRetiredSlug(ctx context.Context, slug string) error {
+	_, err := q.db.Exec(ctx, holdRetiredSlug, slug)
+	return err
 }
 
 const listBlocklist = `-- name: ListBlocklist :many

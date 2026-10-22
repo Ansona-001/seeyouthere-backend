@@ -12,7 +12,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/ansonarose/seeyouthere-backend/internal/content"
 	"github.com/ansonarose/seeyouthere-backend/internal/jobs"
 	"github.com/ansonarose/seeyouthere-backend/internal/media"
 	"github.com/ansonarose/seeyouthere-backend/internal/store"
@@ -512,6 +514,92 @@ func (s *Server) handleAdminSetEventFlags(w http.ResponseWriter, r *http.Request
 			return
 		}
 		serverError(w, r, err)
+		return
+	}
+	s.respondWithAdminEvent(w, r, eventID)
+}
+
+// PATCH /v1/admin/events/{id}/slug {slug}
+//
+// handleAdminChangeEventSlug (super_admin only) moves a live event to a different public link, even after it
+// was published. The new link must pass the same checks the host's own slug field does (format, blocklist,
+// not taken by another event or held after a deletion), so it is always an available one. The old link stops
+// working at once and is held back from everyone else for 30 days. Slug change, hold and audit row share one
+// transaction.
+func (s *Server) handleAdminChangeEventSlug(w http.ResponseWriter, r *http.Request) {
+	eventID, err := parseUUIDParam(r, "id")
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such event.")
+		return
+	}
+	var body struct {
+		Slug string `json:"slug"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	norm, ok := content.NormalizeSlug(body.Slug)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_slug", "That's not a valid link.")
+		return
+	}
+
+	ctx := r.Context()
+	blocked, err := s.q.SlugBlocked(ctx, norm)
+	if err != nil {
+		serverError(w, r, fmt.Errorf("check slug blocklist: %w", err))
+		return
+	}
+	if blocked {
+		writeError(w, http.StatusConflict, "slug_blocked", "That link isn't available.")
+		return
+	}
+	// No user id: nobody gets the held-slug exemption here, so a link retired in the last 30 days stays unavailable.
+	taken, err := s.q.SlugTaken(ctx, store.SlugTakenParams{Slug: norm, ExcludeEventID: &eventID})
+	if err != nil {
+		serverError(w, r, fmt.Errorf("check slug taken: %w", err))
+		return
+	}
+	if taken {
+		writeError(w, http.StatusConflict, "slug_taken", "That link is already taken.")
+		return
+	}
+
+	callerID, _ := userIDFrom(ctx)
+	err = s.inTx(ctx, func(_ pgx.Tx, q *store.Queries) error {
+		if err := q.AllowAdminSlugChange(ctx); err != nil {
+			return fmt.Errorf("allow admin slug change: %w", err)
+		}
+		row, err := q.AdminSetEventSlug(ctx, store.AdminSetEventSlugParams{EventID: eventID, Slug: norm})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errAdminEventNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("set event slug: %w", err)
+		}
+		if row.OldSlug == nil || row.NewSlug == nil {
+			return fmt.Errorf("set event slug: no slug returned for event %s", eventID)
+		}
+		// The old link is reserved so a printed or shared address can't be picked up by someone else.
+		if err := q.HoldRetiredSlug(ctx, *row.OldSlug); err != nil {
+			return fmt.Errorf("hold retired slug: %w", err)
+		}
+		return s.writeAudit(ctx, q, r, auditEntry{
+			ActorID: &callerID, Action: "event.slug", TargetType: "event", TargetID: eventID.String(),
+			Before: map[string]string{"slug": *row.OldSlug}, After: map[string]string{"slug": *row.NewSlug},
+		})
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		switch {
+		case errors.Is(err, errAdminEventNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "No such event.")
+		case errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "events_slug_key":
+			// Another request took the link between the check above and this write.
+			writeError(w, http.StatusConflict, "slug_taken", "That link is already taken.")
+		default:
+			serverError(w, r, err)
+		}
 		return
 	}
 	s.respondWithAdminEvent(w, r, eventID)

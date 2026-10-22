@@ -61,3 +61,29 @@ ON CONFLICT (term) DO NOTHING;
 DELETE FROM slug_blocklist
 WHERE term = @term
 RETURNING term, reason;
+
+-- name: AllowAdminSlugChange :exec
+-- Lets the next UPDATE of a published event's slug through the events_slug_immutable trigger. The setting
+-- is local to the current transaction, so call it inside the same tx as AdminSetEventSlug.
+SELECT set_config('syt.slug_change', 'admin', true);
+
+-- name: AdminSetEventSlug :one
+-- Admin only. Locks the live event, gives it a new slug and returns both. No row: unknown, deleted or
+-- slug-less event. Uniqueness is the caller's check plus the events_slug_key constraint.
+WITH old AS (
+    SELECT id, slug FROM events
+    WHERE id = @event_id::uuid AND slug IS NOT NULL AND deleted_at IS NULL
+    FOR UPDATE
+)
+UPDATE events e
+SET slug = @slug::text, updated_at = now()
+FROM old
+WHERE e.id = old.id
+RETURNING old.slug AS old_slug, e.slug AS new_slug;
+
+-- name: HoldRetiredSlug :exec
+-- Reserves a slug for 30 days against everyone (no owner exemption), like the tombstone a deleted
+-- published event leaves.
+INSERT INTO retired_slugs (slug, owner_id)
+VALUES (@slug::text, NULL)
+ON CONFLICT (slug) DO UPDATE SET retired_at = now(), owner_id = NULL;
