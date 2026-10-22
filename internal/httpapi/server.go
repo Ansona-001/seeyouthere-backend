@@ -266,6 +266,7 @@ func (s *Server) Routes() http.Handler {
 				r.Delete("/users/{id}/roles/{role}", s.handleAdminUserRole)
 				r.Post("/users/{id}/mfa/reset", s.handleAdminResetUserMFA)
 				r.Patch("/events/{id}/flags", s.handleAdminSetEventFlags)
+				r.Patch("/events/{id}/slug", s.handleAdminChangeEventSlug)
 				r.Delete("/events/{id}", s.handleAdminDeleteEvent)
 				r.Delete("/users/{id}", s.handleAdminDeleteUser)
 				r.Route("/templates", func(r chi.Router) {

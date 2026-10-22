@@ -320,3 +320,124 @@ func TestAdminDeleteEvent_StorageFailureKeepsEverythingAndRetrySucceeds(t *testi
 		t.Errorf("audit rows = %d, want exactly 1", n)
 	}
 }
+
+func TestAdminChangeEventSlug(t *testing.T) {
+	a, blobs := newAdminAPIWithBlobs(t)
+	ctx := context.Background()
+	id, oldSlug, _ := a.seedEventState(t, blobs, deleteEventCase{owner: true, publish: true})
+	// A second published event whose slug the first must not be able to take. (seedEventState slugs share the
+	// UUIDv7 time prefix, so this one is set by hand.)
+	otherOwner, _ := a.newTarget(t, "slug-other")
+	other := createTestEvent(t, ctx, a.f.s.q, "birthday", "classic", &otherOwner)
+	otherID, otherSlug := other.ID, "other-"+strings.ReplaceAll(other.ID.String(), "-", "")
+	t.Cleanup(func() { _, _ = a.pool.Exec(context.Background(), "DELETE FROM events WHERE id = $1", otherID) })
+	if _, err := a.pool.Exec(ctx, "UPDATE events SET status = 'published', slug = $2, published_at = now() WHERE id = $1", otherID, otherSlug); err != nil {
+		t.Fatalf("publish other event: %v", err)
+	}
+	draftID, _, _ := a.seedEventState(t, blobs, deleteEventCase{owner: false})
+	path := "/v1/admin/events/" + id.String() + "/slug"
+	newSlug := "moved-" + id.String()[:8]
+	t.Cleanup(func() {
+		_, _ = a.pool.Exec(context.Background(), "DELETE FROM retired_slugs WHERE slug = ANY($1)", []string{oldSlug, newSlug})
+	})
+
+	slugOf := func(eventID uuid.UUID) string {
+		t.Helper()
+		var slug *string
+		if err := a.pool.QueryRow(ctx, "SELECT slug FROM events WHERE id = $1", eventID).Scan(&slug); err != nil || slug == nil {
+			t.Fatalf("read slug: %v", err)
+		}
+		return *slug
+	}
+	if err := a.pool.QueryRow(ctx, "SELECT slug FROM events WHERE id = $1", id).Scan(new(string)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rejections := []struct {
+		name   string
+		token  string
+		path   string
+		body   string
+		status int
+		code   string
+	}{
+		{"moderator is forbidden", a.moderatorT, path, `{"slug":"` + newSlug + `"}`, http.StatusForbidden, "forbidden"},
+		{"malformed id", a.superTok, "/v1/admin/events/nope/slug", `{"slug":"` + newSlug + `"}`, http.StatusNotFound, "not_found"},
+		{"missing event", a.superTok, "/v1/admin/events/" + uuid.Must(uuid.NewV7()).String() + "/slug", `{"slug":"` + newSlug + `"}`, http.StatusNotFound, "not_found"},
+		{"slug-less draft", a.superTok, "/v1/admin/events/" + draftID.String() + "/slug", `{"slug":"` + newSlug + `"}`, http.StatusNotFound, "not_found"},
+		{"invalid format", a.superTok, path, `{"slug":"No Spaces!"}`, http.StatusBadRequest, "invalid_slug"},
+		{"too short", a.superTok, path, `{"slug":"ab"}`, http.StatusBadRequest, "invalid_slug"},
+		{"double hyphen", a.superTok, path, `{"slug":"a--b-c"}`, http.StatusBadRequest, "invalid_slug"},
+		{"taken by another event", a.superTok, path, `{"slug":"` + otherSlug + `"}`, http.StatusConflict, "slug_taken"},
+		{"unknown field", a.superTok, path, `{"slug":"` + newSlug + `","x":1}`, http.StatusBadRequest, "invalid_json"},
+	}
+	for _, tt := range rejections {
+		t.Run(tt.name, func(t *testing.T) {
+			wantStatusCode(t, a.do(http.MethodPatch, tt.path, tt.token, tt.body), tt.status, tt.code)
+			if got := slugOf(id); got != oldSlug {
+				t.Errorf("slug changed to %q by a rejected request", got)
+			}
+		})
+	}
+	if got := slugOf(otherID); got != otherSlug {
+		t.Errorf("another event's slug changed to %q", got)
+	}
+	if len(a.auditRows(t, "event", id)) != 0 {
+		t.Error("rejected requests wrote audit rows")
+	}
+
+	t.Run("blocked term", func(t *testing.T) {
+		if _, err := a.pool.Exec(ctx, "INSERT INTO slug_blocklist (term, reason) VALUES ('zzblocked', 'reserved') ON CONFLICT DO NOTHING"); err != nil {
+			t.Fatalf("seed blocklist: %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = a.pool.Exec(context.Background(), "DELETE FROM slug_blocklist WHERE term = 'zzblocked'")
+		})
+		wantStatusCode(t, a.do(http.MethodPatch, path, a.superTok, `{"slug":"our-zzblocked-day"}`), http.StatusConflict, "slug_blocked")
+	})
+
+	t.Run("a link retired in the last 30 days stays unavailable", func(t *testing.T) {
+		held := "held-" + id.String()[:8]
+		if _, err := a.pool.Exec(ctx, "INSERT INTO retired_slugs (slug) VALUES ($1)", held); err != nil {
+			t.Fatalf("seed retired slug: %v", err)
+		}
+		t.Cleanup(func() { _, _ = a.pool.Exec(context.Background(), "DELETE FROM retired_slugs WHERE slug = $1", held) })
+		wantStatusCode(t, a.do(http.MethodPatch, path, a.superTok, `{"slug":"`+held+`"}`), http.StatusConflict, "slug_taken")
+	})
+
+	t.Run("changes a published event's link, holds the old one and audits it", func(t *testing.T) {
+		rec := a.do(http.MethodPatch, path, a.superTok, `{"slug":"`+strings.ToUpper(newSlug)+`"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		if got := slugOf(id); got != newSlug {
+			t.Fatalf("slug = %q, want %q (normalised)", got, newSlug)
+		}
+		var held int
+		if err := a.pool.QueryRow(ctx, "SELECT count(*) FROM retired_slugs WHERE slug = $1 AND owner_id IS NULL", oldSlug).Scan(&held); err != nil || held != 1 {
+			t.Errorf("old slug held = %d (err %v), want 1", held, err)
+		}
+		rows := a.auditRows(t, "event", id)
+		if len(rows) != 1 || rows[0].Action != "event.slug" {
+			t.Fatalf("audit rows = %+v", rows)
+		}
+		if !strings.Contains(string(rows[0].Before), oldSlug) || !strings.Contains(string(rows[0].After), newSlug) {
+			t.Errorf("audit before/after = %s / %s", rows[0].Before, rows[0].After)
+		}
+		// The old link is now held back from everyone, including through the host's own check.
+		taken, err := a.f.s.q.SlugTaken(ctx, store.SlugTakenParams{Slug: oldSlug})
+		if err != nil || !taken {
+			t.Errorf("old slug taken = %v (err %v), want true", taken, err)
+		}
+	})
+
+	t.Run("the immutability trigger still blocks any other slug change", func(t *testing.T) {
+		_, err := a.pool.Exec(ctx, "UPDATE events SET slug = $2 WHERE id = $1", id, "sneaky-"+id.String()[:8])
+		if err == nil {
+			t.Fatal("a plain UPDATE changed a published slug")
+		}
+		if got := slugOf(id); got != newSlug {
+			t.Errorf("slug = %q, want %q", got, newSlug)
+		}
+	})
+}
