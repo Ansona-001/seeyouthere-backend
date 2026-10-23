@@ -640,10 +640,14 @@ const liveMediaIDs = `-- name: LiveMediaIDs :many
 SELECT id
 FROM media
 WHERE id = ANY($1::uuid[]) AND moderation_status <> 'rejected'
+UNION ALL
+SELECT id
+FROM event_audio
+WHERE id = ANY($1::uuid[])
 `
 
 // Reconcile: which of these media ids still have a non-rejected row; files of any other id are
-// orphans. Callers pass at most one listing page (1000 ids).
+// orphans. Event audio ids count as live too. Callers pass at most one listing page (1000 ids).
 func (q *Queries) LiveMediaIDs(ctx context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, liveMediaIDs, ids)
 	if err != nil {
@@ -676,12 +680,16 @@ func (q *Queries) LockMediaStorageQuota(ctx context.Context) error {
 }
 
 const mediaOwnerUsage = `-- name: MediaOwnerUsage :one
-SELECT coalesce(sum(m.size_bytes), 0)::bigint AS owner_bytes
-FROM media m JOIN events e ON e.id = m.event_id
-WHERE e.owner_id = $1::uuid
-  AND e.deleted_at IS NULL
-  AND m.moderation_status <> 'rejected'
-  AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending')
+SELECT ((SELECT coalesce(sum(m.size_bytes), 0)
+         FROM media m JOIN events e ON e.id = m.event_id
+         WHERE e.owner_id = $1::uuid
+           AND e.deleted_at IS NULL
+           AND m.moderation_status <> 'rejected'
+           AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending'))
+        + (SELECT coalesce(sum(a.size_bytes), 0)
+           FROM event_audio a JOIN events e ON e.id = a.event_id
+           WHERE e.owner_id = $1::uuid
+             AND e.deleted_at IS NULL))::bigint AS owner_bytes
 `
 
 // Approval check (run after LockMediaStorageQuota): same owner_bytes rule as MediaStorageUsage,
@@ -694,15 +702,20 @@ func (q *Queries) MediaOwnerUsage(ctx context.Context, ownerID uuid.UUID) (int64
 }
 
 const mediaStorageUsage = `-- name: MediaStorageUsage :one
-SELECT (SELECT coalesce(sum(m.size_bytes), 0)
-        FROM media m JOIN events e ON e.id = m.event_id
-        WHERE e.owner_id = $1::uuid
-          AND e.deleted_at IS NULL
-          AND m.moderation_status <> 'rejected'
-          AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending'))::bigint AS owner_bytes,
-       (SELECT coalesce(sum(size_bytes), 0)
-        FROM media
-        WHERE moderation_status <> 'rejected')::bigint AS total_bytes,
+SELECT ((SELECT coalesce(sum(m.size_bytes), 0)
+         FROM media m JOIN events e ON e.id = m.event_id
+         WHERE e.owner_id = $1::uuid
+           AND e.deleted_at IS NULL
+           AND m.moderation_status <> 'rejected'
+           AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending'))
+        + (SELECT coalesce(sum(a.size_bytes), 0)
+           FROM event_audio a JOIN events e ON e.id = a.event_id
+           WHERE e.owner_id = $1::uuid
+             AND e.deleted_at IS NULL))::bigint AS owner_bytes,
+       ((SELECT coalesce(sum(size_bytes), 0)
+         FROM media
+         WHERE moderation_status <> 'rejected')
+        + (SELECT coalesce(sum(size_bytes), 0) FROM event_audio))::bigint AS total_bytes,
        (SELECT coalesce(sum(size_bytes), 0)
         FROM media
         WHERE event_id = $2::uuid
@@ -737,6 +750,8 @@ type MediaStorageUsageRow struct {
 // by a per-owner allowance so many events cannot each park a full per-event allowance.
 // NULL owner (anonymous draft): owner_bytes and owner_pending_guest_bytes are 0 and the caller
 // skips the per-user checks. NULL event: pending_guest_bytes is 0.
+// Event music (event_audio) counts like approved images: owner_bytes for live events of the owner,
+// total_bytes for every event until purge.
 func (q *Queries) MediaStorageUsage(ctx context.Context, arg MediaStorageUsageParams) (MediaStorageUsageRow, error) {
 	row := q.db.QueryRow(ctx, mediaStorageUsage, arg.OwnerID, arg.EventID)
 	var i MediaStorageUsageRow

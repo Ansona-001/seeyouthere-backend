@@ -1,0 +1,57 @@
+{
+  "schema": 2,
+  "layout": "centered",
+  "hero_style": "text_only",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "ivory",
+      "name": "Ivory",
+      "colors": {
+        "background": "#FAF3E8",
+        "surface": "#FFFAF2",
+        "text": "#46281A",
+        "muted": "#6E4B35",
+        "accent": "#A8481F",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#A8481F",
+      "art": ["#B5651D", "#8A4B24", "#C4622B", "#F6E3C6", "#A8481F", "#E9CDA4", "#8A6E4B"]
+    },
+    {
+      "id": "maple",
+      "name": "Maple",
+      "colors": {
+        "background": "#F6E6D0",
+        "surface": "#FDF4E6",
+        "text": "#46281A",
+        "muted": "#6A4630",
+        "accent": "#9C3F18",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#9C3F18",
+      "art": ["#B5651D", "#8A4B24", "#C4622B", "#F3D8B2", "#9C3F18", "#E2BC8A", "#8A6E4B"]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "fraunces",
+      "name": "Fraunces and Lora",
+      "heading": "fraunces",
+      "body": "lora",
+      "accent": "pinyon_script"
+    }
+  ],
+  "defaults": { "palette": "ivory", "font": "fraunces" },
+  "layers": [
+    { "kind": "paper", "tone": "background", "glow": "art4", "glow_opacity": 0.7, "vignette": "art6", "vignette_opacity": 0.3 },
+    { "kind": "texture", "texture": "watercolour", "opacity": 0.1, "blend": "multiply", "colors": ["art3", "art6", "art4"] },
+    { "kind": "art", "art": "autumn_page", "placement": "page" },
+    { "kind": "art", "art": "autumn", "placement": "top" },
+    { "kind": "texture", "texture": "cold_press", "opacity": 0.3, "blend": "multiply" }
+  ],
+  "ornament": { "hero": "none", "divider": "none", "badge": "none", "ampersand": "script", "hero_ink": "" },
+  "card": { "style": "reply_card", "border": "none", "radius": 4, "fields": "underline", "buttons": "accent" },
+  "motion": "sway"
+}

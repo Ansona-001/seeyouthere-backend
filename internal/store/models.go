@@ -62,6 +62,16 @@ type Event struct {
 	RetentionReminderSentAt *time.Time `json:"retention_reminder_sent_at"`
 	ShareImage              string     `json:"share_image"`
 	ShareMediaID            *uuid.UUID `json:"share_media_id"`
+	MusicSource             string     `json:"music_source"`
+}
+
+type EventAudio struct {
+	ID         uuid.UUID  `json:"id"`
+	EventID    uuid.UUID  `json:"event_id"`
+	UploadedBy *uuid.UUID `json:"uploaded_by"`
+	SizeBytes  int64      `json:"size_bytes"`
+	DurationMs int32      `json:"duration_ms"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 type EventMember struct {

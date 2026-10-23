@@ -49,15 +49,22 @@ WHERE event_id = @event_id AND uploaded_by = @uploaded_by AND moderation_status 
 -- by a per-owner allowance so many events cannot each park a full per-event allowance.
 -- NULL owner (anonymous draft): owner_bytes and owner_pending_guest_bytes are 0 and the caller
 -- skips the per-user checks. NULL event: pending_guest_bytes is 0.
-SELECT (SELECT coalesce(sum(m.size_bytes), 0)
-        FROM media m JOIN events e ON e.id = m.event_id
-        WHERE e.owner_id = sqlc.narg(owner_id)::uuid
-          AND e.deleted_at IS NULL
-          AND m.moderation_status <> 'rejected'
-          AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending'))::bigint AS owner_bytes,
-       (SELECT coalesce(sum(size_bytes), 0)
-        FROM media
-        WHERE moderation_status <> 'rejected')::bigint AS total_bytes,
+-- Event music (event_audio) counts like approved images: owner_bytes for live events of the owner,
+-- total_bytes for every event until purge.
+SELECT ((SELECT coalesce(sum(m.size_bytes), 0)
+         FROM media m JOIN events e ON e.id = m.event_id
+         WHERE e.owner_id = sqlc.narg(owner_id)::uuid
+           AND e.deleted_at IS NULL
+           AND m.moderation_status <> 'rejected'
+           AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending'))
+        + (SELECT coalesce(sum(a.size_bytes), 0)
+           FROM event_audio a JOIN events e ON e.id = a.event_id
+           WHERE e.owner_id = sqlc.narg(owner_id)::uuid
+             AND e.deleted_at IS NULL))::bigint AS owner_bytes,
+       ((SELECT coalesce(sum(size_bytes), 0)
+         FROM media
+         WHERE moderation_status <> 'rejected')
+        + (SELECT coalesce(sum(size_bytes), 0) FROM event_audio))::bigint AS total_bytes,
        (SELECT coalesce(sum(size_bytes), 0)
         FROM media
         WHERE event_id = sqlc.narg(event_id)::uuid
@@ -73,12 +80,16 @@ SELECT (SELECT coalesce(sum(m.size_bytes), 0)
 -- name: MediaOwnerUsage :one
 -- Approval check (run after LockMediaStorageQuota): same owner_bytes rule as MediaStorageUsage,
 -- without the global sum, so the global lock is not held across a bucket-wide scan.
-SELECT coalesce(sum(m.size_bytes), 0)::bigint AS owner_bytes
-FROM media m JOIN events e ON e.id = m.event_id
-WHERE e.owner_id = @owner_id::uuid
-  AND e.deleted_at IS NULL
-  AND m.moderation_status <> 'rejected'
-  AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending');
+SELECT ((SELECT coalesce(sum(m.size_bytes), 0)
+         FROM media m JOIN events e ON e.id = m.event_id
+         WHERE e.owner_id = @owner_id::uuid
+           AND e.deleted_at IS NULL
+           AND m.moderation_status <> 'rejected'
+           AND NOT (m.uploaded_by = 'guest' AND m.moderation_status = 'pending'))
+        + (SELECT coalesce(sum(a.size_bytes), 0)
+           FROM event_audio a JOIN events e ON e.id = a.event_id
+           WHERE e.owner_id = @owner_id::uuid
+             AND e.deleted_at IS NULL))::bigint AS owner_bytes;
 
 -- name: LockMediaStorageQuota :exec
 -- Serialises the quota check and insert across upload transactions. Take it last, after the event
@@ -99,10 +110,14 @@ WHERE m.id = @media_id
 
 -- name: LiveMediaIDs :many
 -- Reconcile: which of these media ids still have a non-rejected row; files of any other id are
--- orphans. Callers pass at most one listing page (1000 ids).
+-- orphans. Event audio ids count as live too. Callers pass at most one listing page (1000 ids).
 SELECT id
 FROM media
-WHERE id = ANY(@ids::uuid[]) AND moderation_status <> 'rejected';
+WHERE id = ANY(@ids::uuid[]) AND moderation_status <> 'rejected'
+UNION ALL
+SELECT id
+FROM event_audio
+WHERE id = ANY(@ids::uuid[]);
 
 -- name: ListEventMedia :many
 -- Any member. Newest first; uploaded_by / status NULL = all. The page is cut before the guest join.

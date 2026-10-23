@@ -26,6 +26,7 @@ const cleanupTimeout = 10 * time.Second
 // renditions themselves live in blobs under:
 //
 //	e/<event>/<media>/{480,1080,1920}.jpg
+//	e/<event>/<audio>/audio.mp3
 //	t/<template>/<version>/{480,1080,1920}.jpg
 type Store struct {
 	root  string
@@ -65,6 +66,17 @@ func (s *Store) NewOutputDir() (string, error) {
 		return "", fmt.Errorf("media: create output dir: %w", err)
 	}
 	return dir, nil
+}
+
+// NewTempFile creates an empty file under tmp/ for staging an upload (audio
+// is sanitised into one before CommitAudio). The caller closes it and, unless
+// CommitAudio consumed it, removes it.
+func (s *Store) NewTempFile() (*os.File, error) {
+	f, err := os.CreateTemp(s.tmpDir(), "up-")
+	if err != nil {
+		return nil, fmt.Errorf("media: create temp file: %w", err)
+	}
+	return f, nil
 }
 
 // CheckFree reports ErrDiskFull when the filesystem holding root has less
@@ -119,6 +131,36 @@ func (s *Store) Commit(ctx context.Context, outDir string, eventID, mediaID uuid
 		defer cancel()
 		_ = s.blobs.Delete(cctx, mediaKeys(eventID, mediaID))
 		return err
+	}
+	return nil
+}
+
+// CommitAudio uploads the sanitised MP3 at path as eventID/audioID's object.
+// It takes ownership of path and always removes it. If the upload fails the
+// key is deleted best-effort (on a context detached from ctx).
+func (s *Store) CommitAudio(ctx context.Context, path string, eventID, audioID uuid.UUID) error {
+	defer func() { _ = os.Remove(path) }()
+	if err := s.putFile(ctx, path, audioKey(eventID, audioID)); err != nil {
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		_ = s.blobs.Delete(cctx, []string{audioKey(eventID, audioID)})
+		return err
+	}
+	return nil
+}
+
+// OpenAudio returns the stored MP3 of an audio item. ifNoneMatch is
+// forwarded to the backend (ErrNotModified on a match). The caller must close
+// Object.Body and set the audio/mpeg content type itself.
+func (s *Store) OpenAudio(ctx context.Context, eventID, audioID uuid.UUID, ifNoneMatch string) (*Object, error) {
+	return s.blobs.Get(ctx, audioKey(eventID, audioID), ifNoneMatch)
+}
+
+// DeleteAudio removes an audio item's object. A missing object is not an
+// error, so it is idempotent and safe to retry.
+func (s *Store) DeleteAudio(ctx context.Context, eventID, audioID uuid.UUID) error {
+	if err := s.blobs.Delete(ctx, []string{audioKey(eventID, audioID)}); err != nil {
+		return fmt.Errorf("media: delete audio %s/%s: %w", eventID, audioID, err)
 	}
 	return nil
 }

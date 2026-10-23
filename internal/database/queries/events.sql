@@ -116,6 +116,7 @@ GROUP BY r.event_id;
 -- if that template has since become premium or retired. An unselectable pin updates no row.
 -- NULL share_image leaves the share image unchanged; otherwise share_image and share_media_id are set
 -- together (the caller checked the media id; events_share_media_fkey is the source of truth).
+-- NULL music_source leaves it unchanged; the caller checks that 'custom' has an event_audio row.
 UPDATE events e
 SET content = coalesce(sqlc.narg(content), e.content),
     title = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.title ELSE @title::text END,
@@ -139,6 +140,7 @@ SET content = coalesce(sqlc.narg(content), e.content),
     template_version = coalesce(sqlc.narg(template_version), e.template_version),
     share_image = coalesce(sqlc.narg(share_image)::text, e.share_image),
     share_media_id = CASE WHEN sqlc.narg(share_image)::text IS NULL THEN e.share_media_id ELSE sqlc.narg(share_media_id)::uuid END,
+    music_source = coalesce(sqlc.narg(music_source)::text, e.music_source),
     version = e.version + 1,
     updated_at = now()
 WHERE e.id = @event_id
@@ -157,7 +159,7 @@ WHERE e.id = @event_id
 RETURNING e.version, e.updated_at;
 
 -- name: UpdateAnonDraftContent :one
--- Same derived-field, template-pin and share-image rules as UpdateEventContent.
+-- Same derived-field, template-pin, share-image and music_source rules as UpdateEventContent.
 UPDATE events e
 SET content = coalesce(sqlc.narg(content), e.content),
     title = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.title ELSE @title::text END,
@@ -181,6 +183,7 @@ SET content = coalesce(sqlc.narg(content), e.content),
     template_version = coalesce(sqlc.narg(template_version), e.template_version),
     share_image = coalesce(sqlc.narg(share_image)::text, e.share_image),
     share_media_id = CASE WHEN sqlc.narg(share_image)::text IS NULL THEN e.share_media_id ELSE sqlc.narg(share_media_id)::uuid END,
+    music_source = coalesce(sqlc.narg(music_source)::text, e.music_source),
     version = e.version + 1,
     updated_at = now()
 WHERE e.id = @event_id
@@ -311,12 +314,13 @@ WHERE event_id = ANY(@event_ids::uuid[]) AND owner_id IS NULL;
 -- Public page. password_hash is only for the Go-side gate and must never be serialised.
 SELECT e.id, e.slug, e.title, e.occasion_slug, e.content, e.overrides, e.visibility, e.password_hash,
        e.rsvp_mode, e.remove_branding, e.starts_at, e.template_id, e.template_version,
-       e.share_image, e.share_media_id,
+       e.share_image, e.share_media_id, e.music_source, a.id AS audio_id,
        tv.manifest, tv.assets_path,
        sqlc.embed(o)
 FROM events e
 JOIN template_versions tv ON tv.template_id = e.template_id AND tv.version = e.template_version
 JOIN occasions o ON o.slug = e.occasion_slug
+LEFT JOIN event_audio a ON a.event_id = e.id
 WHERE e.slug = @slug AND e.status = 'published' AND e.deleted_at IS NULL;
 
 -- name: LockEventForRSVP :one

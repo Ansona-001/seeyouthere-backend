@@ -146,8 +146,9 @@ func validKey(key string) bool {
 
 func errInvalidKey(op string) error { return fmt.Errorf("r2 %s: invalid key", op) }
 
-// Put stores size bytes from body as image/jpeg, replacing any existing
-// object. The body is read twice (hash, then upload) and again on retries.
+// Put stores size bytes from body, replacing any existing object. Every
+// object is labelled image/jpeg (audio included); the label is never sent to
+// clients, since the HTTP layer sets the content type on responses. The body is read twice (hash, then upload) and again on retries.
 // Every read goes through its own io.SectionReader over an io.ReaderAt (an
 // *os.File, bytes.Reader, ...), so attempts never share a seek offset even if
 // an abandoned attempt's transport goroutine is still reading. A body that is

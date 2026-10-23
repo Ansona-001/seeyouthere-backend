@@ -99,8 +99,9 @@ func (s *Store) Reconcile(ctx context.Context, live LiveMediaFunc) (ReconcileSta
 	return st, s.reconcileTmp(now)
 }
 
-// mediaIDFromKey extracts the media id from "e/<event>/<media>/<w>.jpg". The
-// key must be valid and both ids canonical (lowercase, hyphenated), so every
+// mediaIDFromKey extracts the media id from "e/<event>/<media>/<w>.jpg" or
+// "e/<event>/<audio>/audio.mp3" (audio ids share the media id space, so both
+// are swept the same way). The key must be valid and both ids canonical (lowercase, hyphenated), so every
 // object is attributed to exactly one id and nothing else is ever deleted.
 func mediaIDFromKey(key string) (uuid.UUID, bool) {
 	if !ValidKey(key) {
@@ -113,12 +114,14 @@ func mediaIDFromKey(key string) (uuid.UUID, bool) {
 	if _, ok := canonicalUUID(parts[1]); !ok {
 		return uuid.Nil, false
 	}
-	name, ok := strings.CutSuffix(parts[3], ".jpg")
-	if !ok {
-		return uuid.Nil, false
-	}
-	if w, err := strconv.Atoi(name); err != nil || !validWidth(w) || strconv.Itoa(w) != name {
-		return uuid.Nil, false
+	if parts[3] != audioFile {
+		name, ok := strings.CutSuffix(parts[3], ".jpg")
+		if !ok {
+			return uuid.Nil, false
+		}
+		if w, err := strconv.Atoi(name); err != nil || !validWidth(w) || strconv.Itoa(w) != name {
+			return uuid.Nil, false
+		}
 	}
 	id, ok := canonicalUUID(parts[2])
 	if !ok || id == uuid.Nil {

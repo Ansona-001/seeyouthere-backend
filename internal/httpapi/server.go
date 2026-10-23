@@ -50,6 +50,10 @@ type Server struct {
 	images *media.Processor
 	// mediaSem bounds concurrent object streams (serveObject).
 	mediaSem chan struct{}
+	// audioSem bounds concurrent audio downloads (handleAudioFile).
+	audioSem chan struct{}
+	// audioUploadSem bounds concurrent audio upload sanitising (handleUploadEventAudio).
+	audioUploadSem chan struct{}
 	// limiterWarnAt is when the media routes last logged a rate-limiter
 	// outage (UnixNano); see warnLimiterDown.
 	limiterWarnAt atomic.Int64
@@ -72,20 +76,22 @@ func NewServer(cfg config.Config, pool *pgxpool.Pool, rdb *redis.Client, jobClie
 	}
 
 	return &Server{
-		cfg:      cfg,
-		pool:     pool,
-		rdb:      rdb,
-		q:        q,
-		jobs:     jobClient,
-		codes:    auth.NewCodes(rdb, cfg.AuthSecret),
-		sessions: auth.NewSessions(q, rdb, cfg.SessionTTL),
-		limiter:  ratelimit.New(rdb),
-		tokens:   tokens,
-		hasher:   passhash.New(passwordHashConcurrency),
-		totp:     sealer,
-		media:    mediaStore,
-		mediaSem: make(chan struct{}, mediaStreams),
-		images:   media.NewProcessor(imageProcessConcurrency),
+		cfg:            cfg,
+		pool:           pool,
+		rdb:            rdb,
+		q:              q,
+		jobs:           jobClient,
+		codes:          auth.NewCodes(rdb, cfg.AuthSecret),
+		sessions:       auth.NewSessions(q, rdb, cfg.SessionTTL),
+		limiter:        ratelimit.New(rdb),
+		tokens:         tokens,
+		hasher:         passhash.New(passwordHashConcurrency),
+		totp:           sealer,
+		media:          mediaStore,
+		mediaSem:       make(chan struct{}, mediaStreams),
+		audioSem:       make(chan struct{}, audioStreams),
+		audioUploadSem: make(chan struct{}, audioUploads),
+		images:         media.NewProcessor(imageProcessConcurrency),
 	}, nil
 }
 
@@ -157,6 +163,10 @@ func (s *Server) Routes() http.Handler {
 						r.Delete("/", s.handleDeleteEventMedia)
 					})
 				})
+
+				// Music track: upload (POST /audio) is registered with the other
+				// uploads below, for the same reason as POST /media.
+				r.Delete("/audio", s.handleDeleteEventAudio)
 
 				r.Route("/wishes", func(r chi.Router) {
 					r.Get("/", s.handleListEventWishes)
@@ -294,6 +304,7 @@ func (s *Server) Routes() http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(secureHeaders, s.loadSession, extendUploadDeadline)
 		r.Post("/v1/events/{id}/media", s.handleUploadEventMedia)
+		r.Post("/v1/events/{id}/audio", s.handleUploadEventAudio)
 		r.Post("/v1/public/events/{slug}/photos", s.handleUploadGuestPhoto)
 		r.With(s.requireAdmin("super_admin")).Post("/v1/admin/templates/{id}/versions/{v}/background", s.handleUploadAdminTemplateBackground)
 	})
@@ -311,6 +322,7 @@ func (s *Server) Routes() http.Handler {
 	// handlers bound their own streams).
 	r.Group(func(r chi.Router) {
 		r.Get("/media/templates/{template_id}/{version}/background/{file}", s.handleTemplateMediaFile)
+		r.Get("/media/{event_id}/{media_id}/audio.mp3", s.handleAudioFile)
 		r.Get("/media/{event_id}/{media_id}/{file}", s.handleMediaFile)
 	})
 

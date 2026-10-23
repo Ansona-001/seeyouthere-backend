@@ -19,7 +19,7 @@ Last updated: 2026-10-19. Moved from Google Cloud to Contabo on 2026-10-16/19.
 ### Reverse proxy (host nginx + certbot)
 
 - Config: `deploy/nginx-seeyouthere.conf` → `/etc/nginx/sites-available/seeyouthere` (symlinked into `sites-enabled`); shared proxy headers `deploy/nginx-seeyouthere-proxy.conf` → `/etc/nginx/snippets/seeyouthere-proxy.conf`. Certbot edited the site file in place (443 listeners, redirect), so **do not blindly overwrite it** from the repo; diff first.
-- `seeyouthere.at`: `/media/<uuid>/<uuid>/{480,1080,1920,og}.jpg` and template backgrounds → API (`127.0.0.1:8080`), other `/media/*` → 404, everything else → web (`127.0.0.1:3000`).
+- `seeyouthere.at`: `/media/<uuid>/<uuid>/{480,1080,1920,og}.jpg`, `/media/<uuid>/<uuid>/audio.mp3` (event music; own `limit_req` zone `sytaudio`, 1 r/s burst 5, with `proxy_buffering on`) and template backgrounds → API (`127.0.0.1:8080`), other `/media/*` → 404, everything else → web (`127.0.0.1:3000`).
 - `api.seeyouthere.at` → API, body limit 12 MB. Both vhosts: HSTS and security headers, gzip, `limit_req` 20 r/s (burst 60).
 - The API trusts the rightmost `X-Forwarded-For` entry (`TRUST_PROXY=true`); nginx appends the real client address with `$proxy_add_x_forwarded_for`.
 - HTTP/2 is enabled on both 443 server blocks (`http2 on;`, added by hand after certbot; certbot does not add it). Re-add it if the vhost is ever regenerated.

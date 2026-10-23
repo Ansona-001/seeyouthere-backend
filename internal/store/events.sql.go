@@ -233,7 +233,7 @@ WHERE t.id = $9::uuid
   AND tv.published_at IS NOT NULL
   AND t.status = 'published'
   AND NOT t.is_premium
-RETURNING id, owner_id, occasion_slug, slug, title, content, template_id, template_version, overrides, visibility, password_hash, rsvp_mode, status, remove_branding, starts_at, published_at, created_at, updated_at, deleted_at, version, notify_rsvps, rsvp_notified_at, ends_at, retention_from, retention_reminded_at, retention_reminder_sent_at, share_image, share_media_id
+RETURNING id, owner_id, occasion_slug, slug, title, content, template_id, template_version, overrides, visibility, password_hash, rsvp_mode, status, remove_branding, starts_at, published_at, created_at, updated_at, deleted_at, version, notify_rsvps, rsvp_notified_at, ends_at, retention_from, retention_reminded_at, retention_reminder_sent_at, share_image, share_media_id, music_source
 `
 
 type CreateEventParams struct {
@@ -300,6 +300,7 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 		&i.RetentionReminderSentAt,
 		&i.ShareImage,
 		&i.ShareMediaID,
+		&i.MusicSource,
 	)
 	return i, err
 }
@@ -433,7 +434,7 @@ func (q *Queries) FilterLockedPurgeable(ctx context.Context, eventIds []uuid.UUI
 }
 
 const getAnonDraftEvent = `-- name: GetAnonDraftEvent :one
-SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, 'anon'::text AS role,
+SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source, 'anon'::text AS role,
        t.slug AS template_slug, t.name AS template_name,
        tv.manifest, tv.assets_path,
        coalesce((SELECT max(v.version) FROM template_versions v
@@ -497,6 +498,7 @@ func (q *Queries) GetAnonDraftEvent(ctx context.Context, arg GetAnonDraftEventPa
 		&i.Event.RetentionReminderSentAt,
 		&i.Event.ShareImage,
 		&i.Event.ShareMediaID,
+		&i.Event.MusicSource,
 		&i.Role,
 		&i.TemplateSlug,
 		&i.TemplateName,
@@ -535,7 +537,7 @@ func (q *Queries) GetAnonDraftWriteState(ctx context.Context, arg GetAnonDraftWr
 }
 
 const getEventAdmin = `-- name: GetEventAdmin :one
-SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id,
+SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source,
        u.email AS owner_email,
        t.slug AS template_slug, t.name AS template_name, tv.manifest, tv.assets_path,
        (SELECT count(*) FROM rsvps r WHERE r.event_id = e.id) AS rsvp_count,
@@ -594,6 +596,7 @@ func (q *Queries) GetEventAdmin(ctx context.Context, eventID uuid.UUID) (GetEven
 		&i.Event.RetentionReminderSentAt,
 		&i.Event.ShareImage,
 		&i.Event.ShareMediaID,
+		&i.Event.MusicSource,
 		&i.OwnerEmail,
 		&i.TemplateSlug,
 		&i.TemplateName,
@@ -690,7 +693,7 @@ func (q *Queries) GetEventForRetentionReminder(ctx context.Context, arg GetEvent
 }
 
 const getEventForUser = `-- name: GetEventForUser :one
-SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, r.role::text AS role,
+SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source, r.role::text AS role,
        t.slug AS template_slug, t.name AS template_name,
        tv.manifest, tv.assets_path,
        coalesce((SELECT max(v.version) FROM template_versions v
@@ -752,6 +755,7 @@ func (q *Queries) GetEventForUser(ctx context.Context, arg GetEventForUserParams
 		&i.Event.RetentionReminderSentAt,
 		&i.Event.ShareImage,
 		&i.Event.ShareMediaID,
+		&i.Event.MusicSource,
 		&i.Role,
 		&i.TemplateSlug,
 		&i.TemplateName,
@@ -809,12 +813,13 @@ func (q *Queries) GetEventWriteState(ctx context.Context, arg GetEventWriteState
 const getPublicEventBySlug = `-- name: GetPublicEventBySlug :one
 SELECT e.id, e.slug, e.title, e.occasion_slug, e.content, e.overrides, e.visibility, e.password_hash,
        e.rsvp_mode, e.remove_branding, e.starts_at, e.template_id, e.template_version,
-       e.share_image, e.share_media_id,
+       e.share_image, e.share_media_id, e.music_source, a.id AS audio_id,
        tv.manifest, tv.assets_path,
        o.slug, o.name, o.default_blocks, o.optional_blocks, o.rsvp_fields, o.copy, o.setup_questions, o.sort_order, o.is_active, o.created_at, o.updated_at
 FROM events e
 JOIN template_versions tv ON tv.template_id = e.template_id AND tv.version = e.template_version
 JOIN occasions o ON o.slug = e.occasion_slug
+LEFT JOIN event_audio a ON a.event_id = e.id
 WHERE e.slug = $1 AND e.status = 'published' AND e.deleted_at IS NULL
 `
 
@@ -834,6 +839,8 @@ type GetPublicEventBySlugRow struct {
 	TemplateVersion int32      `json:"template_version"`
 	ShareImage      string     `json:"share_image"`
 	ShareMediaID    *uuid.UUID `json:"share_media_id"`
+	MusicSource     string     `json:"music_source"`
+	AudioID         *uuid.UUID `json:"audio_id"`
 	Manifest        []byte     `json:"manifest"`
 	AssetsPath      string     `json:"assets_path"`
 	Occasion        Occasion   `json:"occasion"`
@@ -859,6 +866,8 @@ func (q *Queries) GetPublicEventBySlug(ctx context.Context, slug *string) (GetPu
 		&i.TemplateVersion,
 		&i.ShareImage,
 		&i.ShareMediaID,
+		&i.MusicSource,
+		&i.AudioID,
 		&i.Manifest,
 		&i.AssetsPath,
 		&i.Occasion.Slug,
@@ -1881,14 +1890,15 @@ SET content = coalesce($1, e.content),
     template_version = coalesce($7, e.template_version),
     share_image = coalesce($8::text, e.share_image),
     share_media_id = CASE WHEN $8::text IS NULL THEN e.share_media_id ELSE $9::uuid END,
+    music_source = coalesce($10::text, e.music_source),
     version = e.version + 1,
     updated_at = now()
-WHERE e.id = $10
+WHERE e.id = $11
   AND e.deleted_at IS NULL
-  AND e.version = $11
+  AND e.version = $12
   AND e.owner_id IS NULL
   AND EXISTS (SELECT 1 FROM anon_drafts a
-              WHERE a.event_id = e.id AND a.cookie_hash = $12 AND a.expires_at > now())
+              WHERE a.event_id = e.id AND a.cookie_hash = $13 AND a.expires_at > now())
   AND (($6::uuid IS NULL AND $7::int IS NULL)
        OR EXISTS (SELECT 1 FROM templates t
                   JOIN template_versions tv ON tv.template_id = t.id
@@ -1910,6 +1920,7 @@ type UpdateAnonDraftContentParams struct {
 	TemplateVersion *int32     `json:"template_version"`
 	ShareImage      *string    `json:"share_image"`
 	ShareMediaID    *uuid.UUID `json:"share_media_id"`
+	MusicSource     *string    `json:"music_source"`
 	EventID         uuid.UUID  `json:"event_id"`
 	Version         int32      `json:"version"`
 	CookieHash      []byte     `json:"cookie_hash"`
@@ -1920,7 +1931,7 @@ type UpdateAnonDraftContentRow struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Same derived-field, template-pin and share-image rules as UpdateEventContent.
+// Same derived-field, template-pin, share-image and music_source rules as UpdateEventContent.
 func (q *Queries) UpdateAnonDraftContent(ctx context.Context, arg UpdateAnonDraftContentParams) (UpdateAnonDraftContentRow, error) {
 	row := q.db.QueryRow(ctx, updateAnonDraftContent,
 		arg.Content,
@@ -1932,6 +1943,7 @@ func (q *Queries) UpdateAnonDraftContent(ctx context.Context, arg UpdateAnonDraf
 		arg.TemplateVersion,
 		arg.ShareImage,
 		arg.ShareMediaID,
+		arg.MusicSource,
 		arg.EventID,
 		arg.Version,
 		arg.CookieHash,
@@ -1965,13 +1977,14 @@ SET content = coalesce($1, e.content),
     template_version = coalesce($7, e.template_version),
     share_image = coalesce($8::text, e.share_image),
     share_media_id = CASE WHEN $8::text IS NULL THEN e.share_media_id ELSE $9::uuid END,
+    music_source = coalesce($10::text, e.music_source),
     version = e.version + 1,
     updated_at = now()
-WHERE e.id = $10
+WHERE e.id = $11
   AND e.deleted_at IS NULL
-  AND e.version = $11
+  AND e.version = $12
   AND e.status <> 'taken_down'
-  AND event_role($10, $12::uuid) IN ('owner', 'editor')
+  AND event_role($11, $13::uuid) IN ('owner', 'editor')
   AND (($6::uuid IS NULL AND $7::int IS NULL)
        OR EXISTS (SELECT 1 FROM templates t
                   JOIN template_versions tv ON tv.template_id = t.id
@@ -1993,6 +2006,7 @@ type UpdateEventContentParams struct {
 	TemplateVersion *int32     `json:"template_version"`
 	ShareImage      *string    `json:"share_image"`
 	ShareMediaID    *uuid.UUID `json:"share_media_id"`
+	MusicSource     *string    `json:"music_source"`
 	EventID         uuid.UUID  `json:"event_id"`
 	Version         int32      `json:"version"`
 	UserID          uuid.UUID  `json:"user_id"`
@@ -2011,6 +2025,7 @@ type UpdateEventContentRow struct {
 // if that template has since become premium or retired. An unselectable pin updates no row.
 // NULL share_image leaves the share image unchanged; otherwise share_image and share_media_id are set
 // together (the caller checked the media id; events_share_media_fkey is the source of truth).
+// NULL music_source leaves it unchanged; the caller checks that 'custom' has an event_audio row.
 func (q *Queries) UpdateEventContent(ctx context.Context, arg UpdateEventContentParams) (UpdateEventContentRow, error) {
 	row := q.db.QueryRow(ctx, updateEventContent,
 		arg.Content,
@@ -2022,6 +2037,7 @@ func (q *Queries) UpdateEventContent(ctx context.Context, arg UpdateEventContent
 		arg.TemplateVersion,
 		arg.ShareImage,
 		arg.ShareMediaID,
+		arg.MusicSource,
 		arg.EventID,
 		arg.Version,
 		arg.UserID,

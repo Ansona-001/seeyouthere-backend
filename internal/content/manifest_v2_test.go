@@ -821,8 +821,8 @@ func TestArtRegistry(t *testing.T) {
 	if n := len(artRegistry); n > maxArtKeys {
 		t.Fatalf("art registry has %d keys, hard cap is %d", n, maxArtKeys)
 	}
-	if len(artRegistry) != 15 {
-		t.Errorf("art registry has %d keys, spec lists 15", len(artRegistry))
+	if len(artRegistry) != 17 {
+		t.Errorf("art registry has %d keys, spec lists 17", len(artRegistry))
 	}
 	for key, spec := range artRegistry {
 		t.Run(key, func(t *testing.T) {

@@ -233,6 +233,7 @@ type eventResp struct {
 	Theme       content.Theme            `json:"theme"`
 	Media       map[string]mediaItemResp `json:"media"`
 	ShareImage  shareImageResp           `json:"share_image"`
+	Music       musicResp                `json:"music"`
 	URL         *string                  `json:"url"`
 }
 
@@ -253,6 +254,33 @@ type shareImageReq struct {
 }
 
 var validShareImageSources = map[string]bool{"hero": true, "site": true, "custom": true}
+
+// musicReq is the optional music part of PATCH /v1/events/{id}.
+type musicReq struct {
+	Source string `json:"source"`
+}
+
+var validMusicSources = map[string]bool{"template": true, "custom": true, "none": true}
+
+// errNoAudio signals a music source of 'custom' for an event without an
+// uploaded track (checked inside the save transaction).
+var errNoAudio = errors.New("event has no uploaded audio")
+
+// musicIssue is the field-level issue for a 'custom' music source without an
+// uploaded track.
+var musicIssue = content.Issue{Path: "music.source", Code: "no_audio", Message: "Upload a track first."}
+
+// musicResp is the host view of the event's music choice. TemplateAvailable
+// is whether the resolved theme has music of its own, independent of Source;
+// Audio is the uploaded track, if any, whichever source is chosen.
+type musicResp struct {
+	Source            string     `json:"source"`
+	TemplateAvailable bool       `json:"template_available"`
+	Audio             *audioResp `json:"audio"`
+}
+
+// themeHasMusic reports whether a resolved theme carries its own track.
+func themeHasMusic(t content.Theme) bool { return t.Music != "" && t.Music != "none" }
 
 // validateShareImage checks a share_image request's shape and returns the
 // parsed media id ("custom" only). Whether that media is usable is checked
@@ -334,6 +362,15 @@ func (s *Server) buildEventResponse(ctx context.Context, q *store.Queries, row e
 		_ = json.Unmarshal(e.Overrides, &ov) // stored data was validated at save time
 	}
 
+	music := musicResp{Source: e.MusicSource, TemplateAvailable: themeHasMusic(theme)}
+	switch a, err := q.GetEventAudio(ctx, e.ID); {
+	case err == nil:
+		resp := newAudioResp(a)
+		music.Audio = &resp
+	case !errors.Is(err, pgx.ErrNoRows):
+		return eventResp{}, fmt.Errorf("load audio for event %s: %w", e.ID, err)
+	}
+
 	var url *string
 	if e.Slug != nil {
 		u := s.cfg.SiteURL + "/" + *e.Slug
@@ -353,6 +390,7 @@ func (s *Server) buildEventResponse(ctx context.Context, q *store.Queries, row e
 		},
 		Content: saved.JSON, Overrides: ov, Theme: theme, Media: media,
 		ShareImage: shareImageResp{Source: e.ShareImage, MediaID: e.ShareMediaID},
+		Music:      music,
 		URL:        url,
 	}, nil
 }
@@ -742,6 +780,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 		Overrides    json.RawMessage `json:"overrides"`
 		TemplateSlug *string         `json:"template_slug"`
 		ShareImage   *shareImageReq  `json:"share_image"`
+		Music        *musicReq       `json:"music"`
 	}
 	if !decodeJSONMax(w, r, &body, maxPatchBodyBytes) {
 		return
@@ -761,6 +800,21 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		shareSource, shareMediaID = &body.ShareImage.Source, id
+	}
+
+	var musicSource *string
+	if body.Music != nil {
+		if !validMusicSources[body.Music.Source] {
+			writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the music choice.",
+				[]content.Issue{{Path: "music.source", Code: "invalid", Message: "Must be template, custom or none."}})
+			return
+		}
+		// Anonymous drafts cannot upload audio, so 'custom' can never be valid.
+		if body.Music.Source == "custom" && !authed {
+			writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the music choice.", []content.Issue{musicIssue})
+			return
+		}
+		musicSource = &body.Music.Source
 	}
 
 	row, ok, err := s.loadEventRow(r, eventID)
@@ -884,10 +938,24 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 
 	err = s.inTx(ctx, func(tx pgx.Tx, q *store.Queries) error {
 		if authed {
+			if musicSource != nil && *musicSource == "custom" {
+				// Locks out a concurrent audio delete between this check and
+				// the update below.
+				if _, err := q.LockEventForEditor(ctx, store.LockEventForEditorParams{EventID: eventID, UserID: userID}); err != nil {
+					return err
+				}
+				has, err := q.EventAudioExists(ctx, eventID)
+				if err != nil {
+					return fmt.Errorf("check event audio: %w", err)
+				}
+				if !has {
+					return errNoAudio
+				}
+			}
 			_, err := q.UpdateEventContent(ctx, store.UpdateEventContentParams{
 				Content: contentJSON, Title: title, StartsAt: startsAt, EndsAt: endsAt, Overrides: overridesJSON,
 				TemplateID: templateID, TemplateVersion: templateVersion,
-				ShareImage: shareSource, ShareMediaID: shareMediaID,
+				ShareImage: shareSource, ShareMediaID: shareMediaID, MusicSource: musicSource,
 				EventID: eventID, Version: body.Version, UserID: userID,
 			})
 			if err != nil {
@@ -897,7 +965,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 			_, err := q.UpdateAnonDraftContent(ctx, store.UpdateAnonDraftContentParams{
 				Content: contentJSON, Title: title, StartsAt: startsAt, EndsAt: endsAt, Overrides: overridesJSON,
 				TemplateID: templateID, TemplateVersion: templateVersion,
-				ShareImage: shareSource, ShareMediaID: shareMediaID,
+				ShareImage: shareSource, ShareMediaID: shareMediaID, MusicSource: musicSource,
 				EventID: eventID, Version: body.Version, CookieHash: cookieHash,
 			})
 			if err != nil {
@@ -911,6 +979,10 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
+	if errors.Is(err, errNoAudio) {
+		writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the music choice.", []content.Issue{musicIssue})
+		return
+	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == "events_share_media_fkey" {
 		writeInvalidShareMedia(w)
