@@ -45,6 +45,8 @@ var artRegistry = map[string]artSpec{
 	"autumn_page":      {0, 0, false, false, placements("page")},
 	"marigold":         {0, 0, false, false, placements("top")},
 	"marigold_page":    {0, 0, false, false, placements("page")},
+	"wildflower":       {0, 0, false, false, placements("top")},
+	"wildflower_page":  {0, 0, false, false, placements("page")},
 	"daisies":          {2, 3, false, true, placements("corners", "edges")},
 }
 
