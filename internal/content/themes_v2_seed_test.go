@@ -17,7 +17,7 @@ import (
 // design/src/v2/build.mjs) and seed migration 00007 copies them verbatim.
 var v2SeedSlugs = []string{
 	"olive-grove", "letterpress", "velvet-foil", "sunlit", "sprinkles", "risograph",
-	"cloud-nine", "gingham", "open-door", "terrazzo", "gilt-noir", "mirror-ball", "mimosa",
+	"cloud-nine", "gingham", "open-door", "terrazzo", "gilt-noir", "mirror-ball", "mimosa", "harvest",
 }
 
 // resolvedHexRe is the only colour form a resolved theme may carry: the

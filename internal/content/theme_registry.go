@@ -41,6 +41,8 @@ var artRegistry = map[string]artSpec{
 	"sparkles":         {1, 2, true, true, placements("scatter", "hero")},
 	"printers_corners": {1, 1, true, false, placements("corners")},
 	"mimosa":           {0, 0, false, false, placements("top")},
+	"autumn":           {0, 0, false, false, placements("top")},
+	"autumn_page":      {0, 0, false, false, placements("page")},
 	"daisies":          {2, 3, false, true, placements("corners", "edges")},
 }
 
