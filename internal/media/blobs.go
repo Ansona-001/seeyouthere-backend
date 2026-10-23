@@ -11,8 +11,9 @@ import (
 // internal/media/r2 implement it. Keys come only from mediaKey/templateKey
 // and must satisfy ValidKey; implementations reject anything else.
 type Blobs interface {
-	// Put stores size bytes from body as image/jpeg, replacing any existing
-	// object. body is seekable so a retrying implementation can rewind it.
+	// Put stores size bytes from body, replacing any existing object. Stored
+	// objects are labelled image/jpeg internally (audio included), but that
+	// label is never sent to clients: the HTTP layer sets the content type. body is seekable so a retrying implementation can rewind it.
 	Put(ctx context.Context, key string, body io.ReadSeeker, size int64) error
 	// Get opens an object. When ifNoneMatch equals the object's ETag it
 	// returns ErrNotModified; a missing object is ErrNotFound.

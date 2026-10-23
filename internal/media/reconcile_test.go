@@ -134,6 +134,11 @@ func TestMediaIDFromKey(t *testing.T) {
 	}{
 		{mediaKey(ev, md, 480), true},
 		{mediaKey(ev, md, 1920), true},
+		{audioKey(ev, md), true},
+		{"e/" + ev.String() + "/" + md.String() + "/audio.mp4", false},
+		{"e/" + ev.String() + "/" + md.String() + "/Audio.mp3", false},
+		{"e/" + ev.String() + "/" + uuid.Nil.String() + "/audio.mp3", false},
+		{"e/bad/" + md.String() + "/audio.mp3", false},
 		{"e/" + ev.String() + "/" + md.String() + "/500.jpg", false},
 		{"e/" + ev.String() + "/" + md.String() + "/480.png", false},
 		{"e/" + ev.String() + "/" + md.String(), false},

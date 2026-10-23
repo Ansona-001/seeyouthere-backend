@@ -972,3 +972,235 @@ func TestMigration00029_MimosaMusic(t *testing.T) {
 	}
 	check()
 }
+
+// TestMigration00032_EventAudio applies migrations up to 32 and checks the events.music_source default
+// and CHECK, the event_audio size/duration CHECKs, the one-track-per-event UNIQUE, the CASCADE on event
+// delete, the SET NULL on uploader delete, and that Down removes the table and column and Up can run again.
+func TestMigration00032_EventAudio(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 31); err != nil {
+		t.Fatalf("migrate to 31: %v", err)
+	}
+	owner := uuid.Must(uuid.NewV7())
+	if _, err := pool.Exec(ctx, "INSERT INTO users (id, email) VALUES ($1, $2)", owner, "mig32-"+owner.String()+"@example.invalid"); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	insertEvent := func() uuid.UUID {
+		t.Helper()
+		id := uuid.Must(uuid.NewV7())
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO events (id, owner_id, occasion_slug, title, content, template_id, template_version)
+			SELECT $1, $2, 'birthday', 'mig32', '[]', t.id, tv.version
+			FROM templates t JOIN template_versions tv ON tv.template_id = t.id LIMIT 1`, id, owner); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+		return id
+	}
+	existing := insertEvent()
+	if _, err := provider.UpTo(ctx, 32); err != nil {
+		t.Fatalf("migrate to 32: %v", err)
+	}
+
+	source := func(id uuid.UUID) string {
+		t.Helper()
+		var s string
+		if err := pool.QueryRow(ctx, "SELECT music_source FROM events WHERE id = $1", id).Scan(&s); err != nil {
+			t.Fatalf("read music_source: %v", err)
+		}
+		return s
+	}
+	if got := source(existing); got != "template" {
+		t.Errorf("music_source of a pre-existing event = %q, want template", got)
+	}
+	if got := source(insertEvent()); got != "template" {
+		t.Errorf("music_source of a new event = %q, want template", got)
+	}
+	for _, v := range []string{"custom", "none", "template"} {
+		if _, err := pool.Exec(ctx, "UPDATE events SET music_source = $1 WHERE id = $2", v, existing); err != nil {
+			t.Errorf("music_source %q rejected: %v", v, err)
+		}
+	}
+	wantCode := func(name string, err error, code string) {
+		t.Helper()
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != code {
+			t.Errorf("%s: err = %v, want SQLSTATE %s", name, err, code)
+		}
+	}
+	for _, v := range []string{"", "Custom", "mp3", "silent"} {
+		_, err := pool.Exec(ctx, "UPDATE events SET music_source = $1 WHERE id = $2", v, existing)
+		wantCode("music_source "+v, err, "23514")
+	}
+	if _, err := pool.Exec(ctx, "UPDATE events SET music_source = NULL WHERE id = $1", existing); err == nil {
+		t.Error("NULL music_source accepted")
+	}
+
+	insertAudio := func(eventID uuid.UUID, uploader *uuid.UUID, size int64, dur int) error {
+		_, err := pool.Exec(ctx, `INSERT INTO event_audio (id, event_id, uploaded_by, size_bytes, duration_ms)
+			VALUES ($1, $2, $3, $4, $5)`, uuid.Must(uuid.NewV7()), eventID, uploader, size, dur)
+		return err
+	}
+	probe := insertEvent()
+	for _, c := range []struct {
+		name string
+		size int64
+		dur  int
+	}{
+		{"size 0", 0, 30000}, {"size over 5 MiB", 5242881, 30000},
+		{"duration under 1s", 1000, 999}, {"duration over 10m", 1000, 600001},
+	} {
+		wantCode(c.name, insertAudio(probe, &owner, c.size, c.dur), "23514")
+	}
+	wantCode("missing event", insertAudio(uuid.Must(uuid.NewV7()), &owner, 1000, 30000), "23503")
+	for _, c := range []struct {
+		size int64
+		dur  int
+	}{{1, 1000}, {5242880, 600000}} {
+		if err := insertAudio(insertEvent(), &owner, c.size, c.dur); err != nil {
+			t.Errorf("boundary size=%d dur=%d rejected: %v", c.size, c.dur, err)
+		}
+	}
+
+	// One track per event.
+	if err := insertAudio(probe, &owner, 1000, 30000); err != nil {
+		t.Fatalf("insert audio: %v", err)
+	}
+	wantCode("second track", insertAudio(probe, &owner, 1000, 30000), "23505")
+
+	// Uploader delete keeps the track (SET NULL).
+	other := uuid.Must(uuid.NewV7())
+	if _, err := pool.Exec(ctx, "INSERT INTO users (id, email) VALUES ($1, $2)", other, "mig32-"+other.String()+"@example.invalid"); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	kept := insertEvent()
+	if err := insertAudio(kept, &other, 1000, 30000); err != nil {
+		t.Fatalf("insert audio: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM users WHERE id = $1", other); err != nil {
+		t.Fatalf("delete uploader: %v", err)
+	}
+	var uploader *uuid.UUID
+	if err := pool.QueryRow(ctx, "SELECT uploaded_by FROM event_audio WHERE event_id = $1", kept).Scan(&uploader); err != nil || uploader != nil {
+		t.Errorf("uploaded_by after uploader delete = %v (err %v), want NULL row kept", uploader, err)
+	}
+
+	// Event delete cascades.
+	if _, err := pool.Exec(ctx, "DELETE FROM events WHERE id = $1", probe); err != nil {
+		t.Fatalf("delete event: %v", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_audio WHERE event_id = $1", probe).Scan(&n); err != nil || n != 0 {
+		t.Errorf("audio rows after event delete = %d (err %v), want 0 (CASCADE)", n, err)
+	}
+
+	// Indexes exist: FK index on uploaded_by and the unique key on event_id.
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE tablename = 'event_audio'
+		AND indexname IN ('event_audio_uploaded_by_idx', 'event_audio_event_key')`).Scan(&n); err != nil || n != 2 {
+		t.Errorf("event_audio indexes = %d (err %v), want 2", n, err)
+	}
+
+	// Down removes the table and the column; Up again restores the default.
+	if _, err := provider.DownTo(ctx, 31); err != nil {
+		t.Fatalf("down to 31: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM information_schema.tables WHERE table_name = 'event_audio') +
+		(SELECT count(*) FROM information_schema.columns WHERE table_name = 'events' AND column_name = 'music_source')`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("event_audio table/music_source column after Down = %d (err %v), want 0", n, err)
+	}
+	if _, err := provider.UpTo(ctx, 32); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	if got := source(existing); got != "template" {
+		t.Errorf("music_source after Up again = %q, want template", got)
+	}
+}
+
+// TestMigration00033_HarvestMusic applies migrations up to 33 and checks that Harvest got exactly one new
+// published version (previous latest + 1) that differs only by music = music_box, that the manifest
+// validates and resolves the music, that no other template got a version, and that Down removes only
+// that version and Up can run again.
+func TestMigration00033_HarvestMusic(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 32); err != nil {
+		t.Fatalf("migrate to 32: %v", err)
+	}
+	versionCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions").Scan(&n); err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		return n
+	}
+	harvestLatest := func() (version int, manifest []byte, published bool) {
+		t.Helper()
+		err := pool.QueryRow(ctx, `SELECT v.version, v.manifest, v.published_at IS NOT NULL
+			FROM template_versions v JOIN templates t ON t.id = v.template_id
+			WHERE t.slug = 'harvest' ORDER BY v.version DESC LIMIT 1`).Scan(&version, &manifest, &published)
+		if err != nil {
+			t.Fatalf("read harvest latest version: %v", err)
+		}
+		return version, manifest, published
+	}
+	before := versionCount()
+	prevVersion, prevManifest, _ := harvestLatest()
+	if _, err := provider.UpTo(ctx, 33); err != nil {
+		t.Fatalf("migrate to 33: %v", err)
+	}
+
+	check := func() {
+		t.Helper()
+		if got := versionCount(); got != before+1 {
+			t.Errorf("versions = %d, want %d (only harvest gets one)", got, before+1)
+		}
+		version, manifest, published := harvestLatest()
+		if version != prevVersion+1 || !published {
+			t.Errorf("harvest latest = v%d published=%v, want v%d published", version, published, prevVersion+1)
+		}
+		m, err := content.ValidateManifest(manifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest: %v", err)
+		}
+		old, err := content.ValidateManifest(prevManifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest(previous): %v", err)
+		}
+		if old.Music != "" {
+			t.Errorf("previous version was modified: music=%q", old.Music)
+		}
+		if len(m.Palettes) != len(old.Palettes) || m.Palettes[0].ID != old.Palettes[0].ID || m.Defaults != old.Defaults || len(m.Fonts) != len(old.Fonts) {
+			t.Errorf("palette/font ids changed: %+v vs %+v", m.Defaults, old.Defaults)
+		}
+		if m.Music != "music_box" {
+			t.Errorf("music = %q, want music_box", m.Music)
+		}
+		if th := content.ResolveTheme(m, nil, ""); th.Music != "music_box" {
+			t.Errorf("resolved music = %q, want music_box", th.Music)
+		}
+		var others int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM template_versions v JOIN templates t ON t.id = v.template_id
+			WHERE t.slug NOT IN ('harvest', 'mimosa') AND v.manifest ? 'music'`).Scan(&others); err != nil || others != 0 {
+			t.Errorf("other templates with music = %d (err %v), want 0", others, err)
+		}
+	}
+	check()
+
+	if _, err := provider.DownTo(ctx, 32); err != nil {
+		t.Fatalf("down to 32: %v", err)
+	}
+	if got := versionCount(); got != before {
+		t.Errorf("versions after Down = %d, want %d", got, before)
+	}
+	if v, _, _ := harvestLatest(); v != prevVersion {
+		t.Errorf("harvest latest after Down = v%d, want v%d", v, prevVersion)
+	}
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+	if _, err := provider.UpTo(ctx, 33); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	check()
+}

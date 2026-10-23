@@ -40,7 +40,19 @@ const (
 	mediaStreamWait  = 5 * time.Second
 	mediaStreamLimit = 60 * time.Second // write deadline for one streamed image
 
+	// audioStreams bounds concurrent audio downloads separately (and below
+	// mediaStreams) so slow MP3 downloads cannot starve image streams.
+	audioStreams = 8
+
+	// mediaAudioPerIPLimit is the per-client-IP hourly audio fetch limit. A
+	// real visitor needs one fetch an hour because responses are cached for
+	// an hour; the limit stops a client looping a multi-MB file.
+	mediaAudioPerIPLimit = 30
+
 	storageRetryAfter = "30"
+
+	jpegContentType = "image/jpeg"
+	mp3ContentType  = "audio/mpeg"
 
 	publicMediaCache  = "public, max-age=3600"
 	previewMediaCache = "private, max-age=300"
@@ -139,12 +151,61 @@ func (s *Server) handleMediaFile(w http.ResponseWriter, r *http.Request) {
 	if isOG {
 		s.serveObject(w, r, func(ctx context.Context, inm string) (*media.Object, error) {
 			return s.media.OpenOG(ctx, eventID, mediaID, inm)
-		}, publicMediaCache, publicReads)
+		}, jpegContentType, publicMediaCache, publicReads)
 		return
 	}
 	s.serveObject(w, r, func(ctx context.Context, inm string) (*media.Object, error) {
 		return s.media.Open(ctx, eventID, mediaID, width, inm)
-	}, publicMediaCache, publicReads)
+	}, jpegContentType, publicMediaCache, publicReads)
+}
+
+// GET /media/{event_id}/{media_id}/audio.mp3
+//
+// Public: the event's uploaded music track, servable under the same rule as
+// its photos (GetServableAudio). The static route segment wins over
+// handleMediaFile's {file} parameter, so an image id here and an audio id on
+// the image route are each simply not found. An audio slot is taken before
+// serveObject takes a stream slot, so at most audioStreams MP3 downloads can
+// hold stream slots at once.
+func (s *Server) handleAudioFile(w http.ResponseWriter, r *http.Request) {
+	mediaErrorHeaders(w)
+	eventID, ok1 := parseCanonicalUUID(chi.URLParam(r, "event_id"))
+	audioID, ok2 := parseCanonicalUUID(chi.URLParam(r, "media_id"))
+	if !ok1 || !ok2 {
+		notFoundFile(w)
+		return
+	}
+	ctx := r.Context()
+	if !s.allowView(w, r) {
+		return
+	}
+	if _, err := s.q.GetServableAudio(ctx, store.GetServableAudioParams{AudioID: audioID, EventID: eventID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			notFoundFile(w)
+			return
+		}
+		serverError(w, r, fmt.Errorf("get servable audio: %w", err))
+		return
+	}
+	if !s.allowAudio(w, r) {
+		return
+	}
+
+	timer := time.NewTimer(mediaStreamWait)
+	defer timer.Stop()
+	select {
+	case s.audioSem <- struct{}{}:
+		defer func() { <-s.audioSem }()
+	case <-timer.C:
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, "busy", "The server is busy. Try again shortly.")
+		return
+	case <-ctx.Done():
+		return
+	}
+	s.serveObject(w, r, func(ctx context.Context, inm string) (*media.Object, error) {
+		return s.media.OpenAudio(ctx, eventID, audioID, inm)
+	}, mp3ContentType, publicMediaCache, publicReads)
 }
 
 // GET /media/templates/{template_id}/{version}/background/{480|1080|1920}.jpg
@@ -173,7 +234,7 @@ func (s *Server) handleTemplateMediaFile(w http.ResponseWriter, r *http.Request)
 	}
 	s.serveObject(w, r, func(ctx context.Context, inm string) (*media.Object, error) {
 		return s.media.OpenTemplateAsset(ctx, templateID, version, width, inm)
-	}, publicMediaCache, publicReads)
+	}, jpegContentType, publicMediaCache, publicReads)
 }
 
 // allowView applies the per-client-IP view limit. A limiter outage fails
@@ -182,6 +243,23 @@ func (s *Server) handleTemplateMediaFile(w http.ResponseWriter, r *http.Request)
 func (s *Server) allowView(w http.ResponseWriter, r *http.Request) bool {
 	ctx := r.Context()
 	ok, err := s.limiter.Allow(ctx, "media:view:ip:"+ipRateKey(clientIPFrom(ctx)), mediaViewPerIPLimit, time.Hour)
+	if err != nil {
+		s.warnLimiterDown(ctx, err)
+		return true
+	}
+	if !ok {
+		w.Header().Set("Retry-After", "3600")
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many requests. Please wait and try again.")
+		return false
+	}
+	return true
+}
+
+// allowAudio applies the stricter per-client-IP audio limit on top of
+// allowView, failing open like it.
+func (s *Server) allowAudio(w http.ResponseWriter, r *http.Request) bool {
+	ctx := r.Context()
+	ok, err := s.limiter.Allow(ctx, "media:audio:ip:"+ipRateKey(clientIPFrom(ctx)), mediaAudioPerIPLimit, time.Hour)
 	if err != nil {
 		s.warnLimiterDown(ctx, err)
 		return true
@@ -211,7 +289,7 @@ func (s *Server) warnLimiterDown(ctx context.Context, err error) {
 // (so a busy refusal costs nothing), and answers with only headers we control
 // (the stored object's own metadata is never reflected).
 func (s *Server) serveObject(w http.ResponseWriter, r *http.Request,
-	open func(ctx context.Context, ifNoneMatch string) (*media.Object, error), cacheControl string, budget readBudget) {
+	open func(ctx context.Context, ifNoneMatch string) (*media.Object, error), contentType, cacheControl string, budget readBudget) {
 	ctx := r.Context()
 
 	timer := time.NewTimer(mediaStreamWait)
@@ -244,7 +322,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request,
 	case errors.Is(err, media.ErrNotModified):
 		// The backend validated the client's ETag; we only need to restate it.
 		h := w.Header()
-		setMediaHeaders(h, cacheControl)
+		setMediaHeaders(h, contentType, cacheControl)
 		if etag := forwardableETag(r.Header.Get("If-None-Match")); etag != "" {
 			h.Set("ETag", etag)
 		}
@@ -261,7 +339,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request,
 	defer obj.Body.Close()
 
 	h := w.Header()
-	setMediaHeaders(h, cacheControl)
+	setMediaHeaders(h, contentType, cacheControl)
 	if obj.ETag != "" {
 		h.Set("ETag", obj.ETag)
 	}
@@ -286,8 +364,8 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request,
 
 // setMediaHeaders sets the headers shared by 200 and 304 media responses. The
 // content type is always ours, never the stored object's.
-func setMediaHeaders(h http.Header, cacheControl string) {
-	h.Set("Content-Type", "image/jpeg")
+func setMediaHeaders(h http.Header, contentType, cacheControl string) {
+	h.Set("Content-Type", contentType)
 	h.Set("Cache-Control", cacheControl)
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Content-Security-Policy", "default-src 'none'")

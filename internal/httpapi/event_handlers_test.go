@@ -114,12 +114,13 @@ func newEventTestFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client) ev
 	})
 
 	s := &Server{
-		pool:     pool,
-		q:        q,
-		rdb:      rdb,
-		limiter:  ratelimit.New(rdb),
-		cfg:      testConfig(),
-		mediaSem: make(chan struct{}, mediaStreams),
+		pool:           pool,
+		q:              q,
+		rdb:            rdb,
+		limiter:        ratelimit.New(rdb),
+		cfg:            testConfig(),
+		mediaSem:       make(chan struct{}, mediaStreams),
+		audioUploadSem: make(chan struct{}, audioUploads),
 	}
 	return eventTestFixture{s: s, ownerID: owner, editorID: editor, viewerID: viewer, strangerID: stranger, eventID: event.ID}
 }

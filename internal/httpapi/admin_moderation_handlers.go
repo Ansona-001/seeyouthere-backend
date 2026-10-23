@@ -814,7 +814,7 @@ func (s *Server) handleGetAdminMediaFile(w http.ResponseWriter, r *http.Request)
 
 	s.serveObject(w, r, func(ctx context.Context, inm string) (*media.Object, error) {
 		return s.media.Open(ctx, row.EventID, mediaID, width, inm)
-	}, previewMediaCache, previewReads)
+	}, jpegContentType, previewMediaCache, previewReads)
 }
 
 // POST /v1/admin/media/{id}/reject

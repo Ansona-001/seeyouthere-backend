@@ -219,7 +219,7 @@ func newPublicEventFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, 
 
 	s := &Server{
 		pool: pool, q: q, rdb: rdb, limiter: ratelimit.New(rdb),
-		cfg: testConfig(), mediaSem: make(chan struct{}, mediaStreams),
+		cfg: testConfig(), mediaSem: make(chan struct{}, mediaStreams), audioUploadSem: make(chan struct{}, audioUploads),
 		tokens: tokens, hasher: hasher, media: mediaStore, images: media.NewProcessor(1),
 	}
 	return &publicEventFixture{s: s, ownerID: ownerID, eventID: event.ID, slug: slug}

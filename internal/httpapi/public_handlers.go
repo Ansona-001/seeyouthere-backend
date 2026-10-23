@@ -78,8 +78,11 @@ type publicEventResp struct {
 	Media          map[string]mediaItemResp `json:"media"`
 	// ShareImage is the link-preview image, nil when the page should use
 	// the site's default image (see resolveShareImage).
-	ShareImage *mediaItemResp       `json:"share_image"`
-	RSVP       publicRsvpConfigResp `json:"rsvp"`
+	ShareImage *mediaItemResp `json:"share_image"`
+	// MusicSrc is the host's own uploaded track, set only while it is the
+	// chosen music source (theme.music is then empty).
+	MusicSrc *string              `json:"music_src"`
+	RSVP     publicRsvpConfigResp `json:"rsvp"`
 }
 
 // resolveShareImage picks the link-preview image from the event's choice:
@@ -383,6 +386,16 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 		backgroundSrc = "/media/" + row.AssetsPath + "/background"
 	}
 	theme := content.ResolveTheme(manifest, row.Overrides, backgroundSrc)
+	// The event's own music choice overrides the template's: "custom" and
+	// "none" both silence the template track.
+	var musicSrc *string
+	if row.MusicSource != "template" {
+		theme.Music = ""
+	}
+	if row.MusicSource == "custom" && row.AudioID != nil {
+		src := audioSrc(row.ID, *row.AudioID)
+		musicSrc = &src
+	}
 
 	lookup := saved.MediaIDs
 	if row.ShareImage == "custom" && row.ShareMediaID != nil {
@@ -424,6 +437,7 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 		Indexable: row.Visibility == "public", RemoveBranding: row.RemoveBranding,
 		Content: saved.JSON, Theme: theme, Media: media,
 		ShareImage: resolveShareImage(row.ShareImage, row.ShareMediaID, saved.HeroMediaID, media),
+		MusicSrc:   musicSrc,
 		RSVP:       rsvpCfg,
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
