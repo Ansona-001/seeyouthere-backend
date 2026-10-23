@@ -1,0 +1,57 @@
+{
+  "schema": 2,
+  "layout": "centered",
+  "hero_style": "text_only",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "saffron",
+      "name": "Saffron",
+      "colors": {
+        "background": "#FAF3E6",
+        "surface": "#FFFBF3",
+        "text": "#4A2412",
+        "muted": "#6B4430",
+        "accent": "#B8420A",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#B8420A",
+      "art": ["#E8761F", "#B8420A", "#6F8447", "#F6E3C6", "#C2560F", "#EBCFA3", "#8A5A2B"]
+    },
+    {
+      "id": "ivory",
+      "name": "Ivory",
+      "colors": {
+        "background": "#FBF7EE",
+        "surface": "#FFFDF8",
+        "text": "#3E2415",
+        "muted": "#664432",
+        "accent": "#A33D0A",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#A33D0A",
+      "art": ["#E8761F", "#A33D0A", "#6F8447", "#F8EBD3", "#B54F10", "#EBD7B5", "#8A5A2B"]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "playfair",
+      "name": "Playfair and Lora",
+      "heading": "playfair_display",
+      "body": "lora",
+      "accent": "pinyon_script"
+    }
+  ],
+  "defaults": { "palette": "saffron", "font": "playfair" },
+  "layers": [
+    { "kind": "paper", "tone": "background", "glow": "art4", "glow_opacity": 0.6, "vignette": "art6", "vignette_opacity": 0.25 },
+    { "kind": "art", "art": "marigold_page", "placement": "page" },
+    { "kind": "art", "art": "marigold", "placement": "top" },
+    { "kind": "texture", "texture": "cold_press", "opacity": 0.35, "blend": "multiply" }
+  ],
+  "ornament": { "hero": "none", "divider": "none", "badge": "none", "ampersand": "script", "hero_ink": "" },
+  "card": { "style": "reply_card", "border": "none", "radius": 4, "fields": "underline", "buttons": "accent" },
+  "motion": "sway",
+  "music": "music_box"
+}
