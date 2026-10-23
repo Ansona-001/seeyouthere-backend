@@ -1,0 +1,57 @@
+{
+  "schema": 2,
+  "layout": "centered",
+  "hero_style": "text_only",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "poppy",
+      "name": "Poppy",
+      "colors": {
+        "background": "#FBF7F0",
+        "surface": "#FFFDF9",
+        "text": "#3A2B25",
+        "muted": "#64483C",
+        "accent": "#B13F17",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#B13F17",
+      "art": ["#E8541C", "#B13F17", "#6F8A6A", "#F6EBDD", "#C4501F", "#E9DCC8", "#8FA7B0"]
+    },
+    {
+      "id": "sage",
+      "name": "Sage",
+      "colors": {
+        "background": "#F7F8F1",
+        "surface": "#FDFEF9",
+        "text": "#2C3A33",
+        "muted": "#4D5F55",
+        "accent": "#2F5D50",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#2F5D50",
+      "art": ["#E8541C", "#2F5D50", "#6F8A6A", "#EEF1E4", "#3C6E5F", "#DDE4D2", "#8FA7B0"]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "cormorant",
+      "name": "Cormorant and Lora",
+      "heading": "cormorant_garamond",
+      "body": "lora",
+      "accent": "pinyon_script"
+    }
+  ],
+  "defaults": { "palette": "poppy", "font": "cormorant" },
+  "layers": [
+    { "kind": "paper", "tone": "background", "glow": "art4", "glow_opacity": 0.5, "vignette": "art6", "vignette_opacity": 0.2 },
+    { "kind": "art", "art": "wildflower_page", "placement": "page" },
+    { "kind": "art", "art": "wildflower", "placement": "top" },
+    { "kind": "texture", "texture": "cold_press", "opacity": 0.3, "blend": "multiply" }
+  ],
+  "ornament": { "hero": "none", "divider": "none", "badge": "none", "ampersand": "script", "hero_ink": "" },
+  "card": { "style": "reply_card", "border": "none", "radius": 4, "fields": "underline", "buttons": "accent" },
+  "motion": "sway",
+  "music": "music_box"
+}
