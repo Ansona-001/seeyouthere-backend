@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 	"unicode/utf8"
 
@@ -33,13 +35,168 @@ var templateSlugRe = regexp.MustCompile(`^[a-z0-9-]{1,50}$`)
 // --- response shapes ---
 
 type adminTemplateResp struct {
-	ID            uuid.UUID       `json:"id"`
-	Slug          string          `json:"slug"`
-	Name          string          `json:"name"`
-	Tags          json.RawMessage `json:"tags"`
-	IsPremium     bool            `json:"is_premium"`
-	Status        string          `json:"status"`
-	LatestVersion int32           `json:"latest_version"`
+	ID         uuid.UUID       `json:"id"`
+	Slug       string          `json:"slug"`
+	Name       string          `json:"name"`
+	Tags       json.RawMessage `json:"tags"`
+	IsPremium  bool            `json:"is_premium"`
+	PricePaise int32           `json:"price_paise"`
+	// RegionalPrices are the non-India prices; null means not offered there.
+	RegionalPrices regionalPricesResp `json:"regional_prices"`
+	Status         string             `json:"status"`
+	LatestVersion  int32              `json:"latest_version"`
+}
+
+type regionalPricesResp struct {
+	AE  *int32 `json:"AE"`
+	INT *int32 `json:"INT"`
+}
+
+func newRegionalPricesResp(rows []store.TemplatePrice) regionalPricesResp {
+	var out regionalPricesResp
+	for _, p := range rows {
+		amount := p.AmountMinor
+		switch p.Region {
+		case "AE":
+			out.AE = &amount
+		case "INT":
+			out.INT = &amount
+		}
+	}
+	return out
+}
+
+// auditMap renders the offered regions for an audit entry.
+func (p regionalPricesResp) auditMap() map[string]*int32 {
+	return map[string]*int32{"AE": p.AE, "INT": p.INT}
+}
+
+// Premium template price bounds in minor units (mirrors templates_price_paise_range)
+// and the price a template gets when the create request names none.
+const (
+	minPriceMinor     = 100
+	maxPriceMinor     = 1000000
+	defaultPricePaise = 59900
+)
+
+// priceField is a price request value decoded leniently so a bad type or
+// value becomes a field-level validation issue instead of a generic
+// invalid_json. It tells an absent key (set false) from null and from a value.
+type priceField struct {
+	set   bool
+	null  bool
+	valid bool  // the token was a JSON integer (possibly out of range)
+	val   int64 // math.MaxInt64 when the integer overflowed int64
+}
+
+// UnmarshalJSON never fails: anything that is not an integer is recorded as
+// invalid and reported by check.
+func (f *priceField) UnmarshalJSON(b []byte) error {
+	f.set = true
+	if string(b) == "null" {
+		f.null = true
+		return nil
+	}
+	v, err := strconv.ParseInt(string(b), 10, 64)
+	switch {
+	case err == nil:
+		f.valid, f.val = true, v
+	case errors.Is(err, strconv.ErrRange):
+		f.valid, f.val = true, math.MaxInt64
+	}
+	return nil
+}
+
+// value reports the price to write; ok is false when absent, null or invalid.
+func (f priceField) value() (int32, bool) {
+	if !f.set || f.null || !f.valid {
+		return 0, false
+	}
+	return int32(f.val), true
+}
+
+// check validates a present, non-null value and appends an issue at path.
+func (f priceField) check(path string, issues *[]content.Issue) {
+	switch {
+	case !f.set || f.null:
+	case !f.valid:
+		*issues = append(*issues, content.Issue{Path: path, Code: "invalid", Message: "Must be a whole number."})
+	case f.val < minPriceMinor || f.val > maxPriceMinor:
+		*issues = append(*issues, content.Issue{Path: path, Code: "out_of_range", Message: "Must be between 100 and 1000000."})
+	}
+}
+
+// regionalPricesReq is the regional_prices request object. A number sets the
+// region's price, null stops offering it, an absent key leaves it unchanged.
+type regionalPricesReq struct {
+	AE  priceField `json:"AE"`
+	INT priceField `json:"INT"`
+}
+
+type regionalPriceChange struct {
+	region string
+	f      priceField
+}
+
+// regions lists the regions in a fixed order; safe on a nil receiver.
+func (r *regionalPricesReq) regions() []regionalPriceChange {
+	if r == nil {
+		return nil
+	}
+	return []regionalPriceChange{{"AE", r.AE}, {"INT", r.INT}}
+}
+
+// validatePrices checks price_paise and regional_prices.<REGION> together so
+// the caller sees every bad field at once. When premiumKnown, premium is
+// whether the template is premium once the request applies, which setting a
+// regional price needs; otherwise the update transaction checks it.
+func validatePrices(w http.ResponseWriter, price priceField, regional *regionalPricesReq, premiumKnown, premium bool) bool {
+	var issues []content.Issue
+	price.check("price_paise", &issues)
+	for _, rr := range regional.regions() {
+		rr.f.check("regional_prices."+rr.region, &issues)
+		if _, ok := rr.f.value(); ok && premiumKnown && !premium {
+			issues = append(issues, content.Issue{Path: "regional_prices." + rr.region, Code: "requires_premium",
+				Message: "Regional prices need a premium template."})
+		}
+	}
+	if len(issues) == 0 {
+		return true
+	}
+	writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the prices.", issues)
+	return false
+}
+
+// errRegionalNeedsPremium carries the offending region out of the update
+// transaction when a regional price is set on a non-premium template.
+type errRegionalNeedsPremium struct{ region string }
+
+func (e *errRegionalNeedsPremium) Error() string {
+	return "admin: regional price on non-premium template: " + e.region
+}
+
+// applyRegionalPrices upserts or deletes the requested regions and returns the
+// template's resulting regional prices. The caller has checked it is premium.
+func applyRegionalPrices(ctx context.Context, q *store.Queries, templateID uuid.UUID, req *regionalPricesReq) ([]store.TemplatePrice, error) {
+	for _, rr := range req.regions() {
+		switch {
+		case !rr.f.set:
+		case rr.f.null:
+			if _, err := q.DeleteTemplatePrice(ctx, store.DeleteTemplatePriceParams{TemplateID: templateID, Region: rr.region}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return nil, fmt.Errorf("delete template price: %w", err)
+			}
+		default:
+			amount, _ := rr.f.value()
+			if _, err := q.UpsertTemplatePrice(ctx, store.UpsertTemplatePriceParams{TemplateID: templateID, Region: rr.region, AmountMinor: amount}); err != nil {
+				return nil, fmt.Errorf("upsert template price: %w", err)
+			}
+		}
+	}
+	rows, err := q.ListTemplatePrices(ctx, []uuid.UUID{templateID})
+	if err != nil {
+		return nil, fmt.Errorf("list template prices: %w", err)
+	}
+	return rows, nil
 }
 
 func tagsOrEmptyObject(tags []byte) json.RawMessage {
@@ -73,11 +230,25 @@ func (s *Server) handleListAdminTemplates(w http.ResponseWriter, r *http.Request
 		serverError(w, r, fmt.Errorf("list templates admin: %w", err))
 		return
 	}
+	ids := make([]uuid.UUID, len(rows))
+	for i, row := range rows {
+		ids[i] = row.ID
+	}
+	prices, err := s.q.ListTemplatePrices(r.Context(), ids)
+	if err != nil {
+		serverError(w, r, fmt.Errorf("list template prices: %w", err))
+		return
+	}
+	byTemplate := make(map[uuid.UUID][]store.TemplatePrice, len(rows))
+	for _, p := range prices {
+		byTemplate[p.TemplateID] = append(byTemplate[p.TemplateID], p)
+	}
 	items := make([]adminTemplateResp, len(rows))
 	for i, row := range rows {
 		items[i] = adminTemplateResp{
 			ID: row.ID, Slug: row.Slug, Name: row.Name, Tags: tagsOrEmptyObject(row.Tags),
-			IsPremium: row.IsPremium, Status: row.Status, LatestVersion: row.LatestVersion,
+			IsPremium: row.IsPremium, PricePaise: row.PricePaise, RegionalPrices: newRegionalPricesResp(byTemplate[row.ID]),
+			Status: row.Status, LatestVersion: row.LatestVersion,
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"templates": items})
@@ -89,6 +260,9 @@ func (s *Server) handleCreateAdminTemplate(w http.ResponseWriter, r *http.Reques
 		Name      string          `json:"name"`
 		Tags      json.RawMessage `json:"tags"`
 		IsPremium bool            `json:"is_premium"`
+		// PricePaise defaults to defaultPricePaise when absent or null.
+		PricePaise     priceField         `json:"price_paise"`
+		RegionalPrices *regionalPricesReq `json:"regional_prices"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -107,22 +281,38 @@ func (s *Server) handleCreateAdminTemplate(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "validation_failed", "Invalid tags.")
 		return
 	}
+	if !validatePrices(w, body.PricePaise, body.RegionalPrices, true, body.IsPremium) {
+		return
+	}
+	price := int32(defaultPricePaise)
+	if v, ok := body.PricePaise.value(); ok {
+		price = v
+	}
 
 	callerID, _ := userIDFrom(r.Context())
 	ctx := r.Context()
 	templateID := uuid.Must(uuid.NewV7())
 	var created store.Template
+	var regional regionalPricesResp
 	err := s.inTx(ctx, func(_ pgx.Tx, q *store.Queries) error {
 		var err error
 		created, err = q.CreateTemplate(ctx, store.CreateTemplateParams{
-			ID: templateID, Slug: body.Slug, Name: name, Tags: tags, IsPremium: body.IsPremium,
+			ID: templateID, Slug: body.Slug, Name: name, Tags: tags, IsPremium: body.IsPremium, PricePaise: price,
 		})
 		if err != nil {
 			return err
 		}
+		rows, err := applyRegionalPrices(ctx, q, templateID, body.RegionalPrices)
+		if err != nil {
+			return err
+		}
+		regional = newRegionalPricesResp(rows)
 		return s.writeAudit(ctx, q, r, auditEntry{
 			ActorID: &callerID, Action: "template.create", TargetType: "template", TargetID: templateID.String(),
-			After: map[string]any{"slug": body.Slug, "name": name, "is_premium": body.IsPremium},
+			After: map[string]any{
+				"slug": body.Slug, "name": name, "is_premium": body.IsPremium, "price_paise": price,
+				"regional_prices": regional.auditMap(),
+			},
 		})
 	})
 	if err != nil {
@@ -136,7 +326,8 @@ func (s *Server) handleCreateAdminTemplate(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusCreated, adminTemplateResp{
 		ID: created.ID, Slug: created.Slug, Name: created.Name, Tags: tagsOrEmptyObject(created.Tags),
-		IsPremium: created.IsPremium, Status: created.Status, LatestVersion: 0,
+		IsPremium: created.IsPremium, PricePaise: created.PricePaise, RegionalPrices: regional,
+		Status: created.Status, LatestVersion: 0,
 	})
 }
 
@@ -207,6 +398,10 @@ func (s *Server) buildAdminTemplateDetail(ctx context.Context, tpl store.Templat
 	if err != nil {
 		return adminTemplateDetailResp{}, fmt.Errorf("list template versions: %w", err)
 	}
+	prices, err := s.q.ListTemplatePrices(ctx, []uuid.UUID{tpl.ID})
+	if err != nil {
+		return adminTemplateDetailResp{}, fmt.Errorf("list template prices: %w", err)
+	}
 	var latest int32
 	items := make([]adminTemplateVersionResp, len(versions))
 	for i, v := range versions {
@@ -225,7 +420,8 @@ func (s *Server) buildAdminTemplateDetail(ctx context.Context, tpl store.Templat
 	return adminTemplateDetailResp{
 		adminTemplateResp: adminTemplateResp{
 			ID: tpl.ID, Slug: tpl.Slug, Name: tpl.Name, Tags: tagsOrEmptyObject(tpl.Tags),
-			IsPremium: tpl.IsPremium, Status: tpl.Status, LatestVersion: latest,
+			IsPremium: tpl.IsPremium, PricePaise: tpl.PricePaise, RegionalPrices: newRegionalPricesResp(prices),
+			Status: tpl.Status, LatestVersion: latest,
 		},
 		Versions: items,
 	}, nil
@@ -241,10 +437,24 @@ func (s *Server) handleUpdateAdminTemplate(w http.ResponseWriter, r *http.Reques
 		Name      *string         `json:"name"`
 		Tags      json.RawMessage `json:"tags"`
 		IsPremium *bool           `json:"is_premium"`
-		Status    *string         `json:"status"`
+		// An absent or null PricePaise leaves the price unchanged.
+		PricePaise     priceField         `json:"price_paise"`
+		RegionalPrices *regionalPricesReq `json:"regional_prices"`
+		Status         *string            `json:"status"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
+	}
+	// Without is_premium in the request, whether the template is premium after
+	// the change is only known in the transaction, which checks it there.
+	premiumKnown := body.IsPremium != nil
+	premiumAfter := body.IsPremium != nil && *body.IsPremium
+	if !validatePrices(w, body.PricePaise, body.RegionalPrices, premiumKnown, premiumAfter) {
+		return
+	}
+	var pricePaise *int32
+	if v, ok := body.PricePaise.value(); ok {
+		pricePaise = &v
 	}
 	if body.Name != nil {
 		if n := utf8.RuneCountInString(*body.Name); n == 0 || n > 120 {
@@ -284,7 +494,7 @@ func (s *Server) handleUpdateAdminTemplate(w http.ResponseWriter, r *http.Reques
 	err = s.inTx(ctx, func(_ pgx.Tx, q *store.Queries) error {
 		var err error
 		updated, err = q.UpdateTemplate(ctx, store.UpdateTemplateParams{
-			Name: body.Name, Tags: tags, IsPremium: body.IsPremium, Status: body.Status, TemplateID: templateID,
+			Name: body.Name, Tags: tags, IsPremium: body.IsPremium, PricePaise: pricePaise, Status: body.Status, TemplateID: templateID,
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errTemplateNotFound
@@ -292,12 +502,39 @@ func (s *Server) handleUpdateAdminTemplate(w http.ResponseWriter, r *http.Reques
 		if err != nil {
 			return fmt.Errorf("update template: %w", err)
 		}
+		if !updated.IsPremium {
+			for _, rr := range body.RegionalPrices.regions() {
+				if _, ok := rr.f.value(); ok {
+					return &errRegionalNeedsPremium{region: rr.region}
+				}
+			}
+		}
+		beforeRows, err := q.ListTemplatePrices(ctx, []uuid.UUID{templateID})
+		if err != nil {
+			return fmt.Errorf("list template prices: %w", err)
+		}
+		afterRows, err := applyRegionalPrices(ctx, q, templateID, body.RegionalPrices)
+		if err != nil {
+			return err
+		}
 		return s.writeAudit(ctx, q, r, auditEntry{
 			ActorID: &callerID, Action: "template.update", TargetType: "template", TargetID: templateID.String(),
-			Before: map[string]any{"name": updated.OldName, "is_premium": updated.OldIsPremium, "status": updated.OldStatus},
-			After:  map[string]any{"name": updated.Name, "is_premium": updated.IsPremium, "status": updated.Status},
+			Before: map[string]any{
+				"name": updated.OldName, "is_premium": updated.OldIsPremium, "price_paise": updated.OldPricePaise, "status": updated.OldStatus,
+				"regional_prices": newRegionalPricesResp(beforeRows).auditMap(),
+			},
+			After: map[string]any{
+				"name": updated.Name, "is_premium": updated.IsPremium, "price_paise": updated.PricePaise, "status": updated.Status,
+				"regional_prices": newRegionalPricesResp(afterRows).auditMap(),
+			},
 		})
 	})
+	var needsPremium *errRegionalNeedsPremium
+	if errors.As(err, &needsPremium) {
+		writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the prices.",
+			[]content.Issue{{Path: "regional_prices." + needsPremium.region, Code: "requires_premium", Message: "Regional prices need a premium template."}})
+		return
+	}
 	if err != nil {
 		if errors.Is(err, errTemplateNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "No such template.")
@@ -308,7 +545,7 @@ func (s *Server) handleUpdateAdminTemplate(w http.ResponseWriter, r *http.Reques
 	}
 	detail, err := s.buildAdminTemplateDetail(ctx, store.Template{
 		ID: updated.ID, Slug: updated.Slug, Name: updated.Name, Tags: updated.Tags,
-		Status: updated.Status, IsPremium: updated.IsPremium, CreatedAt: updated.CreatedAt, UpdatedAt: updated.UpdatedAt,
+		Status: updated.Status, IsPremium: updated.IsPremium, PricePaise: updated.PricePaise, CreatedAt: updated.CreatedAt, UpdatedAt: updated.UpdatedAt,
 	})
 	if err != nil {
 		serverError(w, r, err)

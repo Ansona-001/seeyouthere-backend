@@ -619,18 +619,18 @@ func TestHandleUpdateAdminTemplate_PublishRequiresPublishedVersion(t *testing.T)
 		// are a millisecond timestamp, so a short prefix collides easily
 		// between test runs seconds apart (which is exactly what happened
 		// before this fix, as templates_slug_key duplicates).
-		ID: templateID, Slug: "test-tpl-" + templateID.String(), Name: "Test", Tags: []byte("{}"), IsPremium: false,
+		ID: templateID, Slug: "test-tpl-" + templateID.String(), Name: "Test", Tags: []byte("{}"), IsPremium: false, PricePaise: 59900,
 	}); err != nil {
 		t.Fatalf("create template: %v", err)
 	}
 	t.Cleanup(func() {
 		// This test publishes a version, and template_versions_immutable
 		// forbids ever deleting a published version (by design, §2.1), so
-		// the row can't be hard-deleted. Marking it premium instead removes
+		// the row can't be hard-deleted. Marking it draft instead removes
 		// it from every public/host-facing catalog query (ListPublishedTemplates
-		// filters NOT is_premium), which is the only pollution that would
+		// filters status = published), which is the only pollution that would
 		// otherwise leak into other tests/dev-DB use.
-		_, _ = pool.Exec(context.Background(), "UPDATE templates SET is_premium = true WHERE id = $1", templateID)
+		_, _ = pool.Exec(context.Background(), "UPDATE templates SET status = 'draft' WHERE id = $1", templateID)
 	})
 
 	// No version at all yet: publishing must 409.
@@ -691,12 +691,12 @@ func TestHandleUploadAdminTemplateBackground_ChecksVersionFirst(t *testing.T) {
 
 	templateID := uuid.Must(uuid.NewV7())
 	if _, err := q.CreateTemplate(ctx, store.CreateTemplateParams{
-		ID: templateID, Slug: "test-tpl-bg-" + templateID.String(), Name: "Test", Tags: []byte("{}"), IsPremium: false,
+		ID: templateID, Slug: "test-tpl-bg-" + templateID.String(), Name: "Test", Tags: []byte("{}"), IsPremium: false, PricePaise: 59900,
 	}); err != nil {
 		t.Fatalf("create template: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), "UPDATE templates SET is_premium = true WHERE id = $1", templateID)
+		_, _ = pool.Exec(context.Background(), "UPDATE templates SET status = 'draft' WHERE id = $1", templateID)
 	})
 
 	// Nonexistent version: 404, no upload processing attempted.

@@ -232,7 +232,6 @@ WHERE t.id = $9::uuid
   AND tv.version = $10::int
   AND tv.published_at IS NOT NULL
   AND t.status = 'published'
-  AND NOT t.is_premium
 RETURNING id, owner_id, occasion_slug, slug, title, content, template_id, template_version, overrides, visibility, password_hash, rsvp_mode, status, remove_branding, starts_at, published_at, created_at, updated_at, deleted_at, version, notify_rsvps, rsvp_notified_at, ends_at, retention_from, retention_reminded_at, retention_reminder_sent_at, share_image, share_media_id, music_source
 `
 
@@ -252,7 +251,9 @@ type CreateEventParams struct {
 // Event-scoped authorisation lives in the WHERE clause of each query (event_role, owner_id, or the
 // anonymous-draft cookie hash). No row means "not found or no access"; callers map it to 404.
 // Keyset cursors: first page of a DESC list passes (far future, max uuid); of an ASC list (zero time, nil uuid).
-// Template pins set by hosts must name a published version of a published, non-premium template.
+// Template pins set by hosts must name a published version of a published template. Premium templates
+// are selectable (events start as drafts); publishing one needs an event_payments grant (PublishEvent),
+// and switching a published event to an unpaid premium template is refused (UpdateEventContent).
 // Admin changes go through SetEventFlags instead.
 // No row when the template pin is not selectable; the caller maps pgx.ErrNoRows to a validation error.
 // retention_from is the retention clock: greatest(ends_at, now()), so a past end starts a full
@@ -436,6 +437,10 @@ func (q *Queries) FilterLockedPurgeable(ctx context.Context, eventIds []uuid.UUI
 const getAnonDraftEvent = `-- name: GetAnonDraftEvent :one
 SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source, 'anon'::text AS role,
        t.slug AS template_slug, t.name AS template_name,
+       t.is_premium AS template_is_premium, t.price_paise AS template_price_paise,
+       EXISTS (SELECT 1 FROM event_payments p
+               WHERE p.event_id = e.id AND p.template_id = e.template_id
+                 AND p.revoked_at IS NULL) AS template_paid,
        tv.manifest, tv.assets_path,
        coalesce((SELECT max(v.version) FROM template_versions v
                  WHERE v.template_id = e.template_id AND v.published_at IS NOT NULL),
@@ -456,13 +461,16 @@ type GetAnonDraftEventParams struct {
 }
 
 type GetAnonDraftEventRow struct {
-	Event         Event  `json:"event"`
-	Role          string `json:"role"`
-	TemplateSlug  string `json:"template_slug"`
-	TemplateName  string `json:"template_name"`
-	Manifest      []byte `json:"manifest"`
-	AssetsPath    string `json:"assets_path"`
-	LatestVersion int32  `json:"latest_version"`
+	Event              Event  `json:"event"`
+	Role               string `json:"role"`
+	TemplateSlug       string `json:"template_slug"`
+	TemplateName       string `json:"template_name"`
+	TemplateIsPremium  bool   `json:"template_is_premium"`
+	TemplatePricePaise int32  `json:"template_price_paise"`
+	TemplatePaid       bool   `json:"template_paid"`
+	Manifest           []byte `json:"manifest"`
+	AssetsPath         string `json:"assets_path"`
+	LatestVersion      int32  `json:"latest_version"`
 }
 
 // Same shape as GetEventForUser for an unclaimed draft owned by the draft cookie.
@@ -502,6 +510,9 @@ func (q *Queries) GetAnonDraftEvent(ctx context.Context, arg GetAnonDraftEventPa
 		&i.Role,
 		&i.TemplateSlug,
 		&i.TemplateName,
+		&i.TemplateIsPremium,
+		&i.TemplatePricePaise,
+		&i.TemplatePaid,
 		&i.Manifest,
 		&i.AssetsPath,
 		&i.LatestVersion,
@@ -695,6 +706,10 @@ func (q *Queries) GetEventForRetentionReminder(ctx context.Context, arg GetEvent
 const getEventForUser = `-- name: GetEventForUser :one
 SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source, r.role::text AS role,
        t.slug AS template_slug, t.name AS template_name,
+       t.is_premium AS template_is_premium, t.price_paise AS template_price_paise,
+       EXISTS (SELECT 1 FROM event_payments p
+               WHERE p.event_id = e.id AND p.template_id = e.template_id
+                 AND p.revoked_at IS NULL) AS template_paid,
        tv.manifest, tv.assets_path,
        coalesce((SELECT max(v.version) FROM template_versions v
                  WHERE v.template_id = e.template_id AND v.published_at IS NOT NULL),
@@ -712,13 +727,16 @@ type GetEventForUserParams struct {
 }
 
 type GetEventForUserRow struct {
-	Event         Event  `json:"event"`
-	Role          string `json:"role"`
-	TemplateSlug  string `json:"template_slug"`
-	TemplateName  string `json:"template_name"`
-	Manifest      []byte `json:"manifest"`
-	AssetsPath    string `json:"assets_path"`
-	LatestVersion int32  `json:"latest_version"`
+	Event              Event  `json:"event"`
+	Role               string `json:"role"`
+	TemplateSlug       string `json:"template_slug"`
+	TemplateName       string `json:"template_name"`
+	TemplateIsPremium  bool   `json:"template_is_premium"`
+	TemplatePricePaise int32  `json:"template_price_paise"`
+	TemplatePaid       bool   `json:"template_paid"`
+	Manifest           []byte `json:"manifest"`
+	AssetsPath         string `json:"assets_path"`
+	LatestVersion      int32  `json:"latest_version"`
 }
 
 // Host view for any member. role is 'owner', 'editor' or 'viewer'. Includes the pinned manifest
@@ -759,6 +777,9 @@ func (q *Queries) GetEventForUser(ctx context.Context, arg GetEventForUserParams
 		&i.Role,
 		&i.TemplateSlug,
 		&i.TemplateName,
+		&i.TemplateIsPremium,
+		&i.TemplatePricePaise,
+		&i.TemplatePaid,
 		&i.Manifest,
 		&i.AssetsPath,
 		&i.LatestVersion,
@@ -1278,6 +1299,10 @@ WHERE e.id = $1
   AND e.version = $3
   AND e.status IN ('draft', 'hidden')
   AND e.slug IS NOT NULL
+  AND (NOT EXISTS (SELECT 1 FROM templates t WHERE t.id = e.template_id AND t.is_premium)
+       OR EXISTS (SELECT 1 FROM event_payments p
+                  WHERE p.event_id = e.id AND p.template_id = e.template_id
+                    AND p.revoked_at IS NULL))
 RETURNING e.version, e.updated_at, e.published_at
 `
 
@@ -1293,7 +1318,9 @@ type PublishEventRow struct {
 	PublishedAt *time.Time `json:"published_at"`
 }
 
-// published_at keeps the first publish time (it also locks the slug).
+// published_at keeps the first publish time (it also locks the slug). An event on a premium template
+// publishes only when an event_payments grant exists for (event, template); no row is then also the
+// 'payment required' outcome, which the caller tells apart from a version conflict via GetEventForUser.
 func (q *Queries) PublishEvent(ctx context.Context, arg PublishEventParams) (PublishEventRow, error) {
 	row := q.db.QueryRow(ctx, publishEvent, arg.EventID, arg.UserID, arg.Version)
 	var i PublishEventRow
@@ -1380,7 +1407,14 @@ WITH prev AS (
     FOR NO KEY UPDATE
 )
 UPDATE events e
-SET status = CASE WHEN e.published_at IS NOT NULL THEN 'published' ELSE 'draft' END,
+SET status = CASE
+        WHEN e.published_at IS NULL THEN 'draft'
+        WHEN NOT EXISTS (SELECT 1 FROM templates t WHERE t.id = e.template_id AND t.is_premium)
+          OR EXISTS (SELECT 1 FROM event_payments p
+                     WHERE p.event_id = e.id AND p.template_id = e.template_id
+                       AND p.revoked_at IS NULL) THEN 'published'
+        ELSE 'hidden'
+    END,
     updated_at = now()
 FROM prev
 WHERE e.id = prev.id
@@ -1394,7 +1428,9 @@ type RestoreEventRow struct {
 	NewStatus string     `json:"new_status"`
 }
 
-// Back to 'published' if it had ever been published, else 'draft'.
+// 'draft' if it was never published. Otherwise 'published', unless it sits on a premium template with
+// no live (non-revoked) payment (e.g. the template was switched or the payment revoked while it was
+// taken down): then 'hidden', so a restore can't bypass the publish gate; the host publishes after paying.
 func (q *Queries) RestoreEvent(ctx context.Context, eventID uuid.UUID) (RestoreEventRow, error) {
 	row := q.db.QueryRow(ctx, restoreEvent, eventID)
 	var i RestoreEventRow
@@ -1626,7 +1662,7 @@ WHERE e.id = prev.id
 RETURNING e.id,
           prev.remove_branding AS old_remove_branding, prev.template_id AS old_template_id,
           prev.template_version AS old_template_version, prev.overrides AS old_overrides,
-          e.remove_branding, e.template_id, e.template_version, e.overrides, e.version
+          e.remove_branding, e.template_id, e.template_version, e.overrides, e.version, e.status
 `
 
 type SetEventFlagsParams struct {
@@ -1648,6 +1684,7 @@ type SetEventFlagsRow struct {
 	TemplateVersion    int32     `json:"template_version"`
 	Overrides          []byte    `json:"overrides"`
 	Version            int32     `json:"version"`
+	Status             string    `json:"status"`
 }
 
 // Super-admin flags. NULL leaves a field unchanged. A template change bumps version so an open
@@ -1672,6 +1709,7 @@ func (q *Queries) SetEventFlags(ctx context.Context, arg SetEventFlagsParams) (S
 		&i.TemplateVersion,
 		&i.Overrides,
 		&i.Version,
+		&i.Status,
 	)
 	return i, err
 }
@@ -1905,8 +1943,7 @@ WHERE e.id = $11
                   WHERE t.id = coalesce($6::uuid, e.template_id)
                     AND tv.version = coalesce($7::int, e.template_version)
                     AND tv.published_at IS NOT NULL
-                    AND t.status = 'published'
-                    AND NOT t.is_premium))
+                    AND t.status = 'published'))
 RETURNING e.version, e.updated_at
 `
 
@@ -1931,7 +1968,8 @@ type UpdateAnonDraftContentRow struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Same derived-field, template-pin, share-image and music_source rules as UpdateEventContent.
+// Same derived-field, template-pin, share-image and music_source rules as UpdateEventContent. Anonymous
+// drafts are never published, so premium templates are always selectable here.
 func (q *Queries) UpdateAnonDraftContent(ctx context.Context, arg UpdateAnonDraftContentParams) (UpdateAnonDraftContentRow, error) {
 	row := q.db.QueryRow(ctx, updateAnonDraftContent,
 		arg.Content,
@@ -1992,7 +2030,11 @@ WHERE e.id = $11
                     AND tv.version = coalesce($7::int, e.template_version)
                     AND tv.published_at IS NOT NULL
                     AND t.status = 'published'
-                    AND NOT t.is_premium))
+                    AND (NOT t.is_premium
+                         OR e.status <> 'published'
+                         OR EXISTS (SELECT 1 FROM event_payments p
+                                    WHERE p.event_id = e.id AND p.template_id = t.id
+                                      AND p.revoked_at IS NULL))))
 RETURNING e.version, e.updated_at
 `
 
@@ -2022,7 +2064,9 @@ type UpdateEventContentRow struct {
 // restarts retention from greatest(new end, now()) (so back-dating never shortens an event's life)
 // and clears the reminder so the new end gets its own. A template change must
 // resolve (with the unchanged half) to a selectable pin; leaving both NULL keeps an existing pin even
-// if that template has since become premium or retired. An unselectable pin updates no row.
+// if that template has since been retired. A premium template is selectable while the event is not
+// published, or once an event_payments grant exists for (event, template). An unselectable pin updates
+// no row.
 // NULL share_image leaves the share image unchanged; otherwise share_image and share_media_id are set
 // together (the caller checked the media id; events_share_media_fkey is the source of truth).
 // NULL music_source leaves it unchanged; the caller checks that 'custom' has an event_audio row.

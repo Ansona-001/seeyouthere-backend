@@ -2,7 +2,9 @@
 -- anonymous-draft cookie hash). No row means "not found or no access"; callers map it to 404.
 -- Keyset cursors: first page of a DESC list passes (far future, max uuid); of an ASC list (zero time, nil uuid).
 
--- Template pins set by hosts must name a published version of a published, non-premium template.
+-- Template pins set by hosts must name a published version of a published template. Premium templates
+-- are selectable (events start as drafts); publishing one needs an event_payments grant (PublishEvent),
+-- and switching a published event to an unpaid premium template is refused (UpdateEventContent).
 -- Admin changes go through SetEventFlags instead.
 
 -- name: CreateEvent :one
@@ -20,7 +22,6 @@ WHERE t.id = @template_id::uuid
   AND tv.version = @template_version::int
   AND tv.published_at IS NOT NULL
   AND t.status = 'published'
-  AND NOT t.is_premium
 RETURNING *;
 
 -- name: CreateAnonDraft :exec
@@ -40,6 +41,10 @@ WHERE owner_id = @owner_id::uuid AND deleted_at IS NULL;
 -- and the template's latest published version (for the "upgrade available" hint).
 SELECT sqlc.embed(e), r.role::text AS role,
        t.slug AS template_slug, t.name AS template_name,
+       t.is_premium AS template_is_premium, t.price_paise AS template_price_paise,
+       EXISTS (SELECT 1 FROM event_payments p
+               WHERE p.event_id = e.id AND p.template_id = e.template_id
+                 AND p.revoked_at IS NULL) AS template_paid,
        tv.manifest, tv.assets_path,
        coalesce((SELECT max(v.version) FROM template_versions v
                  WHERE v.template_id = e.template_id AND v.published_at IS NOT NULL),
@@ -54,6 +59,10 @@ WHERE e.id = @event_id AND e.deleted_at IS NULL AND r.role IS NOT NULL;
 -- Same shape as GetEventForUser for an unclaimed draft owned by the draft cookie.
 SELECT sqlc.embed(e), 'anon'::text AS role,
        t.slug AS template_slug, t.name AS template_name,
+       t.is_premium AS template_is_premium, t.price_paise AS template_price_paise,
+       EXISTS (SELECT 1 FROM event_payments p
+               WHERE p.event_id = e.id AND p.template_id = e.template_id
+                 AND p.revoked_at IS NULL) AS template_paid,
        tv.manifest, tv.assets_path,
        coalesce((SELECT max(v.version) FROM template_versions v
                  WHERE v.template_id = e.template_id AND v.published_at IS NOT NULL),
@@ -113,7 +122,9 @@ GROUP BY r.event_id;
 -- restarts retention from greatest(new end, now()) (so back-dating never shortens an event's life)
 -- and clears the reminder so the new end gets its own. A template change must
 -- resolve (with the unchanged half) to a selectable pin; leaving both NULL keeps an existing pin even
--- if that template has since become premium or retired. An unselectable pin updates no row.
+-- if that template has since been retired. A premium template is selectable while the event is not
+-- published, or once an event_payments grant exists for (event, template). An unselectable pin updates
+-- no row.
 -- NULL share_image leaves the share image unchanged; otherwise share_image and share_media_id are set
 -- together (the caller checked the media id; events_share_media_fkey is the source of truth).
 -- NULL music_source leaves it unchanged; the caller checks that 'custom' has an event_audio row.
@@ -155,11 +166,16 @@ WHERE e.id = @event_id
                     AND tv.version = coalesce(sqlc.narg(template_version)::int, e.template_version)
                     AND tv.published_at IS NOT NULL
                     AND t.status = 'published'
-                    AND NOT t.is_premium))
+                    AND (NOT t.is_premium
+                         OR e.status <> 'published'
+                         OR EXISTS (SELECT 1 FROM event_payments p
+                                    WHERE p.event_id = e.id AND p.template_id = t.id
+                                      AND p.revoked_at IS NULL))))
 RETURNING e.version, e.updated_at;
 
 -- name: UpdateAnonDraftContent :one
--- Same derived-field, template-pin, share-image and music_source rules as UpdateEventContent.
+-- Same derived-field, template-pin, share-image and music_source rules as UpdateEventContent. Anonymous
+-- drafts are never published, so premium templates are always selectable here.
 UPDATE events e
 SET content = coalesce(sqlc.narg(content), e.content),
     title = CASE WHEN sqlc.narg(content)::jsonb IS NULL THEN e.title ELSE @title::text END,
@@ -198,8 +214,7 @@ WHERE e.id = @event_id
                   WHERE t.id = coalesce(sqlc.narg(template_id)::uuid, e.template_id)
                     AND tv.version = coalesce(sqlc.narg(template_version)::int, e.template_version)
                     AND tv.published_at IS NOT NULL
-                    AND t.status = 'published'
-                    AND NOT t.is_premium))
+                    AND t.status = 'published'))
 RETURNING e.version, e.updated_at;
 
 -- name: GetEventWriteState :one
@@ -241,7 +256,9 @@ WHERE e.id = @event_id
 RETURNING e.version, e.updated_at;
 
 -- name: PublishEvent :one
--- published_at keeps the first publish time (it also locks the slug).
+-- published_at keeps the first publish time (it also locks the slug). An event on a premium template
+-- publishes only when an event_payments grant exists for (event, template); no row is then also the
+-- 'payment required' outcome, which the caller tells apart from a version conflict via GetEventForUser.
 UPDATE events e
 SET status = 'published',
     published_at = coalesce(e.published_at, now()),
@@ -253,6 +270,10 @@ WHERE e.id = @event_id
   AND e.version = @version
   AND e.status IN ('draft', 'hidden')
   AND e.slug IS NOT NULL
+  AND (NOT EXISTS (SELECT 1 FROM templates t WHERE t.id = e.template_id AND t.is_premium)
+       OR EXISTS (SELECT 1 FROM event_payments p
+                  WHERE p.event_id = e.id AND p.template_id = e.template_id
+                    AND p.revoked_at IS NULL))
 RETURNING e.version, e.updated_at, e.published_at;
 
 -- name: UnpublishEvent :one
@@ -619,14 +640,23 @@ WHERE e.id = prev.id
 RETURNING e.id, e.owner_id, prev.status AS old_status, e.status AS new_status;
 
 -- name: RestoreEvent :one
--- Back to 'published' if it had ever been published, else 'draft'.
+-- 'draft' if it was never published. Otherwise 'published', unless it sits on a premium template with
+-- no live (non-revoked) payment (e.g. the template was switched or the payment revoked while it was
+-- taken down): then 'hidden', so a restore can't bypass the publish gate; the host publishes after paying.
 WITH prev AS (
     SELECT x.id, x.status FROM events x
     WHERE x.id = @event_id AND x.deleted_at IS NULL AND x.status = 'taken_down'
     FOR NO KEY UPDATE
 )
 UPDATE events e
-SET status = CASE WHEN e.published_at IS NOT NULL THEN 'published' ELSE 'draft' END,
+SET status = CASE
+        WHEN e.published_at IS NULL THEN 'draft'
+        WHEN NOT EXISTS (SELECT 1 FROM templates t WHERE t.id = e.template_id AND t.is_premium)
+          OR EXISTS (SELECT 1 FROM event_payments p
+                     WHERE p.event_id = e.id AND p.template_id = e.template_id
+                       AND p.revoked_at IS NULL) THEN 'published'
+        ELSE 'hidden'
+    END,
     updated_at = now()
 FROM prev
 WHERE e.id = prev.id
@@ -652,7 +682,7 @@ WHERE e.id = prev.id
 RETURNING e.id,
           prev.remove_branding AS old_remove_branding, prev.template_id AS old_template_id,
           prev.template_version AS old_template_version, prev.overrides AS old_overrides,
-          e.remove_branding, e.template_id, e.template_version, e.overrides, e.version;
+          e.remove_branding, e.template_id, e.template_version, e.overrides, e.version, e.status;
 
 -- name: LockEventForAdminDelete :one
 -- Admin hard delete (inline and from the purge job): any state, live or soft-deleted. The row lock

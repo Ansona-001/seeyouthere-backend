@@ -18,9 +18,10 @@ SELECT * FROM occasions
 WHERE slug = @slug;
 
 -- name: ListPublishedTemplates :many
--- Host picker: published, non-premium templates with their latest published version.
+-- Host picker: published templates (premium included, flagged with price) with their latest published
+-- version. Premium templates can be picked and edited; publishing the event needs a payment grant.
 -- occasion NULL lists every template. Picker order is templates.sort_order, then name.
-SELECT t.id, t.slug, t.name, t.tags, v.version, v.manifest, v.assets_path
+SELECT t.id, t.slug, t.name, t.tags, t.is_premium, t.price_paise, v.version, v.manifest, v.assets_path
 FROM templates t
 JOIN LATERAL (
     SELECT tv.version, tv.manifest, tv.assets_path
@@ -30,15 +31,15 @@ JOIN LATERAL (
     LIMIT 1
 ) v ON true
 WHERE t.status = 'published'
-  AND NOT t.is_premium
   AND (sqlc.narg(occasion)::text IS NULL
        OR t.tags @> jsonb_build_object('occasions', jsonb_build_array(sqlc.narg(occasion)::text)))
 ORDER BY t.sort_order, t.name, t.id
 LIMIT 100;
 
 -- name: GetPublishedTemplateBySlug :one
--- allow_premium is true only on the admin flags endpoint.
-SELECT t.id, t.slug, t.name, t.is_premium, v.version, v.manifest, v.assets_path
+-- allow_premium is true wherever a premium template is acceptable (host editing, admin flags); false
+-- keeps premium out of public/unauthenticated lookups.
+SELECT t.id, t.slug, t.name, t.is_premium, t.price_paise, v.version, v.manifest, v.assets_path
 FROM templates t
 JOIN LATERAL (
     SELECT tv.version, tv.manifest, tv.assets_path

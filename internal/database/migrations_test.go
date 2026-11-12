@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -70,6 +71,34 @@ func scratchMigrator(t *testing.T) (context.Context, *pgxpool.Pool, *goose.Provi
 		t.Fatalf("goose provider: %v", err)
 	}
 	return ctx, pool, provider
+}
+
+// pickerSlugs returns the slugs the host picker listed before premium templates became selectable
+// (published, non-premium, with a published version; templates.sort_order, name, id). It runs plain SQL
+// instead of store.ListPublishedTemplates because the tests below run at schemas older than the
+// price_paise column that query now selects.
+func pickerSlugs(ctx context.Context, t *testing.T, pool *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT t.slug FROM templates t
+		WHERE t.status = 'published' AND NOT t.is_premium
+		  AND EXISTS (SELECT 1 FROM template_versions tv WHERE tv.template_id = t.id AND tv.published_at IS NOT NULL)
+		ORDER BY t.sort_order, t.name, t.id`)
+	if err != nil {
+		t.Fatalf("list picker templates: %v", err)
+	}
+	defer rows.Close()
+	slugs := []string{}
+	for rows.Next() {
+		var slug string
+		if err := rows.Scan(&slug); err != nil {
+			t.Fatalf("scan picker template: %v", err)
+		}
+		slugs = append(slugs, slug)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("list picker templates: %v", err)
+	}
+	return slugs
 }
 
 // TestMigration00005_Backfill applies migrations 1-4 to a throwaway database,
@@ -202,16 +231,9 @@ func TestMigration00006_ThemeEngineV2(t *testing.T) {
 		}
 
 		q := store.New(pool)
-		listed, err := q.ListPublishedTemplates(ctx, nil)
-		if err != nil {
-			t.Fatalf("list published templates: %v", err)
-		}
-		slugs := make([]string, len(listed))
-		for i, r := range listed {
-			slugs[i] = r.Slug
-		}
+		slugs := pickerSlugs(ctx, t, pool)
 		if fmt.Sprint(slugs) != fmt.Sprint(wantOrder) {
-			t.Errorf("ListPublishedTemplates order = %v, want %v", slugs, wantOrder)
+			t.Errorf("picker order = %v, want %v", slugs, wantOrder)
 		}
 
 		// Every stored version (drafts and old published ones too) must parse
@@ -393,16 +415,13 @@ func TestMigration00007_SeedV2Themes(t *testing.T) {
 		}
 
 		// Drafts stay out of the public catalog: the picker still lists only the original six.
-		listed, err := store.New(pool).ListPublishedTemplates(ctx, nil)
-		if err != nil {
-			t.Fatalf("list published templates: %v", err)
-		}
+		listed := pickerSlugs(ctx, t, pool)
 		if len(listed) != 6 {
 			t.Errorf("published templates = %d, want 6 (the draft themes must not be listed)", len(listed))
 		}
-		for _, r := range listed {
+		for _, slug := range listed {
 			for _, w := range wantSeeds {
-				if r.Slug == w.slug {
+				if slug == w.slug {
 					t.Errorf("draft template %s is listed in the public picker", w.slug)
 				}
 			}
@@ -525,12 +544,8 @@ func TestMigration00025_Mimosa(t *testing.T) {
 			t.Errorf("templates = %d (err %v), want %d", templates, err, before+1)
 		}
 		// A draft stays out of the public catalog.
-		listed, err := store.New(pool).ListPublishedTemplates(ctx, nil)
-		if err != nil {
-			t.Fatalf("list published templates: %v", err)
-		}
-		for _, r := range listed {
-			if r.Slug == "mimosa" {
+		for _, slug := range pickerSlugs(ctx, t, pool) {
+			if slug == "mimosa" {
 				t.Errorf("draft template mimosa is listed in the public picker")
 			}
 		}
@@ -1203,4 +1218,609 @@ func TestMigration00033_HarvestMusic(t *testing.T) {
 		t.Fatalf("up again: %v", err)
 	}
 	check()
+}
+
+// TestMigration00036_PremiumUnlock checks the price column and its range CHECK, the event_payments
+// constraints (one grant per event+template, amount/note/method/currency CHECKs, FKs), that deleting
+// an event keeps the payment row with event_id NULL (financial record outlives the event), that a
+// template with payments cannot be deleted, and that Down removes everything and Up can run again.
+func TestMigration00036_PremiumUnlock(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 36); err != nil {
+		t.Fatalf("migrate to 36: %v", err)
+	}
+	wantCode := func(name string, err error, code string) {
+		t.Helper()
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != code {
+			t.Errorf("%s: err = %v, want SQLSTATE %s", name, err, code)
+		}
+	}
+
+	// Existing templates get the default price.
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates WHERE price_paise <> 59900").Scan(&n); err != nil || n != 0 {
+		t.Errorf("templates without the default price = %d (err %v), want 0", n, err)
+	}
+	var tmpl uuid.UUID
+	if err := pool.QueryRow(ctx, "SELECT id FROM templates ORDER BY id LIMIT 1").Scan(&tmpl); err != nil {
+		t.Fatalf("pick template: %v", err)
+	}
+	for _, p := range []int{99, 1000001, 0, -1} {
+		_, err := pool.Exec(ctx, "UPDATE templates SET price_paise = $1 WHERE id = $2", p, tmpl)
+		wantCode(fmt.Sprintf("price %d", p), err, "23514")
+	}
+	for _, p := range []int{100, 1000000, 59900} {
+		if _, err := pool.Exec(ctx, "UPDATE templates SET price_paise = $1 WHERE id = $2", p, tmpl); err != nil {
+			t.Errorf("price %d rejected: %v", p, err)
+		}
+	}
+
+	owner := uuid.Must(uuid.NewV7())
+	if _, err := pool.Exec(ctx, "INSERT INTO users (id, email) VALUES ($1, $2)", owner, "mig36-"+owner.String()+"@example.invalid"); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	insertEvent := func() uuid.UUID {
+		t.Helper()
+		id := uuid.Must(uuid.NewV7())
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO events (id, owner_id, occasion_slug, title, content, template_id, template_version)
+			SELECT $1, $2, 'birthday', 'mig36', '[]', t.id, tv.version
+			FROM templates t JOIN template_versions tv ON tv.template_id = t.id WHERE t.id = $3 LIMIT 1`, id, owner, tmpl); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+		return id
+	}
+	insertPayment := func(eventID *uuid.UUID, by *uuid.UUID, amount int, method, currency, note string) error {
+		_, err := pool.Exec(ctx, `INSERT INTO event_payments (id, event_id, template_id, granted_by, amount_paise, method, currency, note)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, uuid.Must(uuid.NewV7()), eventID, tmpl, by, amount, method, currency, note)
+		return err
+	}
+
+	ev := insertEvent()
+	if err := insertPayment(&ev, &owner, 59900, "manual", "INR", "bank transfer"); err != nil {
+		t.Fatalf("insert payment: %v", err)
+	}
+	// One grant per (event, template).
+	wantCode("duplicate grant", insertPayment(&ev, &owner, 59900, "manual", "INR", ""), "23505")
+
+	probe := insertEvent()
+	for _, c := range []struct {
+		name     string
+		amount   int
+		method   string
+		currency string
+		note     string
+	}{
+		{"amount 99", 99, "manual", "INR", ""}, {"amount over max", 1000001, "manual", "INR", ""},
+		{"method stripe", 59900, "stripe", "INR", ""}, {"currency USD", 59900, "manual", "USD", ""},
+		{"note 201 chars", 59900, "manual", "INR", strings.Repeat("x", 201)},
+	} {
+		wantCode(c.name, insertPayment(&probe, &owner, c.amount, c.method, c.currency, c.note), "23514")
+	}
+	if err := insertPayment(&probe, nil, 100, "manual", "INR", strings.Repeat("x", 200)); err != nil {
+		t.Errorf("boundary payment (amount 100, note 200, no granter) rejected: %v", err)
+	}
+
+	// Defaults for method, currency and note.
+	defaulted := insertEvent()
+	var method, currency, note string
+	if _, err := pool.Exec(ctx, `INSERT INTO event_payments (id, event_id, template_id, amount_paise)
+		VALUES ($1, $2, $3, 100)`, uuid.Must(uuid.NewV7()), defaulted, tmpl); err != nil {
+		t.Fatalf("insert payment with defaults: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT method, currency, note FROM event_payments WHERE event_id = $1", defaulted).
+		Scan(&method, &currency, &note); err != nil || method != "manual" || currency != "INR" || note != "" {
+		t.Errorf("defaults = %q %q %q (err %v), want manual INR empty", method, currency, note, err)
+	}
+
+	// FKs: unknown event and unknown template are rejected.
+	missing := uuid.Must(uuid.NewV7())
+	wantCode("missing event", insertPayment(&missing, &owner, 59900, "manual", "INR", ""), "23503")
+	_, err := pool.Exec(ctx, `INSERT INTO event_payments (id, event_id, template_id, amount_paise) VALUES ($1, $2, $3, 100)`,
+		uuid.Must(uuid.NewV7()), ev, missing)
+	wantCode("missing template", err, "23503")
+
+	// Granter delete keeps the payment (SET NULL).
+	admin := uuid.Must(uuid.NewV7())
+	if _, err := pool.Exec(ctx, "INSERT INTO users (id, email) VALUES ($1, $2)", admin, "mig36-"+admin.String()+"@example.invalid"); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	granted := insertEvent()
+	if err := insertPayment(&granted, &admin, 59900, "manual", "INR", ""); err != nil {
+		t.Fatalf("insert payment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM users WHERE id = $1", admin); err != nil {
+		t.Fatalf("delete granter: %v", err)
+	}
+	var by *uuid.UUID
+	if err := pool.QueryRow(ctx, "SELECT granted_by FROM event_payments WHERE event_id = $1", granted).Scan(&by); err != nil || by != nil {
+		t.Errorf("granted_by after granter delete = %v (err %v), want NULL row kept", by, err)
+	}
+
+	// Event delete keeps the payment with event_id NULL; orphans do not collide on the unique key.
+	for _, e := range []uuid.UUID{ev, granted} {
+		if _, err := pool.Exec(ctx, "DELETE FROM events WHERE id = $1", e); err != nil {
+			t.Fatalf("delete event: %v", err)
+		}
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_payments WHERE event_id IS NULL AND template_id = $1", tmpl).Scan(&n); err != nil || n != 2 {
+		t.Errorf("orphaned payments after event delete = %d (err %v), want 2 (SET NULL)", n, err)
+	}
+
+	// A template with payments cannot be deleted (RESTRICT).
+	_, err = pool.Exec(ctx, "DELETE FROM templates WHERE id = $1", tmpl)
+	wantCode("delete template with payments", err, "23503")
+
+	// Indexes exist.
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE tablename = 'event_payments'
+		AND indexname IN ('event_payments_event_template_key', 'event_payments_template_id_idx', 'event_payments_granted_by_idx')`).Scan(&n); err != nil || n != 3 {
+		t.Errorf("event_payments indexes = %d (err %v), want 3", n, err)
+	}
+
+	// Down removes the table and the column; Up again restores them.
+	if _, err := provider.DownTo(ctx, 35); err != nil {
+		t.Fatalf("down to 35: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM information_schema.tables WHERE table_name = 'event_payments') +
+		(SELECT count(*) FROM information_schema.columns WHERE table_name = 'templates' AND column_name = 'price_paise')`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("event_payments table/price_paise column after Down = %d (err %v), want 0", n, err)
+	}
+	if _, err := provider.UpTo(ctx, 36); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates WHERE price_paise = 59900").Scan(&n); err != nil || n == 0 {
+		t.Errorf("templates at the default price after Up again = %d (err %v), want > 0", n, err)
+	}
+}
+
+// TestMigration00037_RegionalPrices checks the template_prices backfill and constraints, the
+// event_payments region/currency/revoke columns, the partial unique index (a revoked row does not
+// block a re-grant, two live rows collide), the grant/revoke/restore queries end to end, and that Down
+// refuses to drop non-IN or revoked payments, otherwise restores the 00036 shape, and Up can run again.
+func TestMigration00037_RegionalPrices(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 36); err != nil {
+		t.Fatalf("migrate to 36: %v", err)
+	}
+	wantCode := func(name string, err error, code string) {
+		t.Helper()
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != code {
+			t.Errorf("%s: err = %v, want SQLSTATE %s", name, err, code)
+		}
+	}
+
+	// Two templates with a version: one premium, one free. A pre-existing INR payment must survive Up.
+	rows, err := pool.Query(ctx, `SELECT t.id FROM templates t
+		WHERE EXISTS (SELECT 1 FROM template_versions v WHERE v.template_id = t.id) ORDER BY t.id LIMIT 2`)
+	if err != nil {
+		t.Fatalf("pick templates: %v", err)
+	}
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if len(ids) != 2 {
+		t.Fatalf("need 2 templates with a version, got %d", len(ids))
+	}
+	prem, free := ids[0], ids[1]
+	if _, err := pool.Exec(ctx, "UPDATE templates SET is_premium = true WHERE id = $1", prem); err != nil {
+		t.Fatalf("make premium: %v", err)
+	}
+
+	owner := uuid.Must(uuid.NewV7())
+	if _, err := pool.Exec(ctx, "INSERT INTO users (id, email) VALUES ($1, $2)", owner, "mig37-"+owner.String()+"@example.invalid"); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	insertEvent := func(tmpl uuid.UUID, status string) uuid.UUID {
+		t.Helper()
+		id := uuid.Must(uuid.NewV7())
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO events (id, owner_id, slug, occasion_slug, title, content, template_id, template_version, status, published_at)
+			SELECT $1, $2, $5, 'birthday', 'mig37', '[]', t.id, tv.version, $4::text,
+			       CASE WHEN $4::text = 'draft' THEN NULL ELSE now() END
+			FROM templates t JOIN template_versions tv ON tv.template_id = t.id WHERE t.id = $3 LIMIT 1`,
+			id, owner, tmpl, status, "mig37-"+id.String()); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+		return id
+	}
+	legacy := insertEvent(prem, "published")
+	if _, err := pool.Exec(ctx, `INSERT INTO event_payments (id, event_id, template_id, amount_paise)
+		VALUES ($1, $2, $3, 59900)`, uuid.Must(uuid.NewV7()), legacy, prem); err != nil {
+		t.Fatalf("insert legacy payment: %v", err)
+	}
+
+	if _, err := provider.UpTo(ctx, 37); err != nil {
+		t.Fatalf("migrate to 37: %v", err)
+	}
+
+	// Backfill: the premium template gets AE 2900 AED and INT 900 USD, the free one gets nothing.
+	var n int
+	for _, c := range []struct {
+		tmpl     uuid.UUID
+		region   string
+		currency string
+		amount   int
+		want     int
+	}{
+		{prem, "AE", "AED", 2900, 1}, {prem, "INT", "USD", 900, 1}, {free, "AE", "AED", 2900, 0}, {free, "INT", "USD", 900, 0},
+	} {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM template_prices
+			WHERE template_id = $1 AND region = $2 AND currency = $3 AND amount_minor = $4`,
+			c.tmpl, c.region, c.currency, c.amount).Scan(&n); err != nil || n != c.want {
+			t.Errorf("backfill %+v: rows = %d (err %v), want %d", c, n, err, c.want)
+		}
+	}
+	// The legacy payment is an India/INR sale with the amount carried over.
+	var region, currency string
+	var amount int
+	if err := pool.QueryRow(ctx, "SELECT region, currency, amount_minor FROM event_payments WHERE event_id = $1", legacy).
+		Scan(&region, &currency, &amount); err != nil || region != "IN" || currency != "INR" || amount != 59900 {
+		t.Errorf("legacy payment = %q %q %d (err %v), want IN INR 59900", region, currency, amount, err)
+	}
+
+	// template_prices constraints.
+	insertPrice := func(tmpl uuid.UUID, region, currency string, amount int) error {
+		_, err := pool.Exec(ctx, "INSERT INTO template_prices (template_id, region, currency, amount_minor) VALUES ($1, $2, $3, $4)",
+			tmpl, region, currency, amount)
+		return err
+	}
+	wantCode("duplicate price", insertPrice(prem, "AE", "AED", 3000), "23505")
+	wantCode("region IN not allowed", insertPrice(free, "IN", "INR", 5000), "23514")
+	wantCode("unknown region", insertPrice(free, "US", "USD", 5000), "23514")
+	wantCode("AE with USD", insertPrice(free, "AE", "USD", 5000), "23514")
+	wantCode("INT with AED", insertPrice(free, "INT", "AED", 5000), "23514")
+	wantCode("amount 99", insertPrice(free, "AE", "AED", 99), "23514")
+	wantCode("amount over max", insertPrice(free, "AE", "AED", 1000001), "23514")
+	wantCode("unknown template", insertPrice(uuid.Must(uuid.NewV7()), "AE", "AED", 5000), "23503")
+	for _, a := range []int{100, 1000000} {
+		if err := insertPrice(free, "AE", "AED", a); err != nil {
+			t.Errorf("amount %d rejected: %v", a, err)
+		}
+		if _, err := pool.Exec(ctx, "DELETE FROM template_prices WHERE template_id = $1", free); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// event_payments region/currency checks.
+	insertPayment := func(event uuid.UUID, region, currency string) error {
+		_, err := pool.Exec(ctx, `INSERT INTO event_payments (id, event_id, template_id, region, currency, amount_minor)
+			VALUES ($1, $2, $3, $4, $5, 2900)`, uuid.Must(uuid.NewV7()), event, prem, region, currency)
+		return err
+	}
+	probe := insertEvent(prem, "draft")
+	for _, c := range [][2]string{{"IN", "AED"}, {"IN", "USD"}, {"AE", "INR"}, {"AE", "USD"}, {"INT", "INR"}, {"INT", "AED"}, {"US", "USD"}, {"IN", "EUR"}} {
+		wantCode(fmt.Sprintf("payment %s/%s", c[0], c[1]), insertPayment(probe, c[0], c[1]), "23514")
+	}
+
+	// Partial unique index: a live row blocks a second live row; a revoked row does not.
+	if err := insertPayment(probe, "AE", "AED"); err != nil {
+		t.Fatalf("live payment AE: %v", err)
+	}
+	wantCode("two live rows (same region)", insertPayment(probe, "AE", "AED"), "23505")
+	wantCode("two live rows (other region)", insertPayment(probe, "INT", "USD"), "23505")
+	if _, err := pool.Exec(ctx, "UPDATE event_payments SET revoked_at = now() WHERE event_id = $1", probe); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if err := insertPayment(probe, "INT", "USD"); err != nil {
+		t.Errorf("re-grant after revoke rejected: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_payments WHERE event_id = $1", probe).Scan(&n); err != nil || n != 2 {
+		t.Errorf("rows for probe = %d (err %v), want 2 (revoked + live)", n, err)
+	}
+
+	// revoked_by needs revoked_at; deleting the revoker keeps the revoked row.
+	revoker := uuid.Must(uuid.NewV7())
+	if _, err := pool.Exec(ctx, "INSERT INTO users (id, email) VALUES ($1, $2)", revoker, "mig37-"+revoker.String()+"@example.invalid"); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	_, err = pool.Exec(ctx, "UPDATE event_payments SET revoked_by = $1 WHERE event_id = $2 AND revoked_at IS NULL", revoker, probe)
+	wantCode("revoked_by without revoked_at", err, "23514")
+	if _, err := pool.Exec(ctx, "UPDATE event_payments SET revoked_by = $1 WHERE event_id = $2 AND revoked_at IS NOT NULL", revoker, probe); err != nil {
+		t.Fatalf("set revoked_by: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM users WHERE id = $1", revoker); err != nil {
+		t.Fatalf("delete revoker: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_payments WHERE event_id = $1 AND revoked_at IS NOT NULL AND revoked_by IS NULL", probe).Scan(&n); err != nil || n != 1 {
+		t.Errorf("revoked rows after revoker delete = %d (err %v), want 1 kept with NULL revoked_by", n, err)
+	}
+
+	// Deleting a template cascades its price rows.
+	cascade := uuid.Must(uuid.NewV7())
+	if _, err := pool.Exec(ctx, `INSERT INTO templates (id, slug, name, tags, is_premium) VALUES ($1, 'mig37-cascade', 'c', '{}', true)`, cascade); err != nil {
+		t.Fatalf("insert template: %v", err)
+	}
+	if err := insertPrice(cascade, "AE", "AED", 2900); err != nil {
+		t.Fatalf("insert price: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM templates WHERE id = $1", cascade); err != nil {
+		t.Fatalf("delete template: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_prices WHERE template_id = $1", cascade).Scan(&n); err != nil || n != 0 {
+		t.Errorf("prices after template delete = %d (err %v), want 0 (CASCADE)", n, err)
+	}
+
+	// GrantEventPayment takes amount and currency from the DB.
+	q := store.New(pool)
+	// livePrice is the price the admin would confirm: 0 when the template has none for the region.
+	livePrice := func(tmpl uuid.UUID, region string) int32 {
+		t.Helper()
+		var amount *int32
+		err := pool.QueryRow(ctx, `SELECT CASE WHEN $2::text = 'IN' THEN t.price_paise ELSE p.amount_minor END
+			FROM templates t LEFT JOIN template_prices p ON p.template_id = t.id AND p.region = $2::text
+			WHERE t.id = $1`, tmpl, region).Scan(&amount)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("live price: %v", err)
+		}
+		if amount == nil {
+			return 0
+		}
+		return *amount
+	}
+	grantAt := func(event, tmpl uuid.UUID, region string, expected int32) (store.EventPayment, error) {
+		return q.GrantEventPayment(ctx, store.GrantEventPaymentParams{
+			ID: uuid.Must(uuid.NewV7()), EventID: event, TemplateID: tmpl, Region: region, Note: "q", ExpectedAmountMinor: expected})
+	}
+	grant := func(event, tmpl uuid.UUID, region string) (store.EventPayment, error) {
+		return grantAt(event, tmpl, region, livePrice(tmpl, region))
+	}
+	g := insertEvent(prem, "draft")
+	for _, c := range []struct {
+		region   string
+		currency string
+		amount   int32
+	}{{"IN", "INR", 59900}, {"AE", "AED", 2900}, {"INT", "USD", 900}} {
+		p, err := grant(insertEvent(prem, "draft"), prem, c.region)
+		if err != nil || p.Region != c.region || p.Currency != c.currency || p.AmountMinor != c.amount || p.RevokedAt != nil {
+			t.Errorf("grant %s = %+v (err %v), want %s %d", c.region, p, err, c.currency, c.amount)
+		}
+	}
+	for _, c := range []struct {
+		name   string
+		tmpl   uuid.UUID
+		region string
+	}{{"free template", free, "IN"}, {"unknown region", prem, "US"}, {"empty region", prem, ""}, {"unknown template", uuid.Must(uuid.NewV7()), "IN"}} {
+		if _, err := grant(g, c.tmpl, c.region); !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("grant %s: err = %v, want ErrNoRows", c.name, err)
+		}
+	}
+	// A confirmed amount that is not the live price records nothing.
+	for _, bad := range []int32{0, 1, livePrice(prem, "IN") + 1, livePrice(prem, "IN") - 1} {
+		if _, err := grantAt(g, prem, "IN", bad); !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("grant with stale amount %d: err = %v, want ErrNoRows", bad, err)
+		}
+	}
+	if _, err := grantAt(g, prem, "INT", livePrice(prem, "IN")); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("grant INT with the IN amount: err = %v, want ErrNoRows", err)
+	}
+	// LockEventForPayment: live owned event only.
+	if tid, err := q.LockEventForPayment(ctx, g); err != nil || tid != prem {
+		t.Errorf("LockEventForPayment = %v (err %v), want %v", tid, err, prem)
+	}
+	if _, err := q.LockEventForPayment(ctx, uuid.Must(uuid.NewV7())); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("LockEventForPayment unknown event: err = %v, want ErrNoRows", err)
+	}
+	// Region not offered (row removed) -> no grant; offered again via upsert -> grant at the new price.
+	if _, err := q.DeleteTemplatePrice(ctx, store.DeleteTemplatePriceParams{TemplateID: prem, Region: "AE"}); err != nil {
+		t.Fatalf("delete price: %v", err)
+	}
+	if _, err := grant(g, prem, "AE"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("grant in a region not offered: err = %v, want ErrNoRows", err)
+	}
+	if tp, err := q.UpsertTemplatePrice(ctx, store.UpsertTemplatePriceParams{TemplateID: prem, Region: "AE", AmountMinor: 3500}); err != nil || tp.Currency != "AED" || tp.AmountMinor != 3500 {
+		t.Errorf("upsert price = %+v (err %v), want AED 3500", tp, err)
+	}
+	if tp, err := q.UpsertTemplatePrice(ctx, store.UpsertTemplatePriceParams{TemplateID: prem, Region: "AE", AmountMinor: 3600}); err != nil || tp.AmountMinor != 3600 {
+		t.Errorf("upsert existing price = %+v (err %v), want 3600", tp, err)
+	}
+	if _, err := q.UpsertTemplatePrice(ctx, store.UpsertTemplatePriceParams{TemplateID: prem, Region: "US", AmountMinor: 3500}); err == nil {
+		t.Error("upsert with unknown region succeeded")
+	}
+	if prices, err := q.ListTemplatePrices(ctx, []uuid.UUID{prem, free}); err != nil || len(prices) != 2 || prices[0].Region != "AE" || prices[1].Region != "INT" {
+		t.Errorf("ListTemplatePrices = %+v (err %v), want AE then INT for the premium template", prices, err)
+	}
+	p, err := grant(g, prem, "AE")
+	if err != nil || p.AmountMinor != 3600 {
+		t.Fatalf("grant after upsert = %+v (err %v), want 3600", p, err)
+	}
+	// A second live grant is DO NOTHING (no row).
+	if _, err := grant(g, prem, "INT"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("second live grant: err = %v, want ErrNoRows", err)
+	}
+	if paid, err := q.EventTemplatePaid(ctx, store.EventTemplatePaidParams{EventID: g, TemplateID: prem}); err != nil || !paid {
+		t.Errorf("paid after grant = %v (err %v), want true", paid, err)
+	}
+	// Revoke is soft and happens once; the gate closes; the history keeps it; a re-grant works.
+	r, err := q.RevokeEventPayment(ctx, store.RevokeEventPaymentParams{EventID: g, TemplateID: prem, RevokedBy: owner})
+	if err != nil || r.RevokedAt == nil || r.RevokedBy == nil || *r.RevokedBy != owner {
+		t.Fatalf("revoke = %+v (err %v), want revoked_at and revoked_by set", r, err)
+	}
+	if _, err := q.RevokeEventPayment(ctx, store.RevokeEventPaymentParams{EventID: g, TemplateID: prem, RevokedBy: owner}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("second revoke: err = %v, want ErrNoRows", err)
+	}
+	if paid, err := q.EventTemplatePaid(ctx, store.EventTemplatePaidParams{EventID: g, TemplateID: prem}); err != nil || paid {
+		t.Errorf("paid after revoke = %v (err %v), want false", paid, err)
+	}
+	if l, err := q.ListEventPayments(ctx, g); err != nil || len(l) != 0 {
+		t.Errorf("ListEventPayments after revoke = %d (err %v), want 0", len(l), err)
+	}
+	if l, err := q.ListEventPaymentHistory(ctx, g); err != nil || len(l) != 1 || l[0].RevokedAt == nil {
+		t.Errorf("ListEventPaymentHistory after revoke = %+v (err %v), want the revoked row", l, err)
+	}
+	if _, err := grant(g, prem, "INT"); err != nil {
+		t.Errorf("re-grant after revoke: %v", err)
+	}
+	if l, err := q.ListEventPayments(ctx, g); err != nil || len(l) != 1 || l[0].Region != "INT" {
+		t.Errorf("ListEventPayments after re-grant = %+v (err %v), want one INT row", l, err)
+	}
+
+	// The PublishEvent gate ignores a revoked grant.
+	pub := insertEvent(prem, "draft")
+	publish := func() error {
+		var version int32
+		if err := pool.QueryRow(ctx, "SELECT version FROM events WHERE id = $1", pub).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		_, err := q.PublishEvent(ctx, store.PublishEventParams{EventID: pub, UserID: owner, Version: version})
+		return err
+	}
+	if err := publish(); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("publish premium without grant: err = %v, want ErrNoRows", err)
+	}
+	if _, err := grant(pub, prem, "IN"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.RevokeEventPayment(ctx, store.RevokeEventPaymentParams{EventID: pub, TemplateID: prem, RevokedBy: owner}); err != nil {
+		t.Fatal(err)
+	}
+	if err := publish(); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("publish premium with revoked grant: err = %v, want ErrNoRows", err)
+	}
+	if _, err := grant(pub, prem, "IN"); err != nil {
+		t.Fatal(err)
+	}
+	if err := publish(); err != nil {
+		t.Errorf("publish premium with live grant: %v", err)
+	}
+
+	// RestoreEvent: a taken-down event comes back 'hidden' on an unpaid premium template, 'published' when
+	// paid or on a free template, and 'draft' when it was never published.
+	restore := func(event uuid.UUID) string {
+		t.Helper()
+		row, err := q.RestoreEvent(ctx, event)
+		if err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		if row.OldStatus != "taken_down" {
+			t.Errorf("restore old status = %q, want taken_down", row.OldStatus)
+		}
+		return row.NewStatus
+	}
+	takeDown := func(event uuid.UUID) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, "UPDATE events SET status = 'taken_down' WHERE id = $1", event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Published on a free template, switched to premium (as an admin can), then taken down.
+	unpaid := insertEvent(free, "published")
+	if _, err := pool.Exec(ctx, `UPDATE events e SET template_id = $2, template_version = tv.version
+		FROM template_versions tv WHERE e.id = $1 AND tv.template_id = $2`, unpaid, prem); err != nil {
+		t.Fatalf("switch to premium: %v", err)
+	}
+	takeDown(unpaid)
+	if got := restore(unpaid); got != "hidden" {
+		t.Errorf("restore unpaid premium = %q, want hidden", got)
+	}
+	paid := insertEvent(prem, "published")
+	if _, err := grant(paid, prem, "IN"); err != nil {
+		t.Fatal(err)
+	}
+	takeDown(paid)
+	if got := restore(paid); got != "published" {
+		t.Errorf("restore paid premium = %q, want published", got)
+	}
+	revokedPaid := insertEvent(prem, "published")
+	if _, err := grant(revokedPaid, prem, "IN"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.RevokeEventPayment(ctx, store.RevokeEventPaymentParams{EventID: revokedPaid, TemplateID: prem, RevokedBy: owner}); err != nil {
+		t.Fatal(err)
+	}
+	takeDown(revokedPaid)
+	if got := restore(revokedPaid); got != "hidden" {
+		t.Errorf("restore premium with revoked payment = %q, want hidden", got)
+	}
+	freeEvent := insertEvent(free, "published")
+	takeDown(freeEvent)
+	if got := restore(freeEvent); got != "published" {
+		t.Errorf("restore free template = %q, want published", got)
+	}
+	neverPublished := insertEvent(prem, "draft")
+	takeDown(neverPublished)
+	if got := restore(neverPublished); got != "draft" {
+		t.Errorf("restore never-published = %q, want draft", got)
+	}
+
+	// Indexes after Up.
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE tablename = 'event_payments'
+		AND indexname IN ('event_payments_live_key', 'event_payments_event_template_idx', 'event_payments_template_id_idx',
+		                  'event_payments_granted_by_idx', 'event_payments_revoked_by_idx')`).Scan(&n); err != nil || n != 5 {
+		t.Errorf("event_payments indexes = %d (err %v), want 5", n, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE indexname = 'event_payments_event_template_key'`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("old unique index present after Up = %d (err %v), want 0", n, err)
+	}
+
+	// Down refuses while a non-IN payment exists, and the failed Down leaves the schema at 37.
+	if _, err := provider.DownTo(ctx, 36); err == nil {
+		t.Fatal("down to 36 with non-IN payments succeeded, want an error")
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'template_prices'").Scan(&n); err != nil || n != 1 {
+		t.Errorf("template_prices after refused Down = %d (err %v), want 1 (rolled back)", n, err)
+	}
+	// Revoked rows also refuse Down (a rollback would destroy them), even once the non-IN rows are gone.
+	if _, err := pool.Exec(ctx, "DELETE FROM event_payments WHERE region <> 'IN'"); err != nil {
+		t.Fatalf("delete non-IN payments: %v", err)
+	}
+	var live, revoked int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FILTER (WHERE revoked_at IS NULL), count(*) FILTER (WHERE revoked_at IS NOT NULL) FROM event_payments").
+		Scan(&live, &revoked); err != nil || revoked == 0 {
+		t.Fatalf("payments before Down: live %d revoked %d (err %v), want some revoked", live, revoked, err)
+	}
+	if _, err := provider.DownTo(ctx, 36); err == nil {
+		t.Fatal("down to 36 with revoked payments succeeded, want an error")
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_payments WHERE revoked_at IS NOT NULL").Scan(&n); err != nil || n != revoked {
+		t.Fatalf("revoked rows after refused Down = %d (err %v), want %d kept", n, err, revoked)
+	}
+	// With only live India rows left, Down is clean.
+	if _, err := pool.Exec(ctx, "DELETE FROM event_payments WHERE revoked_at IS NOT NULL"); err != nil {
+		t.Fatalf("delete revoked payments: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_payments").Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.DownTo(ctx, 36); err != nil {
+		t.Fatalf("down to 36: %v", err)
+	}
+	// Back to the 00036 shape: amount_paise, INR-only, no region/revoke columns, old index.
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM information_schema.tables WHERE table_name = 'template_prices') +
+		(SELECT count(*) FROM information_schema.columns WHERE table_name = 'event_payments'
+		   AND column_name IN ('amount_minor', 'region', 'revoked_at', 'revoked_by')) +
+		(SELECT count(*) FROM pg_indexes WHERE indexname IN ('event_payments_live_key', 'event_payments_event_template_idx', 'event_payments_revoked_by_idx'))`).
+		Scan(&n); err != nil || n != 0 {
+		t.Errorf("37 leftovers after Down = %d (err %v), want 0", n, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns WHERE table_name = 'event_payments' AND column_name = 'amount_paise'`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("amount_paise after Down = %d (err %v), want 1", n, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_payments").Scan(&n); err != nil || n != live {
+		t.Errorf("payments after Down = %d (err %v), want %d (all kept)", n, err, live)
+	}
+	_, err = pool.Exec(ctx, `INSERT INTO event_payments (id, event_id, template_id, amount_paise, currency) VALUES ($1, $2, $3, 100, 'AED')`,
+		uuid.Must(uuid.NewV7()), probe, prem)
+	wantCode("AED after Down", err, "23514")
+	_, err = pool.Exec(ctx, `INSERT INTO event_payments (id, event_id, template_id, amount_paise) VALUES ($1, $2, $3, 99)`,
+		uuid.Must(uuid.NewV7()), probe, prem)
+	wantCode("amount 99 after Down", err, "23514")
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE indexname = 'event_payments_event_template_key'`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("old unique index after Down = %d (err %v), want 1", n, err)
+	}
+	if _, err := provider.UpTo(ctx, 37); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_prices WHERE template_id = $1", prem).Scan(&n); err != nil || n != 2 {
+		t.Errorf("premium prices after Up again = %d (err %v), want 2", n, err)
+	}
 }

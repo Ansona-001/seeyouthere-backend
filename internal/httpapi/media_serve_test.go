@@ -352,7 +352,7 @@ func TestServeTemplateMedia(t *testing.T) {
 
 	templateID := uuid.Must(uuid.NewV7())
 	if _, err := q.CreateTemplate(ctx, store.CreateTemplateParams{
-		ID: templateID, Slug: "test-tpl-serve-" + templateID.String(), Name: "Serve", Tags: []byte("{}"),
+		ID: templateID, Slug: "test-tpl-serve-" + templateID.String(), Name: "Serve", Tags: []byte("{}"), PricePaise: 59900,
 	}); err != nil {
 		t.Fatalf("create template: %v", err)
 	}

@@ -270,9 +270,21 @@ type adminEventResp struct {
 // host-facing queries do — the "update available" hint is a host-editor
 // concept and admin has its own explicit template/flags control instead.
 func (s *Server) buildAdminEventResponse(ctx context.Context, q *store.Queries, row store.GetEventAdminRow) (adminEventResp, error) {
+	// GetEventAdmin carries no premium state; two point lookups fill it in.
+	tpl, err := q.GetTemplateAdmin(ctx, row.Event.TemplateID)
+	if err != nil {
+		return adminEventResp{}, fmt.Errorf("get template admin: %w", err)
+	}
+	paid := false
+	if tpl.IsPremium {
+		if paid, err = q.EventTemplatePaid(ctx, store.EventTemplatePaidParams{EventID: row.Event.ID, TemplateID: tpl.ID}); err != nil {
+			return adminEventResp{}, fmt.Errorf("check template payment: %w", err)
+		}
+	}
 	base, err := s.buildEventResponse(ctx, q, eventRow{
 		Event: row.Event, Role: "owner", TemplateSlug: row.TemplateSlug, TemplateName: row.TemplateName,
 		Manifest: row.Manifest, AssetsPath: row.AssetsPath, LatestVersion: row.Event.TemplateVersion,
+		TemplateIsPremium: tpl.IsPremium, TemplatePricePaise: tpl.PricePaise, TemplatePaid: paid,
 	})
 	if err != nil {
 		return adminEventResp{}, err
@@ -336,8 +348,21 @@ func (s *Server) handleGetAdminEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	payments, err := s.q.ListEventPayments(ctx, eventID)
+	if err != nil {
+		serverError(w, r, fmt.Errorf("list event payments: %w", err))
+		return
+	}
+	paymentResps, err := s.adminPaymentResps(ctx, payments)
+	if err != nil {
+		serverError(w, r, err)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"event": resp,
+		"event":    resp,
+		"premium":  resp.Premium,
+		"payments": paymentResps,
 		"counts": map[string]int64{
 			"rsvps":  row.RsvpCount,
 			"guests": row.GuestCount,
@@ -475,6 +500,7 @@ func (s *Server) handleAdminSetEventFlags(w http.ResponseWriter, r *http.Request
 	ctx := r.Context()
 	var templateID *uuid.UUID
 	var templateVersion *int32
+	premiumTarget := false
 	if body.TemplateSlug != nil {
 		tpl, err := s.q.GetPublishedTemplateBySlug(ctx, store.GetPublishedTemplateBySlugParams{
 			Slug: *body.TemplateSlug, AllowPremium: true,
@@ -487,7 +513,7 @@ func (s *Server) handleAdminSetEventFlags(w http.ResponseWriter, r *http.Request
 			serverError(w, r, fmt.Errorf("get published template: %w", err))
 			return
 		}
-		templateID, templateVersion = &tpl.ID, &tpl.Version
+		templateID, templateVersion, premiumTarget = &tpl.ID, &tpl.Version, tpl.IsPremium
 	}
 
 	callerID, _ := userIDFrom(r.Context())
@@ -502,10 +528,19 @@ func (s *Server) handleAdminSetEventFlags(w http.ResponseWriter, r *http.Request
 		if err != nil {
 			return fmt.Errorf("set event flags: %w", err)
 		}
+		after := map[string]any{"remove_branding": row.RemoveBranding, "template_id": row.TemplateID, "template_version": row.TemplateVersion}
+		if premiumTarget && row.Status == "published" {
+			// An admin may put a published event on a premium template without a payment; record whether it is unpaid.
+			paid, err := q.EventTemplatePaid(ctx, store.EventTemplatePaidParams{EventID: eventID, TemplateID: row.TemplateID})
+			if err != nil {
+				return fmt.Errorf("check template payment: %w", err)
+			}
+			after["premium_unpaid"] = !paid
+		}
 		return s.writeAudit(ctx, q, r, auditEntry{
 			ActorID: &callerID, Action: "event.flags", TargetType: "event", TargetID: eventID.String(),
 			Before: map[string]any{"remove_branding": row.OldRemoveBranding, "template_id": row.OldTemplateID, "template_version": row.OldTemplateVersion},
-			After:  map[string]any{"remove_branding": row.RemoveBranding, "template_id": row.TemplateID, "template_version": row.TemplateVersion},
+			After:  after,
 		})
 	})
 	if err != nil {

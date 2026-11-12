@@ -1,6 +1,6 @@
 -- name: ListTemplatesAdmin :many
 -- Every template with its newest version and newest published version (0 = none).
-SELECT t.id, t.slug, t.name, t.tags, t.status, t.is_premium, t.created_at, t.updated_at,
+SELECT t.id, t.slug, t.name, t.tags, t.status, t.is_premium, t.price_paise, t.created_at, t.updated_at,
        v.latest_version, v.latest_published_version
 FROM templates t
 CROSS JOIN LATERAL (
@@ -16,16 +16,18 @@ LIMIT 200;
 SELECT * FROM templates WHERE id = @template_id;
 
 -- name: CreateTemplate :one
--- A duplicate slug raises 23505 on templates_slug_key.
-INSERT INTO templates (id, slug, name, tags, is_premium)
-VALUES (@id, @slug, @name, @tags, @is_premium)
+-- A duplicate slug raises 23505 on templates_slug_key; a price outside 100..1000000 raises 23514 on
+-- templates_price_paise_range.
+INSERT INTO templates (id, slug, name, tags, is_premium, price_paise)
+VALUES (@id, @slug, @name, @tags, @is_premium, @price_paise)
 RETURNING *;
 
 -- name: UpdateTemplate :one
--- NULL leaves a field unchanged. Setting status 'published' requires a published version; no row
+-- NULL leaves a field unchanged (an out-of-range price_paise raises 23514 on templates_price_paise_range).
+-- Setting status 'published' requires a published version; no row
 -- then (or when the template is missing), which the caller maps with CountPublishedVersions.
 WITH prev AS (
-    SELECT x.id, x.name, x.tags, x.status, x.is_premium FROM templates x
+    SELECT x.id, x.name, x.tags, x.status, x.is_premium, x.price_paise FROM templates x
     WHERE x.id = @template_id
     FOR NO KEY UPDATE
 )
@@ -33,6 +35,7 @@ UPDATE templates t
 SET name = coalesce(sqlc.narg(name), t.name),
     tags = coalesce(sqlc.narg(tags), t.tags),
     is_premium = coalesce(sqlc.narg(is_premium), t.is_premium),
+    price_paise = coalesce(sqlc.narg(price_paise), t.price_paise),
     status = coalesce(sqlc.narg(status), t.status),
     updated_at = now()
 FROM prev
@@ -41,7 +44,8 @@ WHERE t.id = prev.id
        OR EXISTS (SELECT 1 FROM template_versions tv
                   WHERE tv.template_id = t.id AND tv.published_at IS NOT NULL))
 RETURNING prev.name AS old_name, prev.tags AS old_tags, prev.status AS old_status, prev.is_premium AS old_is_premium,
-          t.id, t.slug, t.name, t.tags, t.status, t.is_premium, t.created_at, t.updated_at;
+          prev.price_paise AS old_price_paise,
+          t.id, t.slug, t.name, t.tags, t.status, t.is_premium, t.price_paise, t.created_at, t.updated_at;
 
 -- name: ListTemplateVersions :many
 -- Without manifests (wide); fetch one with GetTemplateVersion.

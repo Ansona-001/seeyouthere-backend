@@ -81,6 +81,21 @@ type EventMember struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type EventPayment struct {
+	ID          uuid.UUID  `json:"id"`
+	EventID     *uuid.UUID `json:"event_id"`
+	TemplateID  uuid.UUID  `json:"template_id"`
+	GrantedBy   *uuid.UUID `json:"granted_by"`
+	AmountMinor int32      `json:"amount_minor"`
+	Currency    string     `json:"currency"`
+	Method      string     `json:"method"`
+	Note        string     `json:"note"`
+	CreatedAt   time.Time  `json:"created_at"`
+	Region      string     `json:"region"`
+	RevokedAt   *time.Time `json:"revoked_at"`
+	RevokedBy   *uuid.UUID `json:"revoked_by"`
+}
+
 type EventWish struct {
 	ID        uuid.UUID `json:"id"`
 	EventID   uuid.UUID `json:"event_id"`
@@ -185,15 +200,23 @@ type SlugBlocklist struct {
 }
 
 type Template struct {
-	ID        uuid.UUID `json:"id"`
-	Slug      string    `json:"slug"`
-	Name      string    `json:"name"`
-	Tags      []byte    `json:"tags"`
-	Status    string    `json:"status"`
-	IsPremium bool      `json:"is_premium"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	SortOrder int32     `json:"sort_order"`
+	ID         uuid.UUID `json:"id"`
+	Slug       string    `json:"slug"`
+	Name       string    `json:"name"`
+	Tags       []byte    `json:"tags"`
+	Status     string    `json:"status"`
+	IsPremium  bool      `json:"is_premium"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	SortOrder  int32     `json:"sort_order"`
+	PricePaise int32     `json:"price_paise"`
+}
+
+type TemplatePrice struct {
+	TemplateID  uuid.UUID `json:"template_id"`
+	Region      string    `json:"region"`
+	Currency    string    `json:"currency"`
+	AmountMinor int32     `json:"amount_minor"`
 }
 
 type TemplateVersion struct {
