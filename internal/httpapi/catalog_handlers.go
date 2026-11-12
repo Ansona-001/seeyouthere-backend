@@ -62,6 +62,7 @@ type templateCatalogResp struct {
 	Slug       string                   `json:"slug"`
 	Name       string                   `json:"name"`
 	Tags       json.RawMessage          `json:"tags"`
+	IsPremium  bool                     `json:"is_premium"`
 	Version    int32                    `json:"version"`
 	Defaults   content.ManifestDefaults `json:"defaults"`
 	Palettes   []content.Palette        `json:"palettes"`
@@ -106,6 +107,7 @@ func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request) {
 			Slug:       row.Slug,
 			Name:       row.Name,
 			Tags:       tags,
+			IsPremium:  row.IsPremium,
 			Version:    row.Version,
 			Defaults:   m.Defaults,
 			Palettes:   m.Palettes,

@@ -281,19 +281,19 @@ func newV2Template(t *testing.T, f adminHandlerFixture, pool *pgxpool.Pool) uuid
 	ctx := context.Background()
 	templateID := uuid.Must(uuid.NewV7())
 	if _, err := f.s.q.CreateTemplate(ctx, store.CreateTemplateParams{
-		ID: templateID, Slug: "test-v2-" + templateID.String(), Name: "Test v2", Tags: []byte("{}"),
+		ID: templateID, Slug: "test-v2-" + templateID.String(), Name: "Test v2", Tags: []byte("{}"), PricePaise: 59900,
 	}); err != nil {
 		t.Fatalf("create template: %v", err)
 	}
 	t.Cleanup(func() {
 		// Drafts are deleted so a deliberately broken manifest can't linger
 		// in the dev DB. A published version can't be deleted
-		// (template_versions_immutable), so its template is made premium
+		// (template_versions_immutable), so its template is set to draft
 		// instead, which removes it from every public catalog query.
 		bg := context.Background()
 		_, _ = pool.Exec(bg, "DELETE FROM template_versions WHERE template_id = $1 AND published_at IS NULL", templateID)
 		if _, err := pool.Exec(bg, "DELETE FROM templates WHERE id = $1", templateID); err != nil {
-			_, _ = pool.Exec(bg, "UPDATE templates SET is_premium = true WHERE id = $1", templateID)
+			_, _ = pool.Exec(bg, "UPDATE templates SET status = 'draft' WHERE id = $1", templateID)
 		}
 	})
 	req := jsonRequest(http.MethodPost, "/", f.superAdminID, f.superAdminSessID, []string{"super_admin"},

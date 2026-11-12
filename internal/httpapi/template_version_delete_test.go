@@ -25,18 +25,18 @@ func seedTemplateVersions(t *testing.T, a adminAPI, blobs *testBlobs, n int, wit
 	ctx := context.Background()
 	templateID := uuid.Must(uuid.NewV7())
 	if _, err := a.f.s.q.CreateTemplate(ctx, store.CreateTemplateParams{
-		ID: templateID, Slug: "test-vdel-" + templateID.String(), Name: "Test version delete", Tags: []byte("{}"),
+		ID: templateID, Slug: "test-vdel-" + templateID.String(), Name: "Test version delete", Tags: []byte("{}"), PricePaise: 59900,
 	}); err != nil {
 		t.Fatalf("create template: %v", err)
 	}
 	t.Cleanup(func() {
 		// A published version can't be deleted (template_versions_immutable),
-		// so its template is made premium instead, which hides it from every
+		// so its template is set to draft instead, which hides it from every
 		// public catalog query.
 		bg := context.Background()
 		_, _ = a.pool.Exec(bg, "DELETE FROM template_versions WHERE template_id = $1 AND published_at IS NULL", templateID)
 		if _, err := a.pool.Exec(bg, "DELETE FROM templates WHERE id = $1", templateID); err != nil {
-			_, _ = a.pool.Exec(bg, "UPDATE templates SET is_premium = true WHERE id = $1", templateID)
+			_, _ = a.pool.Exec(bg, "UPDATE templates SET status = 'draft' WHERE id = $1", templateID)
 		}
 	})
 	for v := 1; v <= n; v++ {

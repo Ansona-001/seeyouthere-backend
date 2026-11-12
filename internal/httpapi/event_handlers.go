@@ -124,14 +124,67 @@ type eventRow struct {
 	Manifest      []byte
 	AssetsPath    string
 	LatestVersion int32
+	// Premium state of the pinned template; TemplatePaid is whether an
+	// event_payments grant exists for (event, pinned template).
+	TemplateIsPremium  bool
+	TemplatePricePaise int32
+	TemplatePaid       bool
 }
 
 func fromGetEventForUser(r store.GetEventForUserRow) eventRow {
-	return eventRow{r.Event, r.Role, r.TemplateSlug, r.TemplateName, r.Manifest, r.AssetsPath, r.LatestVersion}
+	return eventRow{r.Event, r.Role, r.TemplateSlug, r.TemplateName, r.Manifest, r.AssetsPath, r.LatestVersion,
+		r.TemplateIsPremium, r.TemplatePricePaise, r.TemplatePaid}
 }
 
 func fromGetAnonDraftEvent(r store.GetAnonDraftEventRow) eventRow {
-	return eventRow{r.Event, r.Role, r.TemplateSlug, r.TemplateName, r.Manifest, r.AssetsPath, r.LatestVersion}
+	return eventRow{r.Event, r.Role, r.TemplateSlug, r.TemplateName, r.Manifest, r.AssetsPath, r.LatestVersion,
+		r.TemplateIsPremium, r.TemplatePricePaise, r.TemplatePaid}
+}
+
+// priceResp is one regional price of a premium template, in minor units.
+type priceResp struct {
+	Region      string `json:"region"`
+	Currency    string `json:"currency"`
+	AmountMinor int32  `json:"amount_minor"`
+}
+
+// premiumResp is the host view of a premium template's prices and unlock state.
+type premiumResp struct {
+	Paid   bool        `json:"paid"`
+	Prices []priceResp `json:"prices"`
+}
+
+// templatePrices lists a premium template's offered prices: the India price
+// (templates.price_paise) first, then the AE and INT rows of template_prices.
+func templatePrices(pricePaise int32, regional []store.TemplatePrice) []priceResp {
+	out := make([]priceResp, 0, 1+len(regional))
+	out = append(out, priceResp{Region: "IN", Currency: "INR", AmountMinor: pricePaise})
+	for _, p := range regional {
+		out = append(out, priceResp{Region: p.Region, Currency: p.Currency, AmountMinor: p.AmountMinor})
+	}
+	return out
+}
+
+// loadTemplatePrices returns the price list for one premium template with one
+// extra query.
+func loadTemplatePrices(ctx context.Context, q *store.Queries, templateID uuid.UUID, pricePaise int32) ([]priceResp, error) {
+	regional, err := q.ListTemplatePrices(ctx, []uuid.UUID{templateID})
+	if err != nil {
+		return nil, fmt.Errorf("list template prices: %w", err)
+	}
+	return templatePrices(pricePaise, regional), nil
+}
+
+// writePaymentRequired renders the 402 returned when a premium template has
+// no live payment grant for the event.
+func (s *Server) writePaymentRequired(w http.ResponseWriter, r *http.Request, templateID uuid.UUID, pricePaise int32) {
+	prices, err := loadTemplatePrices(r.Context(), s.q, templateID, pricePaise)
+	if err != nil {
+		serverError(w, r, err)
+		return
+	}
+	writeErrorDetails(w, http.StatusPaymentRequired, "payment_required", "This premium template needs to be unlocked first.",
+		map[string]any{"template_id": templateID, "prices": prices})
 }
 
 // loadEventRow resolves read/write access to an event for either a signed-in
@@ -235,6 +288,8 @@ type eventResp struct {
 	ShareImage  shareImageResp           `json:"share_image"`
 	Music       musicResp                `json:"music"`
 	URL         *string                  `json:"url"`
+	// Premium is nil unless the pinned template is premium.
+	Premium *premiumResp `json:"premium"`
 }
 
 // shareImageResp is the host view of the link-preview image choice. MediaID
@@ -377,6 +432,15 @@ func (s *Server) buildEventResponse(ctx context.Context, q *store.Queries, row e
 		url = &u
 	}
 
+	var premium *premiumResp
+	if row.TemplateIsPremium {
+		prices, err := loadTemplatePrices(ctx, q, e.TemplateID, row.TemplatePricePaise)
+		if err != nil {
+			return eventResp{}, err
+		}
+		premium = &premiumResp{Paid: row.TemplatePaid, Prices: prices}
+	}
+
 	return eventResp{
 		ID: e.ID, Slug: e.Slug, Title: e.Title, OccasionSlug: e.OccasionSlug, Status: e.Status,
 		Visibility: e.Visibility, HasPassword: e.PasswordHash != nil, RsvpMode: e.RsvpMode,
@@ -392,6 +456,7 @@ func (s *Server) buildEventResponse(ctx context.Context, q *store.Queries, row e
 		ShareImage: shareImageResp{Source: e.ShareImage, MediaID: e.ShareMediaID},
 		Music:      music,
 		URL:        url,
+		Premium:    premium,
 	}, nil
 }
 
@@ -511,7 +576,7 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	if templateSlug == "" {
 		templateSlug = "classic" // seeded, tagged for every occasion (§2.2)
 	}
-	tmpl, err := s.q.GetPublishedTemplateBySlug(ctx, store.GetPublishedTemplateBySlugParams{Slug: templateSlug, AllowPremium: false})
+	tmpl, err := s.q.GetPublishedTemplateBySlug(ctx, store.GetPublishedTemplateBySlugParams{Slug: templateSlug, AllowPremium: true})
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusBadRequest, "unknown_template", "Unknown template.")
 		return
@@ -638,6 +703,7 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.buildEventResponse(ctx, s.q, eventRow{
 		Event: createdEvent, Role: role, TemplateSlug: tmpl.Slug, TemplateName: tmpl.Name,
 		Manifest: tmpl.Manifest, AssetsPath: tmpl.AssetsPath, LatestVersion: tmpl.Version,
+		TemplateIsPremium: tmpl.IsPremium, TemplatePricePaise: tmpl.PricePaise, // a new event has no grant yet
 	})
 	if err != nil {
 		serverError(w, r, err)
@@ -837,6 +903,8 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 
 	var templateID *uuid.UUID
 	var templateVersion *int32
+	var premiumTarget bool
+	var premiumPrice int32
 	manifest := row.Manifest
 	if body.TemplateSlug != nil {
 		slug := strings.TrimSpace(*body.TemplateSlug)
@@ -844,7 +912,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "unknown_template", "Unknown template.")
 			return
 		}
-		tmpl, err := s.q.GetPublishedTemplateBySlug(ctx, store.GetPublishedTemplateBySlugParams{Slug: slug, AllowPremium: false})
+		tmpl, err := s.q.GetPublishedTemplateBySlug(ctx, store.GetPublishedTemplateBySlugParams{Slug: slug, AllowPremium: true})
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusBadRequest, "unknown_template", "Unknown template.")
 			return
@@ -855,6 +923,7 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		templateID, templateVersion = &tmpl.ID, &tmpl.Version
 		manifest = tmpl.Manifest
+		premiumTarget, premiumPrice = tmpl.IsPremium, tmpl.PricePaise
 	}
 
 	var contentJSON []byte
@@ -936,6 +1005,21 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 		overridesJSON = canon
 	}
 
+	// A published event can only move to a premium template it has paid for.
+	// Validation above wins over this; the SQL gate in UpdateEventContent is
+	// the backstop for a race with a status change or a revoked grant.
+	if authed && premiumTarget && row.Event.Status == "published" {
+		paid, err := s.q.EventTemplatePaid(ctx, store.EventTemplatePaidParams{EventID: eventID, TemplateID: *templateID})
+		if err != nil {
+			serverError(w, r, fmt.Errorf("check template payment: %w", err))
+			return
+		}
+		if !paid {
+			s.writePaymentRequired(w, r, *templateID, premiumPrice)
+			return
+		}
+	}
+
 	err = s.inTx(ctx, func(tx pgx.Tx, q *store.Queries) error {
 		if authed {
 			if musicSource != nil && *musicSource == "custom" {
@@ -989,6 +1073,24 @@ func (s *Server) handlePatchEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
+		if authed && premiumTarget {
+			fresh, ok, ferr := s.loadEventRow(r, eventID)
+			if ferr != nil {
+				serverError(w, r, ferr)
+				return
+			}
+			if ok && fresh.Event.Status == "published" {
+				paid, perr := s.q.EventTemplatePaid(ctx, store.EventTemplatePaidParams{EventID: eventID, TemplateID: *templateID})
+				if perr != nil {
+					serverError(w, r, fmt.Errorf("check template payment: %w", perr))
+					return
+				}
+				if !paid {
+					s.writePaymentRequired(w, r, *templateID, premiumPrice)
+					return
+				}
+			}
+		}
 		var wErr error
 		if authed {
 			wErr = s.mapEventWriteFailure(ctx, s.q, &userID, eventID, nil, map[string]bool{"owner": true, "editor": true})
@@ -1086,6 +1188,13 @@ func (s *Server) handleUpgradeEventTemplate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// A published event on a premium template whose grant was revoked can't
+	// move to a newer version until it is paid again.
+	if authed && row.TemplateIsPremium && !row.TemplatePaid && row.Event.Status == "published" {
+		s.writePaymentRequired(w, r, row.Event.TemplateID, row.TemplatePricePaise)
+		return
+	}
+
 	templateID := row.Event.TemplateID
 	latest := row.LatestVersion
 
@@ -1106,6 +1215,12 @@ func (s *Server) handleUpgradeEventTemplate(w http.ResponseWriter, r *http.Reque
 	if errors.Is(err, pgx.ErrNoRows) {
 		var wErr error
 		if authed {
+			// The SQL payment gate also yields no row (grant revoked since the check above).
+			if fresh, ok, ferr := s.loadEventRow(r, eventID); ferr == nil && ok && fresh.Role != "viewer" &&
+				fresh.Event.Status == "published" && fresh.TemplateIsPremium && !fresh.TemplatePaid {
+				s.writePaymentRequired(w, r, fresh.Event.TemplateID, fresh.TemplatePricePaise)
+				return
+			}
 			wErr = s.mapEventWriteFailure(ctx, s.q, &userID, eventID, nil, map[string]bool{"owner": true, "editor": true})
 		} else {
 			wErr = s.mapEventWriteFailure(ctx, s.q, nil, eventID, cookieHash, nil)
@@ -1351,10 +1466,6 @@ func (s *Server) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Log in to continue.")
 		return
 	}
-	if !s.allow(w, r, limit{"events:publish:" + userID.String(), 20, 24 * time.Hour}) {
-		return
-	}
-
 	var body struct {
 		Version int32 `json:"version"`
 	}
@@ -1383,6 +1494,16 @@ func (s *Server) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	if row.Event.Status == "taken_down" {
 		writeError(w, http.StatusConflict, "event_taken_down", "This event has been taken down.")
+		return
+	}
+
+	// A cheap, deterministic refusal comes before the rate limit so a host
+	// waiting on a manual payment doesn't burn the daily publish allowance.
+	if row.TemplateIsPremium && !row.TemplatePaid {
+		s.writePaymentRequired(w, r, row.Event.TemplateID, row.TemplatePricePaise)
+		return
+	}
+	if !s.allow(w, r, limit{"events:publish:" + userID.String(), 20, 24 * time.Hour}) {
 		return
 	}
 
@@ -1423,6 +1544,12 @@ func (s *Server) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 
 	_, err = s.q.PublishEvent(ctx, store.PublishEventParams{EventID: eventID, UserID: userID, Version: body.Version})
 	if errors.Is(err, pgx.ErrNoRows) {
+		// The SQL payment gate also yields no row; tell it apart from a version conflict.
+		if fresh, ok, ferr := s.loadMemberEvent(ctx, userID, eventID); ferr == nil && ok && fresh.Role == "owner" &&
+			fresh.TemplateIsPremium && !fresh.TemplatePaid {
+			s.writePaymentRequired(w, r, fresh.Event.TemplateID, fresh.TemplatePricePaise)
+			return
+		}
 		writeEventWriteError(w, r, s.mapEventWriteFailure(ctx, s.q, &userID, eventID, nil, map[string]bool{"owner": true}))
 		return
 	}

@@ -37,20 +37,22 @@ func (q *Queries) CountTemplateVersions(ctx context.Context, templateID uuid.UUI
 }
 
 const createTemplate = `-- name: CreateTemplate :one
-INSERT INTO templates (id, slug, name, tags, is_premium)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, slug, name, tags, status, is_premium, created_at, updated_at, sort_order
+INSERT INTO templates (id, slug, name, tags, is_premium, price_paise)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, slug, name, tags, status, is_premium, created_at, updated_at, sort_order, price_paise
 `
 
 type CreateTemplateParams struct {
-	ID        uuid.UUID `json:"id"`
-	Slug      string    `json:"slug"`
-	Name      string    `json:"name"`
-	Tags      []byte    `json:"tags"`
-	IsPremium bool      `json:"is_premium"`
+	ID         uuid.UUID `json:"id"`
+	Slug       string    `json:"slug"`
+	Name       string    `json:"name"`
+	Tags       []byte    `json:"tags"`
+	IsPremium  bool      `json:"is_premium"`
+	PricePaise int32     `json:"price_paise"`
 }
 
-// A duplicate slug raises 23505 on templates_slug_key.
+// A duplicate slug raises 23505 on templates_slug_key; a price outside 100..1000000 raises 23514 on
+// templates_price_paise_range.
 func (q *Queries) CreateTemplate(ctx context.Context, arg CreateTemplateParams) (Template, error) {
 	row := q.db.QueryRow(ctx, createTemplate,
 		arg.ID,
@@ -58,6 +60,7 @@ func (q *Queries) CreateTemplate(ctx context.Context, arg CreateTemplateParams) 
 		arg.Name,
 		arg.Tags,
 		arg.IsPremium,
+		arg.PricePaise,
 	)
 	var i Template
 	err := row.Scan(
@@ -70,6 +73,7 @@ func (q *Queries) CreateTemplate(ctx context.Context, arg CreateTemplateParams) 
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.SortOrder,
+		&i.PricePaise,
 	)
 	return i, err
 }
@@ -133,7 +137,7 @@ func (q *Queries) DeleteTemplateVersion(ctx context.Context, arg DeleteTemplateV
 }
 
 const getTemplateAdmin = `-- name: GetTemplateAdmin :one
-SELECT id, slug, name, tags, status, is_premium, created_at, updated_at, sort_order FROM templates WHERE id = $1
+SELECT id, slug, name, tags, status, is_premium, created_at, updated_at, sort_order, price_paise FROM templates WHERE id = $1
 `
 
 func (q *Queries) GetTemplateAdmin(ctx context.Context, templateID uuid.UUID) (Template, error) {
@@ -149,6 +153,7 @@ func (q *Queries) GetTemplateAdmin(ctx context.Context, templateID uuid.UUID) (T
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.SortOrder,
+		&i.PricePaise,
 	)
 	return i, err
 }
@@ -262,7 +267,7 @@ func (q *Queries) ListTemplateVersions(ctx context.Context, templateID uuid.UUID
 }
 
 const listTemplatesAdmin = `-- name: ListTemplatesAdmin :many
-SELECT t.id, t.slug, t.name, t.tags, t.status, t.is_premium, t.created_at, t.updated_at,
+SELECT t.id, t.slug, t.name, t.tags, t.status, t.is_premium, t.price_paise, t.created_at, t.updated_at,
        v.latest_version, v.latest_published_version
 FROM templates t
 CROSS JOIN LATERAL (
@@ -282,6 +287,7 @@ type ListTemplatesAdminRow struct {
 	Tags                   []byte    `json:"tags"`
 	Status                 string    `json:"status"`
 	IsPremium              bool      `json:"is_premium"`
+	PricePaise             int32     `json:"price_paise"`
 	CreatedAt              time.Time `json:"created_at"`
 	UpdatedAt              time.Time `json:"updated_at"`
 	LatestVersion          int32     `json:"latest_version"`
@@ -305,6 +311,7 @@ func (q *Queries) ListTemplatesAdmin(ctx context.Context) ([]ListTemplatesAdminR
 			&i.Tags,
 			&i.Status,
 			&i.IsPremium,
+			&i.PricePaise,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.LatestVersion,
@@ -375,55 +382,62 @@ func (q *Queries) SetTemplateVersionAssets(ctx context.Context, arg SetTemplateV
 
 const updateTemplate = `-- name: UpdateTemplate :one
 WITH prev AS (
-    SELECT x.id, x.name, x.tags, x.status, x.is_premium FROM templates x
-    WHERE x.id = $5
+    SELECT x.id, x.name, x.tags, x.status, x.is_premium, x.price_paise FROM templates x
+    WHERE x.id = $6
     FOR NO KEY UPDATE
 )
 UPDATE templates t
 SET name = coalesce($1, t.name),
     tags = coalesce($2, t.tags),
     is_premium = coalesce($3, t.is_premium),
-    status = coalesce($4, t.status),
+    price_paise = coalesce($4, t.price_paise),
+    status = coalesce($5, t.status),
     updated_at = now()
 FROM prev
 WHERE t.id = prev.id
-  AND (coalesce($4::text, t.status) <> 'published'
+  AND (coalesce($5::text, t.status) <> 'published'
        OR EXISTS (SELECT 1 FROM template_versions tv
                   WHERE tv.template_id = t.id AND tv.published_at IS NOT NULL))
 RETURNING prev.name AS old_name, prev.tags AS old_tags, prev.status AS old_status, prev.is_premium AS old_is_premium,
-          t.id, t.slug, t.name, t.tags, t.status, t.is_premium, t.created_at, t.updated_at
+          prev.price_paise AS old_price_paise,
+          t.id, t.slug, t.name, t.tags, t.status, t.is_premium, t.price_paise, t.created_at, t.updated_at
 `
 
 type UpdateTemplateParams struct {
 	Name       *string   `json:"name"`
 	Tags       []byte    `json:"tags"`
 	IsPremium  *bool     `json:"is_premium"`
+	PricePaise *int32    `json:"price_paise"`
 	Status     *string   `json:"status"`
 	TemplateID uuid.UUID `json:"template_id"`
 }
 
 type UpdateTemplateRow struct {
-	OldName      string    `json:"old_name"`
-	OldTags      []byte    `json:"old_tags"`
-	OldStatus    string    `json:"old_status"`
-	OldIsPremium bool      `json:"old_is_premium"`
-	ID           uuid.UUID `json:"id"`
-	Slug         string    `json:"slug"`
-	Name         string    `json:"name"`
-	Tags         []byte    `json:"tags"`
-	Status       string    `json:"status"`
-	IsPremium    bool      `json:"is_premium"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	OldName       string    `json:"old_name"`
+	OldTags       []byte    `json:"old_tags"`
+	OldStatus     string    `json:"old_status"`
+	OldIsPremium  bool      `json:"old_is_premium"`
+	OldPricePaise int32     `json:"old_price_paise"`
+	ID            uuid.UUID `json:"id"`
+	Slug          string    `json:"slug"`
+	Name          string    `json:"name"`
+	Tags          []byte    `json:"tags"`
+	Status        string    `json:"status"`
+	IsPremium     bool      `json:"is_premium"`
+	PricePaise    int32     `json:"price_paise"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-// NULL leaves a field unchanged. Setting status 'published' requires a published version; no row
+// NULL leaves a field unchanged (an out-of-range price_paise raises 23514 on templates_price_paise_range).
+// Setting status 'published' requires a published version; no row
 // then (or when the template is missing), which the caller maps with CountPublishedVersions.
 func (q *Queries) UpdateTemplate(ctx context.Context, arg UpdateTemplateParams) (UpdateTemplateRow, error) {
 	row := q.db.QueryRow(ctx, updateTemplate,
 		arg.Name,
 		arg.Tags,
 		arg.IsPremium,
+		arg.PricePaise,
 		arg.Status,
 		arg.TemplateID,
 	)
@@ -433,12 +447,14 @@ func (q *Queries) UpdateTemplate(ctx context.Context, arg UpdateTemplateParams) 
 		&i.OldTags,
 		&i.OldStatus,
 		&i.OldIsPremium,
+		&i.OldPricePaise,
 		&i.ID,
 		&i.Slug,
 		&i.Name,
 		&i.Tags,
 		&i.Status,
 		&i.IsPremium,
+		&i.PricePaise,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

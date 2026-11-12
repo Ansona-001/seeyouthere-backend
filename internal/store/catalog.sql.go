@@ -64,7 +64,7 @@ func (q *Queries) GetOccasionForEvent(ctx context.Context, slug string) (Occasio
 }
 
 const getPublishedTemplateBySlug = `-- name: GetPublishedTemplateBySlug :one
-SELECT t.id, t.slug, t.name, t.is_premium, v.version, v.manifest, v.assets_path
+SELECT t.id, t.slug, t.name, t.is_premium, t.price_paise, v.version, v.manifest, v.assets_path
 FROM templates t
 JOIN LATERAL (
     SELECT tv.version, tv.manifest, tv.assets_path
@@ -88,12 +88,14 @@ type GetPublishedTemplateBySlugRow struct {
 	Slug       string    `json:"slug"`
 	Name       string    `json:"name"`
 	IsPremium  bool      `json:"is_premium"`
+	PricePaise int32     `json:"price_paise"`
 	Version    int32     `json:"version"`
 	Manifest   []byte    `json:"manifest"`
 	AssetsPath string    `json:"assets_path"`
 }
 
-// allow_premium is true only on the admin flags endpoint.
+// allow_premium is true wherever a premium template is acceptable (host editing, admin flags); false
+// keeps premium out of public/unauthenticated lookups.
 func (q *Queries) GetPublishedTemplateBySlug(ctx context.Context, arg GetPublishedTemplateBySlugParams) (GetPublishedTemplateBySlugRow, error) {
 	row := q.db.QueryRow(ctx, getPublishedTemplateBySlug, arg.Slug, arg.AllowPremium)
 	var i GetPublishedTemplateBySlugRow
@@ -102,6 +104,7 @@ func (q *Queries) GetPublishedTemplateBySlug(ctx context.Context, arg GetPublish
 		&i.Slug,
 		&i.Name,
 		&i.IsPremium,
+		&i.PricePaise,
 		&i.Version,
 		&i.Manifest,
 		&i.AssetsPath,
@@ -196,7 +199,7 @@ func (q *Queries) ListActiveOccasions(ctx context.Context) ([]Occasion, error) {
 }
 
 const listPublishedTemplates = `-- name: ListPublishedTemplates :many
-SELECT t.id, t.slug, t.name, t.tags, v.version, v.manifest, v.assets_path
+SELECT t.id, t.slug, t.name, t.tags, t.is_premium, t.price_paise, v.version, v.manifest, v.assets_path
 FROM templates t
 JOIN LATERAL (
     SELECT tv.version, tv.manifest, tv.assets_path
@@ -206,7 +209,6 @@ JOIN LATERAL (
     LIMIT 1
 ) v ON true
 WHERE t.status = 'published'
-  AND NOT t.is_premium
   AND ($1::text IS NULL
        OR t.tags @> jsonb_build_object('occasions', jsonb_build_array($1::text)))
 ORDER BY t.sort_order, t.name, t.id
@@ -218,12 +220,15 @@ type ListPublishedTemplatesRow struct {
 	Slug       string    `json:"slug"`
 	Name       string    `json:"name"`
 	Tags       []byte    `json:"tags"`
+	IsPremium  bool      `json:"is_premium"`
+	PricePaise int32     `json:"price_paise"`
 	Version    int32     `json:"version"`
 	Manifest   []byte    `json:"manifest"`
 	AssetsPath string    `json:"assets_path"`
 }
 
-// Host picker: published, non-premium templates with their latest published version.
+// Host picker: published templates (premium included, flagged with price) with their latest published
+// version. Premium templates can be picked and edited; publishing the event needs a payment grant.
 // occasion NULL lists every template. Picker order is templates.sort_order, then name.
 func (q *Queries) ListPublishedTemplates(ctx context.Context, occasion *string) ([]ListPublishedTemplatesRow, error) {
 	rows, err := q.db.Query(ctx, listPublishedTemplates, occasion)
@@ -239,6 +244,8 @@ func (q *Queries) ListPublishedTemplates(ctx context.Context, occasion *string) 
 			&i.Slug,
 			&i.Name,
 			&i.Tags,
+			&i.IsPremium,
+			&i.PricePaise,
 			&i.Version,
 			&i.Manifest,
 			&i.AssetsPath,
