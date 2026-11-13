@@ -48,6 +48,11 @@ var artRegistry = map[string]artSpec{
 	"wildflower":       {0, 0, false, false, placements("top")},
 	"wildflower_page":  {0, 0, false, false, placements("page")},
 	"daisies":          {2, 3, false, true, placements("corners", "edges")},
+	"doodles":          {2, 4, false, true, placements("scatter", "edges")},
+	"clothesline":      {3, 5, false, false, placements("top")},
+	"little_house":     {4, 6, false, false, placements("hero_top")},
+	"lovebirds":        {3, 5, false, false, placements("top_corners")},
+	"fizz":             {4, 6, false, false, placements("hero_top")},
 }
 
 // allArtPlacements is the union of every key's placements, so an unknown
