@@ -1,0 +1,96 @@
+{
+  "schema": 2,
+  "layout": "centered",
+  "hero_style": "spotlight",
+  "heading_scale": "display",
+  "background": null,
+  "palettes": [
+    {
+      "id": "bubblegum",
+      "name": "Bubblegum",
+      "colors": {
+        "background": "#F6EEE1",
+        "surface": "#FFFBF5",
+        "text": "#2B2230",
+        "muted": "#5F4F5C",
+        "accent": "#C2185B",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#C2185B",
+      "art": ["#E58AAE", "#C2185B", "#9A9CA3", "#F7C1D6", "#F6EEE1", "#E6D5C3"]
+    },
+    {
+      "id": "silver",
+      "name": "Silver",
+      "colors": {
+        "background": "#F0F0F2",
+        "surface": "#FFFFFF",
+        "text": "#1F1F26",
+        "muted": "#53535E",
+        "accent": "#3A3A46",
+        "accent_text": "#FFFFFF"
+      },
+      "accent_ink": "#3A3A46",
+      "art": ["#9A9CA3", "#C2185B", "#E58AAE", "#F7C1D6", "#F0F0F2", "#D9D9DE"]
+    }
+  ],
+  "fonts": [
+    {
+      "id": "bodoni",
+      "name": "Bodoni Moda and Josefin Sans",
+      "heading": "bodoni_moda",
+      "body": "josefin_sans",
+      "accent": "dancing_script"
+    }
+  ],
+  "defaults": {
+    "palette": "bubblegum",
+    "font": "bodoni"
+  },
+  "layers": [
+    {
+      "kind": "paper",
+      "region": "page",
+      "tone": "background",
+      "glow": "art4",
+      "glow_opacity": 0.35,
+      "vignette": "art6",
+      "vignette_opacity": 0.3
+    },
+    {
+      "kind": "art",
+      "region": "page",
+      "art": "glitterball_page",
+      "placement": "page"
+    },
+    {
+      "kind": "art",
+      "region": "page",
+      "art": "glitterball",
+      "placement": "top"
+    },
+    {
+      "kind": "texture",
+      "region": "page",
+      "texture": "cold_press",
+      "opacity": 0.3,
+      "blend": "multiply"
+    }
+  ],
+  "ornament": {
+    "hero": "none",
+    "divider": "sparkle_rule",
+    "badge": "starburst_sticker",
+    "ampersand": "none",
+    "hero_ink": "",
+    "label_ink": ""
+  },
+  "card": {
+    "style": "soft",
+    "border": "hairline",
+    "radius": 20,
+    "fields": "boxed",
+    "buttons": "accent"
+  },
+  "motion": "pop_and_settle"
+}
