@@ -64,6 +64,8 @@ services:
     environment:
       API_INTERNAL_URL: http://api:8080
       NODE_OPTIONS: --max-old-space-size=300
+      # Cloudflare Web Analytics beacon token (public, not a secret). Empty disables analytics.
+      CF_BEACON_TOKEN: ${CF_BEACON_TOKEN:-}
     depends_on: [api]
 
   postgres:
