@@ -8,7 +8,7 @@ package content
 
 // maxArtKeys is a hard cap on the art registry; theme_registry_test.go
 // enforces it so the frontend bundle of art components stays bounded.
-const maxArtKeys = 32
+const maxArtKeys = 36
 
 // artSpec describes what one art registry key accepts.
 type artSpec struct {
@@ -55,6 +55,12 @@ var artRegistry = map[string]artSpec{
 	"little_house":     {4, 6, false, false, placements("hero_top")},
 	"lovebirds":        {3, 5, false, false, placements("top_corners")},
 	"fizz":             {4, 6, false, false, placements("hero_top")},
+	"constellation":    {2, 2, false, false, placements("hero_top")},
+	"ribbon_bow":       {3, 3, false, false, placements("hero_top")},
+	"candles":          {4, 4, false, false, placements("hero_top")},
+	"mobile":           {3, 3, false, false, placements("hero_top")},
+	"lit_house":        {2, 2, false, false, placements("hero_top")},
+	"sunset":           {3, 3, false, false, placements("hero_top")},
 }
 
 // allArtPlacements is the union of every key's placements, so an unknown
@@ -143,7 +149,7 @@ var (
 	validCardBorders = fieldSet("none", "hairline", "ink", "foil", "foil_inset")
 	validCardFields  = fieldSet("boxed", "underline")
 	validCardButtons = fieldSet("accent", "foil")
-	validMotions     = fieldSet("none", "draw_on", "pop_and_settle", "foil_sheen", "sway")
+	validMotions     = fieldSet("none", "draw_on", "pop_and_settle", "foil_sheen", "sway", "lights")
 	validMusics      = fieldSet("none", "music_box")
 
 	// v1Dividers are the ornament dividers the v1 DecorationDivider renders;
