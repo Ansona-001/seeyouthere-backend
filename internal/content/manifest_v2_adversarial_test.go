@@ -290,6 +290,8 @@ func advEnumSlots() []advSlot {
 		{name: "hero_style", base: oliveS, valid: "text_only", set: advTop("hero_style"), path: "hero_style"},
 		{name: "heading_scale", base: oliveS, valid: "display", set: advTop("heading_scale"), path: "heading_scale", emptyOK: true},
 		{name: "motion", base: oliveS, valid: "draw_on", set: advTop("motion"), path: "motion", emptyOK: true},
+		{name: "music", base: oliveS, valid: "music_box", set: advTop("music"), path: "music", emptyOK: true},
+		{name: "intro", base: oliveS, valid: "wisteria", set: advTop("intro"), path: "intro", emptyOK: true},
 		// layer kinds.
 		{name: "layers0.kind", base: oliveS, valid: "paper", set: advL(0, "kind"), path: "layers[0].kind"},
 		{name: "layers1.kind", base: oliveS, valid: "texture", set: advL(1, "kind"), path: "layers[1].kind"},
@@ -750,6 +752,8 @@ func TestAdv_ArraysAndCounts(t *testing.T) {
 		{name: "ornament null accepted", fn: func(m obj) { m["ornament"] = nil }},
 		{name: "card null accepted", fn: func(m obj) { m["card"] = nil }},
 		{name: "motion null accepted", fn: func(m obj) { m["motion"] = nil }},
+		{name: "music null accepted", fn: func(m obj) { m["music"] = nil }},
+		{name: "intro null accepted", fn: func(m obj) { m["intro"] = nil }},
 		{name: "ornament hero_ink as number", fn: func(m obj) { m["ornament"].(obj)["hero_ink"] = 1 }, code: "invalid_json", path: "manifest"},
 	})
 }
@@ -1334,6 +1338,7 @@ func TestAdv_ArtRegistryMatrix(t *testing.T) {
 		"lit_house":        {2, 2, false, false, []string{"hero_top"}},
 		"sunset":           {3, 3, false, false, []string{"hero_top"}},
 		"mimosa":           {0, 0, false, false, []string{"top"}},
+		"wisteria":         {0, 0, false, false, []string{"top"}},
 		"autumn":           {0, 0, false, false, []string{"top"}},
 		"autumn_page":      {0, 0, false, false, []string{"page"}},
 		"marigold":         {0, 0, false, false, []string{"top"}},
@@ -1715,6 +1720,9 @@ func TestAdv_SchemaMatrix(t *testing.T) {
 		v1With("card", obj{}),
 		v1With("motion", "draw_on"),
 		v1With("motion", "x"),
+		v1With("music", "music_box"),
+		v1With("intro", "wisteria"),
+		v1With("intro", "x"),
 		{name: "schema 1 + palette accent_ink", base: func() obj { return validManifestMap() }, fn: func(m obj) { palAt(m, 0)["accent_ink"] = "#000000" }, code: "schema_mismatch", path: "palettes[0]"},
 		{name: "schema 1 + palette art", base: func() obj { return validManifestMap() }, fn: func(m obj) { palAt(m, 0)["art"] = []string{"#000000"} }, code: "schema_mismatch", path: "palettes[0]"},
 		{name: "schema 1 + palette foil", base: func() obj { return validManifestMap() }, fn: func(m obj) { palAt(m, 0)["foil"] = []string{"#000000"} }, code: "schema_mismatch", path: "palettes[0]"},
@@ -2153,6 +2161,7 @@ func TestAdv_AllowlistsMatchSpec(t *testing.T) {
 		{"card buttons", validCardButtons, []string{"accent", "foil"}},
 		{"motions", validMotions, []string{"none", "draw_on", "pop_and_settle", "foil_sheen", "sway", "lights"}},
 		{"musics", validMusics, []string{"none", "music_box"}},
+		{"intros", validIntros, []string{"none", "wisteria"}},
 		{"v1 dividers", v1Dividers, []string{"none", "line", "floral", "dots", "heart"}},
 	}
 	for _, s := range sets {
@@ -2439,6 +2448,9 @@ func advVariants(tb testing.TB) []advVariant {
 	}
 	for _, v := range advSortedKeys(validMusics) {
 		add("music/"+v, func(m obj) { m["music"] = v })
+	}
+	for _, v := range advSortedKeys(validIntros) {
+		add("intro/"+v, func(m obj) { m["intro"] = v })
 	}
 	for _, v := range advSortedKeys(validHeroOrnaments) {
 		add("ornament.hero/"+v, func(m obj) { m["ornament"].(obj)["hero"] = v })

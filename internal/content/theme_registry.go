@@ -41,6 +41,7 @@ var artRegistry = map[string]artSpec{
 	"sparkles":         {1, 2, true, true, placements("scatter", "hero")},
 	"printers_corners": {1, 1, true, false, placements("corners")},
 	"mimosa":           {0, 0, false, false, placements("top")},
+	"wisteria":         {0, 0, false, false, placements("top")},
 	"autumn":           {0, 0, false, false, placements("top")},
 	"autumn_page":      {0, 0, false, false, placements("page")},
 	"marigold":         {0, 0, false, false, placements("top")},
@@ -151,6 +152,7 @@ var (
 	validCardButtons = fieldSet("accent", "foil")
 	validMotions     = fieldSet("none", "draw_on", "pop_and_settle", "foil_sheen", "sway", "lights")
 	validMusics      = fieldSet("none", "music_box")
+	validIntros      = fieldSet("none", "wisteria")
 
 	// v1Dividers are the ornament dividers the v1 DecorationDivider renders;
 	// the fallback v1 `decoration` of a v2 theme is the divider if it is one.

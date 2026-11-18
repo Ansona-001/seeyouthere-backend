@@ -132,6 +132,9 @@ func assertThemeSafe(t *testing.T, th Theme) {
 	if th.Music != "" {
 		enum("music", th.Music, validMusics)
 	}
+	if th.Intro != "" {
+		enum("intro", th.Intro, validIntros)
+	}
 	enum("layout", th.Layout, validLayouts)
 	enum("hero_style", th.HeroStyle, validHeroStyleV2)
 	enum("decoration", th.Decoration, v1Dividers)
@@ -356,7 +359,7 @@ func TestResolveThemeV2_JSONShape(t *testing.T) {
 	// A v1 theme carries none of the engine-2 keys.
 	v1, _ := ValidateManifest(mustJSON(t, validManifestMap()))
 	b, _ = json.Marshal(ResolveTheme(v1, nil, ""))
-	for _, k := range []string{`"engine"`, `"layers"`, `"art"`, `"foil"`, `"ornament"`, `"card"`, `"motion"`} {
+	for _, k := range []string{`"engine"`, `"layers"`, `"art"`, `"foil"`, `"ornament"`, `"card"`, `"motion"`, `"intro"`} {
 		if strings.Contains(string(b), k) {
 			t.Errorf("v1 theme JSON contains %s: %s", k, b)
 		}
@@ -417,5 +420,32 @@ func TestResolveThemeV2_OrnamentDate(t *testing.T) {
 	b, _ = json.Marshal(ResolveTheme(m, nil, ""))
 	if strings.Contains(string(b), `"date"`) {
 		t.Errorf("empty ornament.date must be omitted: %s", b)
+	}
+}
+
+func TestResolveThemeV2_Intro(t *testing.T) {
+	seeds := loadV2Seeds(t)
+	tests := []struct {
+		slug, want string
+	}{
+		{"wisteria", "wisteria"},
+		{"olive-grove", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.slug, func(t *testing.T) {
+			m, err := ValidateManifest(seeds[tc.slug])
+			if err != nil {
+				t.Fatal(err)
+			}
+			th := ResolveTheme(m, nil, "")
+			if th.Intro != tc.want {
+				t.Errorf("Intro = %q, want %q", th.Intro, tc.want)
+			}
+			assertThemeSafe(t, th)
+			b, _ := json.Marshal(th)
+			if has := strings.Contains(string(b), `"intro"`); has != (tc.want != "") {
+				t.Errorf(`"intro" in theme JSON = %v, want %v: %s`, has, tc.want != "", b)
+			}
+		})
 	}
 }

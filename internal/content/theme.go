@@ -35,6 +35,7 @@ type Theme struct {
 	Card     *Card     `json:"card,omitempty"`
 	Motion   string    `json:"motion,omitempty"`
 	Music    string    `json:"music,omitempty"`
+	Intro    string    `json:"intro,omitempty"`
 }
 
 type ThemeFonts struct {
@@ -117,6 +118,7 @@ func resolveV2(t *Theme, m Manifest, p Palette, backgroundSrc string, open bool)
 	t.Foil = append([]string(nil), p.Foil...)
 	t.Motion = m.Motion
 	t.Music = m.Music
+	t.Intro = m.Intro
 
 	var o Ornament
 	var c Card

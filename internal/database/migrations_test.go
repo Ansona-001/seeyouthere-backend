@@ -2236,3 +2236,265 @@ func TestMigration00040_LineAndLightTemplates(t *testing.T) {
 	}
 	checkSeeded()
 }
+
+// TestMigration00041_WisteriaTemplate applies migrations up to 41 and checks the Wisteria draft template:
+// id, name, status, sort_order, free and tags, one published v1 whose stored manifest validates, equals its
+// testdata file and carries the intro and music fields, and that it stays out of the host picker. It then
+// runs 00041's Down (both rows go, the immutable trigger is re-enabled) and applies Up again.
+func TestMigration00041_WisteriaTemplate(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 40); err != nil {
+		t.Fatalf("migrate to 40: %v", err)
+	}
+	var before int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates").Scan(&before); err != nil {
+		t.Fatalf("count templates: %v", err)
+	}
+	if _, err := provider.UpTo(ctx, 41); err != nil {
+		t.Fatalf("migrate to 41: %v", err)
+	}
+
+	cases := []struct {
+		slug, id, name, tags string
+		sortOrder            int32
+	}{
+		{"wisteria", "01926a00-0000-7000-8000-000000000022", "Wisteria", `{"occasions": ["wedding", "engagement"]}`, 17},
+	}
+	checkSeeded := func() {
+		t.Helper()
+		for _, c := range cases {
+			var (
+				id, name, status, tags string
+				sortOrder              int32
+				premium                bool
+			)
+			err := pool.QueryRow(ctx, `SELECT id::text, name, status, tags::text, sort_order, is_premium
+				FROM templates WHERE slug = $1`, c.slug).Scan(&id, &name, &status, &tags, &sortOrder, &premium)
+			if err != nil {
+				t.Errorf("%s: read template: %v", c.slug, err)
+				continue
+			}
+			if id != c.id || name != c.name || status != "draft" || sortOrder != c.sortOrder || premium || tags != c.tags {
+				t.Errorf("%s: id=%s name=%q status=%s sort_order=%d premium=%v tags=%s, want id=%s name=%q draft sort_order=%d not premium tags=%s",
+					c.slug, id, name, status, sortOrder, premium, tags, c.id, c.name, c.sortOrder, c.tags)
+			}
+
+			var (
+				manifest  []byte
+				version   int
+				published bool
+				assets    string
+				size      int
+			)
+			err = pool.QueryRow(ctx, `SELECT version, manifest, published_at IS NOT NULL, assets_path, pg_column_size(manifest)
+				FROM template_versions WHERE template_id = $1`, id).Scan(&version, &manifest, &published, &assets, &size)
+			if err != nil { // also fails if there is more than one version
+				t.Errorf("%s: read version: %v", c.slug, err)
+				continue
+			}
+			if version != 1 || !published || assets != "" || size > 32768 {
+				t.Errorf("%s: version=%d published=%v assets_path=%q manifest size=%d, want v1 published, no assets, <= 32768", c.slug, version, published, assets, size)
+			}
+			m, err := content.ValidateManifest(manifest)
+			if err != nil {
+				t.Errorf("%s: ValidateManifest: %v", c.slug, err)
+				continue
+			}
+			if m.Schema != 2 || len(m.Palettes) == 0 || len(m.Fonts) == 0 {
+				t.Errorf("%s: manifest schema=%d palettes=%d fonts=%d, want schema 2 with palettes and fonts", c.slug, m.Schema, len(m.Palettes), len(m.Fonts))
+			}
+			if m.Intro != "wisteria" || m.Music != "music_box" {
+				t.Errorf("%s: intro=%q music=%q, want wisteria and music_box", c.slug, m.Intro, m.Music)
+			}
+			if th := content.ResolveTheme(m, nil, ""); th.Intro != "wisteria" {
+				t.Errorf("%s: resolved intro = %q, want wisteria", c.slug, th.Intro)
+			}
+			for _, p := range m.Palettes {
+				for _, f := range m.Fonts {
+					overrides := fmt.Sprintf(`{"palette":%q,"font":%q}`, p.ID, f.ID)
+					th := content.ResolveTheme(m, []byte(overrides), "")
+					if th.Engine != 2 || th.Palette != p.Colors || th.Fonts.Heading != f.Heading || th.Fonts.Body != f.Body {
+						t.Errorf("%s: ResolveTheme(%s, %s) = engine %d %+v, want engine 2 with that palette and font pair", c.slug, p.ID, f.ID, th.Engine, th)
+					}
+				}
+			}
+
+			want, err := os.ReadFile("../content/testdata/themes_v2/" + c.slug + ".json")
+			if err != nil {
+				t.Errorf("%s: read testdata: %v", c.slug, err)
+				continue
+			}
+			var gotJSON, wantJSON any
+			if err := json.Unmarshal(manifest, &gotJSON); err != nil {
+				t.Errorf("%s: decode stored manifest: %v", c.slug, err)
+			} else if err := json.Unmarshal(want, &wantJSON); err != nil {
+				t.Errorf("%s: decode testdata: %v", c.slug, err)
+			} else if !reflect.DeepEqual(gotJSON, wantJSON) {
+				t.Errorf("%s: stored manifest differs from testdata/themes_v2/%s.json", c.slug, c.slug)
+			}
+		}
+
+		var templates int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates").Scan(&templates); err != nil || templates != before+len(cases) {
+			t.Errorf("templates = %d (err %v), want %d", templates, err, before+len(cases))
+		}
+		// Drafts stay out of the public catalog.
+		for _, slug := range pickerSlugs(ctx, t, pool) {
+			for _, c := range cases {
+				if slug == c.slug {
+					t.Errorf("draft template %s is listed in the public picker", slug)
+				}
+			}
+		}
+	}
+	checkSeeded()
+
+	if _, err := provider.DownTo(ctx, 40); err != nil {
+		t.Fatalf("down to 40: %v", err)
+	}
+	for _, c := range cases {
+		var left int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates WHERE id = $1 OR slug = $2", c.id, c.slug).Scan(&left); err != nil || left != 0 {
+			t.Errorf("%s templates after Down = %d (err %v), want 0", c.slug, left, err)
+		}
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions WHERE template_id = $1", c.id).Scan(&left); err != nil || left != 0 {
+			t.Errorf("%s versions after Down = %d (err %v), want 0", c.slug, left, err)
+		}
+	}
+	var left int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates").Scan(&left); err != nil || left != before {
+		t.Errorf("templates after Down = %d (err %v), want %d", left, err, before)
+	}
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+
+	if _, err := provider.UpTo(ctx, 41); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	checkSeeded()
+}
+
+// TestMigration00042_WisteriaLeafPalette applies migrations up to 41, then checks that
+// 00042 gives Wisteria exactly one new published version (previous latest + 1) whose palettes put the names in
+// leaf green, that only `palettes` changed, that the manifest validates (contrast included) and resolves the green
+// as the hero ink, that no other template got a version, and that Down removes only that version and Up can run again.
+func TestMigration00042_WisteriaLeafPalette(t *testing.T) {
+	const leaf = "#3F5236"
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 41); err != nil {
+		t.Fatalf("migrate to 41: %v", err)
+	}
+	versionCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions").Scan(&n); err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		return n
+	}
+	latest := func() (version int, manifest []byte, published bool) {
+		t.Helper()
+		err := pool.QueryRow(ctx, `SELECT v.version, v.manifest, v.published_at IS NOT NULL
+			FROM template_versions v JOIN templates t ON t.id = v.template_id
+			WHERE t.slug = 'wisteria' ORDER BY v.version DESC LIMIT 1`).Scan(&version, &manifest, &published)
+		if err != nil {
+			t.Fatalf("read wisteria latest version: %v", err)
+		}
+		return version, manifest, published
+	}
+	before := versionCount()
+	prevVersion, prevManifest, _ := latest()
+	if _, err := provider.UpTo(ctx, 42); err != nil {
+		t.Fatalf("migrate to 42: %v", err)
+	}
+
+	check := func() {
+		t.Helper()
+		if got := versionCount(); got != before+1 {
+			t.Errorf("versions = %d, want %d (only wisteria gets one)", got, before+1)
+		}
+		version, manifest, published := latest()
+		if version != prevVersion+1 || !published {
+			t.Errorf("wisteria latest = v%d published=%v, want v%d published", version, published, prevVersion+1)
+		}
+		m, err := content.ValidateManifest(manifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest: %v", err)
+		}
+		old, err := content.ValidateManifest(prevManifest)
+		if err != nil {
+			t.Fatalf("ValidateManifest(previous): %v", err)
+		}
+		if old.Palettes[0].Art[3] == leaf {
+			t.Errorf("previous version was modified: art4 = %q", old.Palettes[0].Art[3])
+		}
+		if len(m.Palettes) != len(old.Palettes) || m.Defaults != old.Defaults || len(m.Fonts) != len(old.Fonts) {
+			t.Fatalf("palette/font ids changed: %+v vs %+v", m.Defaults, old.Defaults)
+		}
+		for i := range m.Palettes {
+			if m.Palettes[i].ID != old.Palettes[i].ID {
+				t.Errorf("palette %d id = %q, want %q", i, m.Palettes[i].ID, old.Palettes[i].ID)
+			}
+		}
+		// Everything but palettes, layers, ornament and card is carried over unchanged.
+		var a, b map[string]json.RawMessage
+		if err := json.Unmarshal(manifest, &a); err != nil {
+			t.Fatalf("unmarshal manifest: %v", err)
+		}
+		if err := json.Unmarshal(prevManifest, &b); err != nil {
+			t.Fatalf("unmarshal previous manifest: %v", err)
+		}
+		for _, k := range []string{"palettes", "layers", "ornament", "card"} {
+			delete(a, k)
+			delete(b, k)
+		}
+		if !reflect.DeepEqual(a, b) {
+			t.Errorf("fields other than palettes, layers, ornament and card changed")
+		}
+		// No rules or boxes: the frame layer is gone (the other layers keep their order), cards are open and
+		// borderless, the date has no bars, the divider is the leafy sprig and the card-edge seal is gone.
+		var kinds, oldKinds []string
+		for _, l := range m.Layers {
+			kinds = append(kinds, l.Kind)
+		}
+		for _, l := range old.Layers {
+			if l.Kind != "frame" {
+				oldKinds = append(oldKinds, l.Kind)
+			}
+		}
+		if !reflect.DeepEqual(kinds, oldKinds) || len(kinds) != len(old.Layers)-1 {
+			t.Errorf("layer kinds = %v, want %v (previous without its one frame)", kinds, oldKinds)
+		}
+		if m.Card.Style != "open" || m.Card.Border != "none" || m.Card.Fields != old.Card.Fields || m.Card.Buttons != old.Card.Buttons {
+			t.Errorf("card = %+v, want open, no border, fields and buttons unchanged", m.Card)
+		}
+		if o := m.Ornament; o.Date != "" || o.Divider != "olive_sprig" || o.Badge != "none" ||
+			o.Ampersand != old.Ornament.Ampersand || o.HeroInk != old.Ornament.HeroInk || o.LabelInk != old.Ornament.LabelInk {
+			t.Errorf("ornament = %+v, want no date, olive_sprig divider, no badge, the rest unchanged", o)
+		}
+		if th := content.ResolveTheme(m, nil, ""); th.Ornament == nil || th.Ornament.HeroInk != leaf {
+			t.Errorf("resolved hero_ink = %+v, want %s", th.Ornament, leaf)
+		}
+	}
+	check()
+
+	if _, err := provider.DownTo(ctx, 41); err != nil {
+		t.Fatalf("down to 41: %v", err)
+	}
+	if got := versionCount(); got != before {
+		t.Errorf("versions after Down = %d, want %d", got, before)
+	}
+	if v, _, _ := latest(); v != prevVersion {
+		t.Errorf("wisteria latest after Down = v%d, want v%d", v, prevVersion)
+	}
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+	if _, err := provider.UpTo(ctx, 42); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	check()
+}

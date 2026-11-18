@@ -341,6 +341,8 @@ func TestManifestV2_SchemaMismatchFromV1(t *testing.T) {
 		{"ornament", func(m obj) { m["ornament"] = obj{} }, "ornament"},
 		{"card", func(m obj) { m["card"] = obj{} }, "card"},
 		{"motion", func(m obj) { m["motion"] = "none" }, "motion"},
+		{"music", func(m obj) { m["music"] = "music_box" }, "music"},
+		{"intro", func(m obj) { m["intro"] = "wisteria" }, "intro"},
 		{"palette foil", func(m obj) { m["palettes"].([]any)[0].(obj)["foil"] = []string{"#111111", "#222222", "#333333"} }, "palettes[0]"},
 		{"palette art", func(m obj) { m["palettes"].([]any)[0].(obj)["art"] = []string{"#111111"} }, "palettes[0]"},
 		{"palette accent_ink", func(m obj) { m["palettes"].([]any)[0].(obj)["accent_ink"] = "#111111" }, "palettes[0]"},
@@ -515,6 +517,8 @@ func TestManifestV2_OrnamentCardMotion(t *testing.T) {
 		{name: "motion unknown", fn: func(m obj) { m["motion"] = "wobble" }, code: "invalid_value", path: "motion"},
 		{name: "music unknown", fn: func(m obj) { m["music"] = "jukebox" }, code: "invalid_value", path: "music"},
 		{name: "music number", fn: func(m obj) { m["music"] = 1 }, code: "invalid_json"},
+		{name: "intro unknown", fn: func(m obj) { m["intro"] = "curtain" }, code: "invalid_value", path: "intro"},
+		{name: "intro number", fn: func(m obj) { m["intro"] = 1 }, code: "invalid_json"},
 	})
 }
 
@@ -690,6 +694,7 @@ func TestManifestV2_HostileStrings(t *testing.T) {
 		"card.style":     func(m obj, v string) { m["card"].(obj)["style"] = v },
 		"card.border":    func(m obj, v string) { m["card"].(obj)["border"] = v },
 		"motion":         func(m obj, v string) { m["motion"] = v },
+		"intro":          func(m obj, v string) { m["intro"] = v },
 		"layout":         func(m obj, v string) { m["layout"] = v },
 		"hero_style":     func(m obj, v string) { m["hero_style"] = v },
 		"font heading":   func(m obj, v string) { m["fonts"].([]any)[0].(obj)["heading"] = v },
@@ -698,7 +703,7 @@ func TestManifestV2_HostileStrings(t *testing.T) {
 		for i, v := range hostile {
 			// "" is the default for the optional slots (ornament/card/motion),
 			// so it is not an error there.
-			if v == "" && (strings.HasPrefix(slot, "ornament.") || strings.HasPrefix(slot, "card.") || slot == "motion") {
+			if v == "" && (strings.HasPrefix(slot, "ornament.") || strings.HasPrefix(slot, "card.") || slot == "motion" || slot == "intro") {
 				continue
 			}
 			t.Run(fmt.Sprintf("%s/%d", slot, i), func(t *testing.T) {
@@ -821,8 +826,8 @@ func TestArtRegistry(t *testing.T) {
 	if n := len(artRegistry); n > maxArtKeys {
 		t.Fatalf("art registry has %d keys, hard cap is %d", n, maxArtKeys)
 	}
-	if len(artRegistry) != 34 {
-		t.Errorf("art registry has %d keys, spec lists 34", len(artRegistry))
+	if len(artRegistry) != 35 {
+		t.Errorf("art registry has %d keys, spec lists 35", len(artRegistry))
 	}
 	for key, spec := range artRegistry {
 		t.Run(key, func(t *testing.T) {
@@ -908,7 +913,7 @@ func TestManifestV1_UnchangedByV2(t *testing.T) {
 		t.Fatal(err)
 	}
 	canon, _ := json.Marshal(m)
-	for _, key := range []string{`"layers"`, `"ornament"`, `"card"`, `"motion"`, `"accent_ink"`, `"art"`, `"foil"`} {
+	for _, key := range []string{`"layers"`, `"ornament"`, `"card"`, `"motion"`, `"music"`, `"intro"`, `"accent_ink"`, `"art"`, `"foil"`} {
 		if strings.Contains(string(canon), key) {
 			t.Errorf("v1 canonical form contains %s: %s", key, canon)
 		}

@@ -9,7 +9,7 @@ import (
 )
 
 // Manifest is a template version's design definition: schema 1 (flat theme
-// knobs) or schema 2 (theme engine v2: layers, ornament, card, motion). The
+// knobs) or schema 2 (theme engine v2: layers, ornament, card, motion, music, intro). The
 // schema-2 fields are all omitempty so a schema-1 manifest's canonical bytes
 // are unchanged; decoration, surface and texture are omitempty because a
 // schema-2 manifest must not carry them (schema 1 always has all three).
@@ -35,6 +35,7 @@ type Manifest struct {
 	Card     *Card     `json:"card,omitempty"`
 	Motion   string    `json:"motion,omitempty"`
 	Music    string    `json:"music,omitempty"`
+	Intro    string    `json:"intro,omitempty"`
 }
 
 type Palette struct {
