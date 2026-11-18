@@ -488,6 +488,111 @@ func TestBuildInitialContent_RequiredAnswerMissing(t *testing.T) {
 	}
 }
 
+func TestBuildInitialContent_FromToDates(t *testing.T) {
+	occ := sampleOccasion(t)
+	occ.SetupQuestions = []SetupQuestion{
+		{Key: "title", Label: "Event name", Type: "text", Required: true, Target: "title_var"},
+		{Key: "from", Label: "From", Type: "date_time", Required: true, Target: "datetime.start_local"},
+		{Key: "to", Label: "To", Type: "date_time", Required: true, Target: "datetime.end_local"},
+	}
+	occ.Copy.TitleTemplate = "{title}"
+
+	t.Run("range is written to the date block", func(t *testing.T) {
+		raw, err := BuildInitialContent(occ, map[string]string{
+			"title": "Annual awards", "from": "2027-09-10T18:00", "to": "2027-09-12T21:00",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var blocks []map[string]any
+		if err := json.Unmarshal(raw, &blocks); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		for _, b := range blocks {
+			if b["type"] != "datetime" {
+				continue
+			}
+			if b["start_local"] != "2027-09-10T18:00" || b["end_local"] != "2027-09-12T21:00" {
+				t.Errorf("datetime = %v / %v, want 2027-09-10T18:00 / 2027-09-12T21:00", b["start_local"], b["end_local"])
+			}
+			return
+		}
+		t.Fatal("no datetime block in built content")
+	})
+
+	for name, answers := range map[string]map[string]string{
+		"end before start": {"title": "Annual awards", "from": "2027-09-12T18:00", "to": "2027-09-10T18:00"},
+		"end equals start": {"title": "Annual awards", "from": "2027-09-12T18:00", "to": "2027-09-12T18:00"},
+		"range over 14 d":  {"title": "Annual awards", "from": "2027-09-01T18:00", "to": "2027-09-30T18:00"},
+		"end not a date":   {"title": "Annual awards", "from": "2027-09-12T18:00", "to": "tomorrow"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := BuildInitialContent(occ, answers); !hasIssueCode(err, "invalid_range") && !hasIssueCode(err, "invalid_datetime") {
+				t.Fatalf("expected invalid_range or invalid_datetime, got %v", err)
+			}
+		})
+	}
+
+	t.Run("missing end is required", func(t *testing.T) {
+		if _, err := BuildInitialContent(occ, map[string]string{"title": "Annual awards", "from": "2027-09-12T18:00"}); !hasIssueCode(err, "required") {
+			t.Fatalf("expected required, got %v", err)
+		}
+	})
+}
+
+func TestBuildInitialContent_OptionalFromTo(t *testing.T) {
+	occ := sampleOccasion(t)
+	occ.SetupQuestions = []SetupQuestion{
+		{Key: "title", Label: "Event name", Type: "text", Required: true, Target: "title_var"},
+		{Key: "from", Label: "Date and time", Type: "date_time", Target: "datetime.start_local"},
+		{Key: "to", Label: "To", Type: "date_time", Target: "datetime.end_local"},
+	}
+	occ.Copy.TitleTemplate = "{title}"
+
+	datetimeOf := func(t *testing.T, raw json.RawMessage) map[string]any {
+		t.Helper()
+		var blocks []map[string]any
+		if err := json.Unmarshal(raw, &blocks); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		for _, b := range blocks {
+			if b["type"] == "datetime" {
+				return b
+			}
+		}
+		t.Fatal("no datetime block in built content")
+		return nil
+	}
+
+	t.Run("no dates keeps the placeholder", func(t *testing.T) {
+		raw, err := BuildInitialContent(occ, map[string]string{"title": "Annual awards"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if dt := datetimeOf(t, raw); dt["end_local"] != "" {
+			t.Errorf("end_local = %v, want empty", dt["end_local"])
+		}
+	})
+
+	t.Run("a single date has no end", func(t *testing.T) {
+		raw, err := BuildInitialContent(occ, map[string]string{"title": "Annual awards", "from": "2027-09-10T18:00"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		dt := datetimeOf(t, raw)
+		if dt["start_local"] != "2027-09-10T18:00" || dt["end_local"] != "" {
+			t.Errorf("datetime = %v / %v, want 2027-09-10T18:00 / empty", dt["start_local"], dt["end_local"])
+		}
+	})
+
+	t.Run("an end without a start is rejected", func(t *testing.T) {
+		_, err := BuildInitialContent(occ, map[string]string{"title": "Annual awards", "to": "2027-09-12T21:00"})
+		if !hasIssueCode(err, "requires_start") {
+			t.Fatalf("expected requires_start, got %v", err)
+		}
+	})
+}
+
 func TestSaved_EffectiveEnd(t *testing.T) {
 	start := time.Date(2027, 6, 1, 18, 0, 0, 0, time.UTC)
 	end := start.Add(4 * time.Hour)

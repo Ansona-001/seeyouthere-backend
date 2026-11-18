@@ -32,7 +32,7 @@ type Copy struct {
 // setupQuestionTargets is where a setup answer is written: either into the
 // title template (title_var) or directly onto a field of a default block.
 var setupQuestionTargets = map[string]bool{
-	"title_var": true, "datetime.start_local": true, "datetime.timezone": true,
+	"title_var": true, "datetime.start_local": true, "datetime.end_local": true, "datetime.timezone": true,
 	"location.name": true, "location.address": true, "hero.subtitle": true,
 }
 
@@ -136,6 +136,7 @@ func BuildInitialContent(occ Occasion, answers map[string]string) (json.RawMessa
 
 	title := occ.Copy.TitleTemplate
 	sets := make(map[string]string, len(occ.SetupQuestions))
+	setKeys := make(map[string]string, len(occ.SetupQuestions)) // target -> question key, for error paths
 	iss := &issues{}
 	for _, q := range occ.SetupQuestions {
 		raw, present := answers[q.Key]
@@ -154,6 +155,13 @@ func BuildInitialContent(occ Occasion, answers map[string]string) (json.RawMessa
 			title = strings.ReplaceAll(title, "{"+q.Key+"}", capitalizeFirst(ans))
 		} else {
 			sets[q.Target] = ans
+			setKeys[q.Target] = q.Key
+		}
+	}
+	// An end without a start would be checked against the occasion's placeholder date, so ask for the start.
+	if _, hasEnd := sets["datetime.end_local"]; hasEnd {
+		if _, hasStart := sets["datetime.start_local"]; !hasStart {
+			iss.add("answers."+setKeys["datetime.end_local"], "requires_start", "Add a start date and time as well.")
 		}
 	}
 	if err := iss.err(); err != nil {
@@ -175,6 +183,9 @@ func BuildInitialContent(occ Occasion, answers map[string]string) (json.RawMessa
 		case "datetime":
 			if v, ok := sets["datetime.start_local"]; ok {
 				b["start_local"] = v
+			}
+			if v, ok := sets["datetime.end_local"]; ok {
+				b["end_local"] = v
 			}
 			if v, ok := sets["datetime.timezone"]; ok {
 				b["timezone"] = v
