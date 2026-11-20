@@ -50,7 +50,7 @@ func newMediaTestFixtureBlobs(t *testing.T, pool *pgxpool.Pool, rdb *redis.Clien
 	f.s.media = mediaStore
 	f.s.images = media.NewProcessor(1)
 	f.s.tokens = tokens
-	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, f.s.q, mediaStore, tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes)
+	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, f.s.q, mediaStore, tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes, 1000)
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}

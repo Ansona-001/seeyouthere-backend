@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,12 +27,18 @@ import (
 var validAttending = map[string]bool{"yes": true, "no": true, "maybe": true}
 
 // maxRSVPConfirmationsPerEventPerDay bounds send_rsvp_confirmation per event
-// per UTC day: an open event with no invite gate can otherwise be used to
-// mail arbitrary addresses at volume (the per-IP/per-event write caps allow
-// far more RSVPs than any legitimate event needs confirmation emails for),
-// none of which counts toward the per-recipient cap in internal/jobs/rsvps.go
-// or MAIL_DAILY_INVITE_CAP.
-const maxRSVPConfirmationsPerEventPerDay = 200
+// per UTC day for an open RSVP on an invite event: an open event can
+// otherwise be used to mail arbitrary addresses at volume (the per-IP/per-event
+// write caps allow far more RSVPs than any legitimate event needs confirmation
+// emails for), none of which counts toward the per-recipient cap in
+// internal/jobs/rsvps.go. Over it the enqueue is skipped. Registrations on a
+// hosted event are counted by the worker instead, which defers rather than
+// drops them (jobs.MaxRegistrationConfirmationsPerEventPerDay).
+const maxRSVPConfirmationsPerEventPerDay = 2000
+
+// maxRegistrationsPerEvent is the hard bound on open registrations of one hosted event, checked
+// under the event lock: the shared public link is the only gate, so it must not grow without limit.
+const maxRegistrationsPerEvent = 5000
 
 var (
 	// errRSVPClosed covers every "no new commitment accepted" case: no rsvp
@@ -42,6 +50,18 @@ var (
 	errRSVPClosed       = errors.New("rsvp closed")
 	errPartyTooLarge    = errors.New("party too large")
 	errRSVPEditConflict = errors.New("rsvp edit token invalidated concurrently")
+
+	// Hosted-event registrations. The email is the identity of a registration: it is locked after the
+	// first save, and once the pass has been used at the door the registration is frozen.
+	errRegistrationEmailLocked = errors.New("registration email cannot change")
+	errRegistrationCheckedIn   = errors.New("registration already checked in")
+
+	// errRegistrationUnavailable replaces errRSVPClosed and errRSVPCapacityReached for a new
+	// registration attempt (hosted, no invite cookie, no RSVP cookie): an email that already holds a
+	// registration or a guest-list slot is answered 202 before those checks run, so a 409 here
+	// would tell the requester that their email is new. It is answered with the same 202 as every
+	// other registration attempt; nothing is created and nothing is mailed.
+	errRegistrationUnavailable = errors.New("registration unavailable")
 )
 
 // errRSVPCapacityReached carries the remaining spots for the 409's details.
@@ -94,10 +114,12 @@ func (s *Server) handleListRSVPs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such event.")
 		return
 	}
-	_, userID, ok := s.loadRSVPEvent(w, r, eventID)
+	row, userID, ok := s.loadRSVPEvent(w, r, eventID)
 	if !ok {
 		return
 	}
+	// Viewers are door staff: they see who responded, not contact details or answers.
+	seesContacts := row.Role == "owner" || row.Role == "editor"
 
 	var attendingFilter *string
 	if v := r.URL.Query().Get("attending"); v != "" {
@@ -128,10 +150,13 @@ func (s *Server) handleListRSVPs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	items := make([]rsvpResp, len(rows))
-	for i, row := range rows {
+	for i, rr := range rows {
 		items[i] = rsvpResp{
-			ID: row.ID, Name: row.Name, Email: row.Email, Attending: row.Attending, Count: row.Count,
-			Answers: row.Answers, GuestID: row.GuestID, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+			ID: rr.ID, Name: rr.Name, Email: rr.Email, Attending: rr.Attending, Count: rr.Count,
+			Answers: rr.Answers, GuestID: rr.GuestID, CreatedAt: rr.CreatedAt, UpdatedAt: rr.UpdatedAt,
+		}
+		if !seesContacts {
+			items[i].Email, items[i].Answers = nil, nil
 		}
 	}
 	var nextCursor *string
@@ -294,7 +319,7 @@ func (s *Server) handleExportRSVPsCSV(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such event.")
 		return
 	}
-	row, userID, ok := s.loadRSVPEvent(w, r, eventID)
+	row, userID, ok := s.requireRSVPWriteRole(w, r, eventID)
 	if !ok {
 		return
 	}
@@ -485,6 +510,8 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 			[]content.Issue{{Path: "email", Code: "invalid", Message: "Enter a valid email address."}})
 		return
 	}
+	// A hosted event's open RSVP is a registration, keyed by email: it is how the pass is sent back.
+	hosted := row.Kind == "hosted"
 	// attending = "no" forces count = 0 (§4.4); otherwise at least one head.
 	count := body.Count
 	if body.Attending == "no" {
@@ -509,6 +536,21 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 		openTok, hasOpenTok = s.checkRSVPCookie(ctx, r, eventID)
 	}
 
+	// Without an invite cookie a hosted RSVP is a registration, which needs an email. Registrations are
+	// mailed to arbitrary addresses, so cap them per address per event on top of the IP and event
+	// limits. The key holds a hash, never the address.
+	if hosted && !hasGuest {
+		if email == nil {
+			writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the highlighted fields.",
+				[]content.Issue{{Path: "email", Code: "required", Message: "Enter your email address."}})
+			return
+		}
+		sum := sha256.Sum256([]byte(*email))
+		if !s.allow(w, r, limit{"rsvp:email_event:" + hex.EncodeToString(sum[:]) + ":" + eventID.String(), 5, time.Hour}) {
+			return
+		}
+	}
+
 	if hasGuest && count > guest.HouseholdSize {
 		writeError(w, http.StatusBadRequest, "party_too_large", "That's more than this household's invite allows.")
 		return
@@ -516,6 +558,10 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 
 	var result rsvpWriteResult
 	var newOpenRSVP bool
+	// existingEmail is set when the email already holds a registration or a guest-list slot: the
+	// transaction then commits (the confirmation job for an existing registration must persist) and
+	// the handler answers exactly as for a new registration, revealing nothing about the existing row.
+	var existingEmail bool
 	err := s.inTx(ctx, func(tx pgx.Tx, q *store.Queries) error {
 		locked, err := q.LockEventForRSVP(ctx, eventID)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -556,7 +602,7 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 		var existingID uuid.UUID
 		var existingAttending string
 		var existingCount int32
-		var existingEmail *string
+		var prevEmail *string
 		isNew := true
 		switch {
 		case hasGuest:
@@ -566,7 +612,7 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 			}
 			if err == nil {
 				isNew = false
-				existingID, existingAttending, existingCount, existingEmail = existing.ID, existing.Attending, existing.Count, existing.Email
+				existingID, existingAttending, existingCount, prevEmail = existing.ID, existing.Attending, existing.Count, existing.Email
 			}
 		case hasOpenTok:
 			existing, err := q.GetRSVPForEvent(ctx, store.GetRSVPForEventParams{ID: openTok.ID, EventID: eventID})
@@ -576,7 +622,47 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 				return fmt.Errorf("get rsvp for event: %w", err)
 			} else {
 				isNew = false
-				existingID, existingAttending, existingCount, existingEmail = existing.ID, existing.Attending, existing.Count, existing.Email
+				existingID, existingAttending, existingCount, prevEmail = existing.ID, existing.Attending, existing.Count, existing.Email
+				if existing.Registration {
+					if !stringPtrEqual(existing.Email, email) {
+						return errRegistrationEmailLocked
+					}
+					if existing.CheckedInAt != nil {
+						return errRegistrationCheckedIn
+					}
+				}
+			}
+		}
+
+		if hosted && !hasGuest && !hasOpenTok {
+			// One registration per email. A repeat is answered like a new registration and the pass
+			// link is re-sent to the address on file; the response reveals nothing about the row.
+			regID, err := q.GetRegistrationIDByEmail(ctx, store.GetRegistrationIDByEmailParams{EventID: eventID, Email: *email})
+			if err == nil {
+				if err := s.enqueueRegistrationConfirmation(ctx, tx, regID, true); err != nil {
+					return err
+				}
+				existingEmail = true
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("get registration by email: %w", err)
+			}
+			// An invited guest has their own pass and invite link: create and send nothing.
+			_, err = q.GetGuestIDByEmail(ctx, store.GetGuestIDByEmailParams{EventID: eventID, Email: *email})
+			if err == nil {
+				existingEmail = true
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("get guest by email: %w", err)
+			}
+			n, err := q.CountRegistrations(ctx, eventID)
+			if err != nil {
+				return fmt.Errorf("count registrations: %w", err)
+			}
+			if n >= maxRegistrationsPerEvent {
+				return errRegistrationUnavailable
 			}
 		}
 
@@ -585,8 +671,15 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 			prevYesCount = existingCount
 		}
 		increasing := body.Attending == "yes" && count > prevYesCount
+		// registering: this write creates a registration for a caller with no cookie, whose email was
+		// just found to hold neither a registration nor a guest-list slot. hasOpenTok is re-evaluated
+		// above, so a cookie for a row deleted meanwhile lands here as well.
+		registering := hosted && !hasGuest && !hasOpenTok
 		if increasing {
 			if block.Deadline != nil && time.Now().After(*block.Deadline) {
+				if registering {
+					return errRegistrationUnavailable
+				}
 				return errRSVPClosed
 			}
 			if block.Capacity != nil {
@@ -603,12 +696,15 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 					left = 0
 				}
 				if count > left {
+					if registering {
+						return errRegistrationUnavailable
+					}
 					return &errRSVPCapacityReached{spotsLeft: left}
 				}
 			}
 		}
 
-		emailChanged := isNew || !stringPtrEqual(existingEmail, email)
+		emailChanged := isNew || !stringPtrEqual(prevEmail, email)
 
 		switch {
 		case hasGuest:
@@ -629,9 +725,16 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 				ID: existingID, EventID: eventID, EditTokenVersion: openTok.EditTokenVersion,
 			})
 			if errors.Is(err, pgx.ErrNoRows) {
-				// The edit_token_version verified against the cookie no
-				// longer matches: extremely rare (no host endpoint rotates
-				// an open RSVP's token today), handled defensively anyway.
+				// Either a scan checked the registration in after the pre-check, or the
+				// edit_token_version verified against the cookie no longer matches (extremely rare:
+				// no host endpoint rotates an open RSVP's token today).
+				cur, rerr := q.GetRSVPForEvent(ctx, store.GetRSVPForEventParams{ID: existingID, EventID: eventID})
+				if rerr == nil && cur.CheckedInAt != nil {
+					return errRegistrationCheckedIn
+				}
+				if rerr != nil && !errors.Is(rerr, pgx.ErrNoRows) {
+					return fmt.Errorf("re-read rsvp after conflict: %w", rerr)
+				}
 				return errRSVPEditConflict
 			}
 			if err != nil {
@@ -645,6 +748,7 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 			r, err := q.CreateOpenRSVP(ctx, store.CreateOpenRSVPParams{
 				ID: uuid.Must(uuid.NewV7()), EventID: eventID, Name: name, Email: email,
 				Attending: body.Attending, Count: count, Answers: answers,
+				Registration: hosted,
 			})
 			if err != nil {
 				return fmt.Errorf("create open rsvp: %w", err)
@@ -658,33 +762,14 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if isNew || emailChanged {
-			// An open event with no invite gate lets anyone put an arbitrary
-			// address into the RSVP form, so cap send_rsvp_confirmation the
-			// same way send_invite is capped: per-event and globally, on the
-			// same daily scale as MAIL_DAILY_INVITE_CAP. Over either cap,
-			// skip the enqueue but still save the RSVP — a mail budget must
-			// never fail the write.
-			today := time.Now().UTC().Format("2006-01-02")
-			eventOK, err := s.limiter.AllowN(ctx, "rsvp_confirm:event:"+eventID.String()+":"+today, 1, maxRSVPConfirmationsPerEventPerDay, 24*time.Hour)
+			var err error
+			if newOpenRSVP && hosted {
+				err = s.enqueueRegistrationConfirmation(ctx, tx, result.ID, false)
+			} else {
+				err = s.enqueueRSVPConfirmation(ctx, tx, eventID, result.ID)
+			}
 			if err != nil {
-				return fmt.Errorf("rsvp confirm event rate limit: %w", err)
-			}
-			globalOK := false
-			if eventOK {
-				globalOK, err = s.limiter.AllowN(ctx, "rsvp_confirm:global:"+today, 1, int64(s.cfg.MailDailyInviteCap), 48*time.Hour)
-				if err != nil {
-					s.limiter.Uncount(ctx, "rsvp_confirm:event:"+eventID.String()+":"+today, 1)
-					return fmt.Errorf("rsvp confirm global rate limit: %w", err)
-				}
-			}
-			if !eventOK || !globalOK {
-				if eventOK && !globalOK {
-					s.limiter.Uncount(ctx, "rsvp_confirm:event:"+eventID.String()+":"+today, 1)
-				}
-				slog.InfoContext(ctx, "send_rsvp_confirmation: mail cap reached, skipping enqueue",
-					"event_id", eventID, "event_ok", eventOK, "global_ok", globalOK)
-			} else if _, err := s.jobs.InsertTx(ctx, tx, jobs.SendRSVPConfirmationArgs{RSVPID: result.ID}, nil); err != nil {
-				return fmt.Errorf("enqueue send_rsvp_confirmation: %w", err)
+				return err
 			}
 		}
 		if locked.NotifyRsvps {
@@ -697,6 +782,22 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
+	// A registration is never answered with an RSVP cookie or any RSVP data: the pass reaches only
+	// the inbox of the address given. A concurrent request for the same email that won the unique
+	// index has already queued the mail, so that loser is answered the same way.
+	registrationRace := err != nil && hosted && !hasGuest && isUniqueViolation(err, "rsvps_event_registration_email_key")
+	if errors.Is(err, errRegistrationUnavailable) {
+		// Closed, past the deadline, full or at the registration bound: answered like every other
+		// registration attempt so the response cannot be used to probe which emails are registered
+		// or on the guest list. The transaction rolled back, so nothing was created or queued.
+		slog.InfoContext(ctx, "registration unavailable", "event_id", eventID)
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "check_email"})
+		return
+	}
+	if err == nil && (existingEmail || (newOpenRSVP && hosted)) || registrationRace {
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "check_email"})
+		return
+	}
 	if err != nil {
 		writeRSVPWriteError(w, r, err)
 		return
@@ -711,6 +812,53 @@ func (s *Server) handlePutPublicRSVP(w http.ResponseWriter, r *http.Request) {
 		ID: result.ID, Name: result.Name, Email: result.Email, Attending: result.Attending, Count: result.Count,
 		Answers: result.Answers, GuestID: result.GuestID, CreatedAt: result.CreatedAt, UpdatedAt: result.UpdatedAt,
 	}})
+}
+
+// enqueueRSVPConfirmation queues send_rsvp_confirmation for rsvpID in tx, for an RSVP that is not a
+// hosted-event registration. An open event with no invite gate lets anyone put an arbitrary address
+// into the RSVP form, so it is capped the same way send_invite is capped: per event and globally, on
+// the same daily scale as MAIL_DAILY_INVITE_CAP. Over either cap the enqueue is skipped but the
+// caller's write still succeeds: a mail budget must never fail the write.
+func (s *Server) enqueueRSVPConfirmation(ctx context.Context, tx pgx.Tx, eventID, rsvpID uuid.UUID) error {
+	today := time.Now().UTC().Format("2006-01-02")
+	eventKey := jobs.RSVPConfirmEventKey(eventID, today)
+	eventOK, err := s.limiter.AllowN(ctx, eventKey, 1, maxRSVPConfirmationsPerEventPerDay, 24*time.Hour)
+	if err != nil {
+		return fmt.Errorf("rsvp confirm event rate limit: %w", err)
+	}
+	globalOK := false
+	if eventOK {
+		globalOK, err = s.limiter.AllowN(ctx, "rsvp_confirm:global:"+today, 1, int64(s.cfg.MailDailyInviteCap), 48*time.Hour)
+		if err != nil {
+			s.limiter.Uncount(ctx, eventKey, 1)
+			return fmt.Errorf("rsvp confirm global rate limit: %w", err)
+		}
+	}
+	if !eventOK || !globalOK {
+		if eventOK {
+			s.limiter.Uncount(ctx, eventKey, 1)
+		}
+		slog.InfoContext(ctx, "send_rsvp_confirmation: mail cap reached, skipping enqueue",
+			"event_id", eventID, "event_ok", eventOK, "global_ok", globalOK)
+		return nil
+	}
+	if _, err := s.jobs.InsertTx(ctx, tx, jobs.SendRSVPConfirmationArgs{RSVPID: rsvpID}, nil); err != nil {
+		return fmt.Errorf("enqueue send_rsvp_confirmation: %w", err)
+	}
+	return nil
+}
+
+// enqueueRegistrationConfirmation queues the pass-link mail of a hosted-event registration in tx.
+// Always enqueued, never capped here: the worker counts it against the per-event and the global
+// registration caps (MAIL_DAILY_REGISTRATION_CAP) and defers it to the next UTC day when one is
+// reached, so a cap postpones a sign-up's mail instead of silently losing it. The enqueue volume is
+// bounded by the per-IP, per-event and per-email request limits and by maxRegistrationsPerEvent.
+// resend marks a duplicate-registration link re-send, which the worker exempts from the per-event cap.
+func (s *Server) enqueueRegistrationConfirmation(ctx context.Context, tx pgx.Tx, rsvpID uuid.UUID, resend bool) error {
+	if _, err := s.jobs.InsertTx(ctx, tx, jobs.SendRSVPConfirmationArgs{RSVPID: rsvpID, Resend: resend}, nil); err != nil {
+		return fmt.Errorf("enqueue send_rsvp_confirmation: %w", err)
+	}
+	return nil
 }
 
 // stringPtrEqual reports whether two possibly-nil string pointers hold the
@@ -735,6 +883,13 @@ func writeRSVPWriteError(w http.ResponseWriter, r *http.Request, err error) {
 			map[string]int32{"spots_left": capErr.spotsLeft})
 	case errors.Is(err, errPartyTooLarge):
 		writeError(w, http.StatusBadRequest, "party_too_large", "That's more people than this event allows per RSVP.")
+	case errors.Is(err, errRegistrationEmailLocked):
+		writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the highlighted fields.",
+			[]content.Issue{{Path: "email", Code: "locked", Message: "The email on a registration can't be changed."}})
+	case errors.Is(err, errRegistrationCheckedIn):
+		writeError(w, http.StatusConflict, "checked_in", "This registration has already been used at the door.")
+	case isUniqueViolation(err, "rsvps_event_registration_email_key"):
+		writeError(w, http.StatusConflict, "email_registered", "That email is already registered for this event.")
 	case errors.Is(err, errRSVPEditConflict):
 		writeError(w, http.StatusConflict, "version_conflict", "This RSVP changed since you loaded it. Reload and try again.")
 	default:

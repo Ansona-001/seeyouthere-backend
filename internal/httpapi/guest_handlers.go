@@ -138,6 +138,10 @@ type guestResp struct {
 	CreatedAt     time.Time      `json:"created_at"`
 	RSVP          *guestRSVPResp `json:"rsvp"`
 	InviteURL     *string        `json:"invite_url"`
+	// CheckedInAt and CheckedInCount are the door check-in state of a hosted
+	// event's guest: nil and 0 until admitted.
+	CheckedInAt    *time.Time `json:"checked_in_at"`
+	CheckedInCount int32      `json:"checked_in_count"`
 }
 
 // buildGuestResp assembles the host-facing Guest shape (§4.1). invite_url is
@@ -218,10 +222,12 @@ func (s *Server) handleListGuests(w http.ResponseWriter, r *http.Request) {
 		cursorCreatedAt, cursorID = t, id
 	}
 	pattern := buildLikePattern(r.URL.Query().Get("q"))
+	// Viewers (door staff) get names and counts only: no contact details, and no searching by email.
+	seesContacts := row.Role == "owner" || row.Role == "editor"
 
 	ctx := r.Context()
 	rows, err := s.q.ListGuests(ctx, store.ListGuestsParams{
-		EventID: eventID, UserID: userID, Pattern: pattern,
+		EventID: eventID, UserID: userID, Pattern: pattern, MatchEmail: seesContacts,
 		CursorCreatedAt: cursorCreatedAt, CursorID: cursorID, Lim: int32(limitN),
 	})
 	if err != nil {
@@ -236,6 +242,10 @@ func (s *Server) handleListGuests(w http.ResponseWriter, r *http.Request) {
 			rsvp = &guestRSVPResp{Attending: *g.RsvpAttending, Count: *g.RsvpCount, UpdatedAt: *g.RsvpUpdatedAt}
 		}
 		guests[i] = s.buildGuestResp(row.Role, row.Event.Slug, g.ID, g.Name, g.Email, g.Phone, g.HouseholdSize, g.TokenVersion, g.InvitedAt, g.CreatedAt, rsvp)
+		guests[i].CheckedInAt, guests[i].CheckedInCount = g.CheckedInAt, g.CheckedInCount
+		if !seesContacts {
+			guests[i].Email, guests[i].Phone = nil, nil
+		}
 	}
 	var nextCursor *string
 	if len(rows) == limitN {
@@ -313,6 +323,9 @@ func (s *Server) handleCreateGuest(w http.ResponseWriter, r *http.Request) {
 		if count >= maxGuestsPerEvent {
 			return errGuestLimit
 		}
+		if err := ensureNotRegistered(ctx, q, eventID, email); err != nil {
+			return err
+		}
 		g, err := q.CreateGuest(ctx, store.CreateGuestParams{
 			ID: uuid.Must(uuid.NewV7()), EventID: eventID, Name: name, Email: email, Phone: phone,
 			HouseholdSize: *body.HouseholdSize, UserID: userID,
@@ -326,6 +339,9 @@ func (s *Server) handleCreateGuest(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, errGuestLimit):
 		writeError(w, http.StatusConflict, "guest_limit", "This event has reached its guest limit.")
+		return
+	case errors.Is(err, errEmailRegistered):
+		writeError(w, http.StatusConflict, "already_registered", "That email has already registered for this event.")
 		return
 	case isUniqueViolation(err, "guests_event_email_key"):
 		writeError(w, http.StatusConflict, "guest_exists", "A guest with this email is already on the list.")
@@ -419,12 +435,32 @@ func (s *Server) handleUpdateGuest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	updated, err := s.q.UpdateGuest(ctx, store.UpdateGuestParams{
-		Name: namePtr, HouseholdSize: householdPtr,
-		SetEmail: setEmail, Email: emailPtr, SetPhone: setPhone, Phone: phonePtr,
-		GuestID: guestID, EventID: eventID, UserID: userID,
+	var updated store.UpdateGuestRow
+	err = s.inTx(ctx, func(_ pgx.Tx, q *store.Queries) error {
+		if setEmail && emailPtr != nil {
+			// Serialise against registrations (same event lock) before checking for an existing one.
+			if _, err := q.LockEventForEditor(ctx, store.LockEventForEditorParams{EventID: eventID, UserID: userID}); err != nil {
+				return err
+			}
+			if err := ensureNotRegistered(ctx, q, eventID, emailPtr); err != nil {
+				return err
+			}
+		}
+		g, err := q.UpdateGuest(ctx, store.UpdateGuestParams{
+			Name: namePtr, HouseholdSize: householdPtr,
+			SetEmail: setEmail, Email: emailPtr, SetPhone: setPhone, Phone: phonePtr,
+			GuestID: guestID, EventID: eventID, UserID: userID,
+		})
+		if err != nil {
+			return err
+		}
+		updated = g
+		return nil
 	})
 	switch {
+	case errors.Is(err, errEmailRegistered):
+		writeError(w, http.StatusConflict, "already_registered", "That email has already registered for this event.")
+		return
 	case isUniqueViolation(err, "guests_event_email_key"):
 		writeError(w, http.StatusConflict, "guest_exists", "A guest with this email is already on the list.")
 		return
@@ -439,6 +475,28 @@ func (s *Server) handleUpdateGuest(w http.ResponseWriter, r *http.Request) {
 	resp := s.buildGuestResp(row.Role, row.Event.Slug, updated.ID, updated.Name, updated.Email, updated.Phone,
 		updated.HouseholdSize, updated.TokenVersion, updated.InvitedAt, updated.CreatedAt, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"guest": resp})
+}
+
+// errEmailRegistered means the email already holds a registration on the event, so a host must not
+// give it a second pass as a guest.
+var errEmailRegistered = errors.New("email already registered for event")
+
+// ensureNotRegistered returns errEmailRegistered when the (lower-cased) email has a registration on
+// the event. A nil email never matches. Registrations exist only on hosted events. Call it inside
+// the transaction holding the event lock so a concurrent sign-up cannot slip past.
+func ensureNotRegistered(ctx context.Context, q *store.Queries, eventID uuid.UUID, email *string) error {
+	if email == nil {
+		return nil
+	}
+	_, err := q.GetRegistrationIDByEmail(ctx, store.GetRegistrationIDByEmailParams{EventID: eventID, Email: *email})
+	switch {
+	case err == nil:
+		return errEmailRegistered
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	default:
+		return fmt.Errorf("get registration by email: %w", err)
+	}
 }
 
 // decodeNullableField reports whether key is present in raw and, if so,

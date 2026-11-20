@@ -43,10 +43,10 @@ var ErrMalformed = errors.New("token: malformed")
 
 // Keys holds the subkeys derived from AUTH_SECRET. It is safe for concurrent use.
 type Keys struct {
-	guest, rsvp, access, ip []byte
+	guest, rsvp, access, ip, pass, rsvpPass []byte
 }
 
-// NewKeys derives the four subkeys used across the package. authSecret must
+// NewKeys derives the six subkeys used across the package. authSecret must
 // be at least 32 bytes (config.Load already enforces this; the check here
 // guards direct callers such as tests).
 func NewKeys(authSecret []byte) (*Keys, error) {
@@ -59,6 +59,8 @@ func NewKeys(authSecret []byte) (*Keys, error) {
 	labels["syt rsvp v1"] = &k.rsvp
 	labels["syt access v1"] = &k.access
 	labels["syt ip v1"] = &k.ip
+	labels["syt pass v1"] = &k.pass
+	labels["syt rsvp pass v1"] = &k.rsvpPass
 	for label, dst := range labels {
 		key, err := hkdf.Key(sha256.New, authSecret, nil, label, 32)
 		if err != nil {
@@ -80,6 +82,20 @@ func (k *Keys) CheckGuest(id uuid.UUID, version int32, mac []byte) bool {
 	return hmac.Equal(sign(k.guest, versionedMessage(id, version)), mac)
 }
 
+// PassToken derives the entry-pass token a hosted event's guest shows at the
+// door. It has the same shape as a guest token (so Split parses it) but is
+// signed under its own subkey: an invite token never verifies as a pass and a
+// pass never verifies as an invite token. Bumping guests.token_version
+// (rotate-link) revokes the pass together with the invite link.
+func (k *Keys) PassToken(guestID uuid.UUID, version int32) string {
+	return encode(guestID, sign(k.pass, versionedMessage(guestID, version)))
+}
+
+// CheckPass reports whether mac is the correct, current-version pass MAC for guestID.
+func (k *Keys) CheckPass(id uuid.UUID, version int32, mac []byte) bool {
+	return hmac.Equal(sign(k.pass, versionedMessage(id, version)), mac)
+}
+
 // RSVPToken derives the edit-link token for an open (non-guest) RSVP. It
 // carries rsvps.edit_token_version the same way a guest token carries
 // guests.token_version, so RotateRSVPEditToken can revoke a leaked or
@@ -91,6 +107,20 @@ func (k *Keys) RSVPToken(rsvpID uuid.UUID, version int32) string {
 // CheckRSVP reports whether mac is the correct, current-version MAC for rsvpID.
 func (k *Keys) CheckRSVP(id uuid.UUID, version int32, mac []byte) bool {
 	return hmac.Equal(sign(k.rsvp, versionedMessage(id, version)), mac)
+}
+
+// RSVPPassToken derives the entry-pass token for an open (non-guest) RSVP. It
+// has the same shape as the other tokens (so Split parses it) but is signed
+// under its own subkey: it never verifies as a guest pass, invite token or
+// RSVP edit token, nor the reverse. It carries rsvps.edit_token_version, so
+// rotating the edit link revokes the pass too.
+func (k *Keys) RSVPPassToken(id uuid.UUID, version int32) string {
+	return encode(id, sign(k.rsvpPass, versionedMessage(id, version)))
+}
+
+// CheckRSVPPass reports whether mac is the correct, current-version RSVP pass MAC for id.
+func (k *Keys) CheckRSVPPass(id uuid.UUID, version int32, mac []byte) bool {
+	return hmac.Equal(sign(k.rsvpPass, versionedMessage(id, version)), mac)
 }
 
 // Split decodes a token into the id it names and its MAC. It does not

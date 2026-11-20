@@ -153,7 +153,7 @@ func createTestEvent(t *testing.T, ctx context.Context, q *store.Queries, occasi
 		t.Fatalf("parse stored: %v", err)
 	}
 	event, err := q.CreateEvent(ctx, store.CreateEventParams{
-		ID: uuid.Must(uuid.NewV7()), OwnerID: ownerID, OccasionSlug: occasionSlug, Title: saved.Title,
+		ID: uuid.Must(uuid.NewV7()), OwnerID: ownerID, OccasionSlug: occasionSlug, Kind: "invite", Title: saved.Title,
 		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		TemplateID: tmpl.ID, TemplateVersion: tmpl.Version,
 	})
@@ -584,7 +584,7 @@ func TestHandleDeleteEvent_EnqueuesMediaVisibilityJob(t *testing.T) {
 	q := store.New(pool)
 
 	mediaStore := newTestMediaStore(t)
-	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes)
+	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes, 1000)
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}

@@ -134,6 +134,9 @@ func (w *SendInviteWorker) Work(ctx context.Context, job *river.Job[SendInviteAr
 		fmt.Fprintf(&b, "When: %s\n\n", when)
 	}
 	fmt.Fprintf(&b, "View the invitation and RSVP:\n%s\n\n", inviteURL)
+	if g.EventKind == "hosted" && g.EventEntryPasses {
+		b.WriteString("Your entry pass is on your invitation page. Show the QR code at the door.\n\n")
+	}
 	fmt.Fprintf(&b, "Report this page: %s\n", reportURL)
 
 	// A failed send must not burn the recipient's daily quota: MaxAttempts

@@ -47,6 +47,15 @@ type publicViewerGuestResp struct {
 	HouseholdSize int32  `json:"household_size"`
 }
 
+// entryPassResp is what the invitation or registration page needs to draw the pass's QR code. The token is
+// derived, not stored (token.PassToken for a guest, token.RSVPPassToken for a registration), and this
+// response is no-store. It is the viewer's pass: a guest's, or their own registration's.
+type entryPassResp struct {
+	Token       string     `json:"token"`
+	Admits      int32      `json:"admits"`
+	CheckedInAt *time.Time `json:"checked_in_at"`
+}
+
 // publicRsvpConfigResp is §4.1's PublicEvent.event.rsvp. Fields is the
 // occasion's enabled fields resolved to full definitions
 // (content.EffectiveFields) only — never merged with the rsvp block's own
@@ -67,6 +76,9 @@ type publicEventResp struct {
 	OccasionSlug string     `json:"occasion_slug"`
 	Visibility   string     `json:"visibility"`
 	RsvpMode     string     `json:"rsvp_mode"`
+	Kind         string     `json:"kind"`
+	// EntryPasses mirrors the event setting; when false, viewer.pass is always null.
+	EntryPasses bool `json:"entry_passes"`
 	StartsAt     *time.Time `json:"starts_at"`
 	// EndsAt mirrors eventResp.EndsAt (event_handlers.go): derived from the
 	// content's datetime block, nil if absent or invalid.
@@ -242,17 +254,26 @@ func (s *Server) resolvePublicEvent(w http.ResponseWriter, r *http.Request, slug
 // any: an invite cookie takes priority (it also carries household_size, so
 // the RSVP form can enforce the party-size cap), otherwise an open-RSVP
 // cookie for this event. Neither is required.
-func (s *Server) loadPublicViewer(ctx context.Context, eventID uuid.UUID, r *http.Request) (*publicViewerGuestResp, *rsvpResp, error) {
+func (s *Server) loadPublicViewer(ctx context.Context, eventID uuid.UUID, r *http.Request) (*publicViewerGuestResp, *entryPassResp, *rsvpResp, error) {
 	if guest, ok := s.checkInviteCookie(ctx, r, eventID); ok {
 		viewer := &publicViewerGuestResp{Name: guest.Name, HouseholdSize: guest.HouseholdSize}
+		hosted := guest.EventKind == "hosted"
 		row, err := s.q.GetGuestRSVP(ctx, store.GetGuestRSVPParams{EventID: eventID, GuestID: guest.ID})
 		if errors.Is(err, pgx.ErrNoRows) {
-			return viewer, nil, nil
+			var pass *entryPassResp
+			if hosted {
+				pass = s.entryPass(guest, nil, nil)
+			}
+			return viewer, pass, nil, nil
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("get guest rsvp: %w", err)
+			return nil, nil, nil, fmt.Errorf("get guest rsvp: %w", err)
 		}
-		return viewer, &rsvpResp{
+		var pass *entryPassResp
+		if hosted && row.Attending != "no" {
+			pass = s.entryPass(guest, &row.Attending, &row.Count)
+		}
+		return viewer, pass, &rsvpResp{
 			ID: row.ID, Name: row.Name, Email: row.Email, Attending: row.Attending, Count: row.Count,
 			Answers: row.Answers, GuestID: row.GuestID, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 		}, nil
@@ -261,18 +282,36 @@ func (s *Server) loadPublicViewer(ctx context.Context, eventID uuid.UUID, r *htt
 	if tok, ok := s.checkRSVPCookie(ctx, r, eventID); ok {
 		row, err := s.q.GetRSVPForEvent(ctx, store.GetRSVPForEventParams{ID: tok.ID, EventID: eventID})
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("get rsvp for event: %w", err)
+			return nil, nil, nil, fmt.Errorf("get rsvp for event: %w", err)
 		}
-		return nil, &rsvpResp{
+		// A registration holds a pass while the answer is yes; the pass is signed over the edit-token
+		// version, so rotating the edit link revokes it with the link.
+		var pass *entryPassResp
+		if row.Registration && row.Attending == "yes" {
+			pass = &entryPassResp{
+				Token:       s.tokens.RSVPPassToken(row.ID, row.EditTokenVersion),
+				Admits:      row.Count,
+				CheckedInAt: row.CheckedInAt,
+			}
+		}
+		return nil, pass, &rsvpResp{
 			ID: row.ID, Name: row.Name, Email: row.Email, Attending: row.Attending, Count: row.Count,
 			Answers: row.Answers, GuestID: row.GuestID, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 		}, nil
 	}
 
-	return nil, nil, nil
+	return nil, nil, nil, nil
+}
+
+func (s *Server) entryPass(guest store.GetGuestForTokenRow, attending *string, count *int32) *entryPassResp {
+	return &entryPassResp{
+		Token:       s.tokens.PassToken(guest.ID, guest.TokenVersion),
+		Admits:      defaultAdmitCount(attending, count, guest.HouseholdSize),
+		CheckedInAt: guest.CheckedInAt,
+	}
 }
 
 // --- rsvp config, theme and media (shared build-up for the page response) ---
@@ -281,8 +320,11 @@ func (s *Server) loadPublicViewer(ctx context.Context, eventID uuid.UUID, r *htt
 // event's rsvp block: whether RSVPs are enabled at all, whether new "yes"
 // responses are currently accepted, and (when capacity is set) how many
 // spots remain. This mirrors, but is simpler than, the write-time "closed"
-// check in B3 (which also excludes the RSVP being edited).
-func (s *Server) buildPublicRsvpConfig(ctx context.Context, eventID uuid.UUID, occ content.Occasion, block *content.RSVPBlock) (publicRsvpConfigResp, error) {
+// check in B3 (which also excludes the RSVP being edited). Under invite_only
+// a visitor without a valid invite cookie can never submit (the write path
+// answers 403), so the config reports closed with "invite_only", which
+// takes precedence over the deadline and capacity reasons.
+func (s *Server) buildPublicRsvpConfig(ctx context.Context, eventID uuid.UUID, occ content.Occasion, block *content.RSVPBlock, rsvpMode string, hasInvite bool) (publicRsvpConfigResp, error) {
 	if block == nil {
 		return publicRsvpConfigResp{Fields: []content.Field{}}, nil
 	}
@@ -293,6 +335,11 @@ func (s *Server) buildPublicRsvpConfig(ctx context.Context, eventID uuid.UUID, o
 		MaxPartySize: block.MaxPartySize,
 	}
 
+	if rsvpMode == "invite_only" && !hasInvite {
+		reason := "invite_only"
+		cfg.ClosedReason = &reason
+		return cfg, nil
+	}
 	if block.Deadline != nil && time.Now().After(*block.Deadline) {
 		reason := "deadline"
 		cfg.ClosedReason = &reason
@@ -406,12 +453,17 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, err)
 		return
 	}
-	rsvpCfg, err := s.buildPublicRsvpConfig(ctx, row.ID, occ, saved.RSVP)
+	// guest is non-nil only for a valid invite cookie, which is exactly what
+	// the invite_only RSVP gate requires.
+	guest, pass, viewerRSVP, err := s.loadPublicViewer(ctx, row.ID, r)
 	if err != nil {
 		serverError(w, r, err)
 		return
 	}
-	guest, viewerRSVP, err := s.loadPublicViewer(ctx, row.ID, r)
+	if !row.EntryPasses {
+		pass = nil // the host switched entry passes off: no QR code, whoever the viewer is
+	}
+	rsvpCfg, err := s.buildPublicRsvpConfig(ctx, row.ID, occ, saved.RSVP, row.RsvpMode, guest != nil)
 	if err != nil {
 		serverError(w, r, err)
 		return
@@ -432,7 +484,7 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 
 	resp := publicEventResp{
 		ID: row.ID, Slug: *row.Slug, Title: row.Title, OccasionSlug: row.OccasionSlug,
-		Visibility: row.Visibility, RsvpMode: row.RsvpMode, StartsAt: row.StartsAt,
+		Visibility: row.Visibility, RsvpMode: row.RsvpMode, Kind: row.Kind, EntryPasses: row.EntryPasses, StartsAt: row.StartsAt,
 		EndsAt:    saved.EndsAt,
 		Indexable: row.Visibility == "public", RemoveBranding: row.RemoveBranding,
 		Content: saved.JSON, Theme: theme, Media: media,
@@ -442,7 +494,7 @@ func (s *Server) handleGetPublicEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"event":  resp,
-		"viewer": map[string]any{"guest": guest, "rsvp": viewerRSVP},
+		"viewer": map[string]any{"guest": guest, "pass": pass, "rsvp": viewerRSVP},
 		"photos": map[string]any{"items": photos, "next_cursor": nextCursor},
 		"wishes": wishes,
 	})
@@ -627,6 +679,15 @@ func (s *Server) handleAcceptRSVPLink(w http.ResponseWriter, r *http.Request) {
 	if rsvp.EventSlug == nil || rsvp.EventStatus != "published" || rsvp.GuestID != nil || !s.tokens.CheckRSVP(id, rsvp.EditTokenVersion, mac) {
 		writeError(w, http.StatusNotFound, "invalid_link", "This link isn't valid.")
 		return
+	}
+
+	// Opening the emailed link shows the address is real and wanted: from here the registration holds
+	// its spot (an unconfirmed one stops counting after 24 hours and is purged after 48).
+	if rsvp.Registration {
+		if err := s.q.ConfirmRegistration(ctx, store.ConfirmRegistrationParams{ID: rsvp.ID, EventID: rsvp.EventID}); err != nil {
+			serverError(w, r, fmt.Errorf("confirm registration: %w", err))
+			return
+		}
 	}
 
 	s.setEventCookie(w, rsvpCookiePrefix, rsvp.EventID, body.Token, rsvpCookieTTL)

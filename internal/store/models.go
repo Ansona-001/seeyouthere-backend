@@ -63,6 +63,8 @@ type Event struct {
 	ShareImage              string     `json:"share_image"`
 	ShareMediaID            *uuid.UUID `json:"share_media_id"`
 	MusicSource             string     `json:"music_source"`
+	Kind                    string     `json:"kind"`
+	EntryPasses             bool       `json:"entry_passes"`
 }
 
 type EventAudio struct {
@@ -107,16 +109,19 @@ type EventWish struct {
 }
 
 type Guest struct {
-	ID            uuid.UUID  `json:"id"`
-	EventID       uuid.UUID  `json:"event_id"`
-	Name          string     `json:"name"`
-	Email         *string    `json:"email"`
-	Phone         *string    `json:"phone"`
-	HouseholdSize int32      `json:"household_size"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
-	TokenVersion  int32      `json:"token_version"`
-	InvitedAt     *time.Time `json:"invited_at"`
+	ID             uuid.UUID  `json:"id"`
+	EventID        uuid.UUID  `json:"event_id"`
+	Name           string     `json:"name"`
+	Email          *string    `json:"email"`
+	Phone          *string    `json:"phone"`
+	HouseholdSize  int32      `json:"household_size"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	TokenVersion   int32      `json:"token_version"`
+	InvitedAt      *time.Time `json:"invited_at"`
+	CheckedInAt    *time.Time `json:"checked_in_at"`
+	CheckedInCount int32      `json:"checked_in_count"`
+	CheckedInBy    *uuid.UUID `json:"checked_in_by"`
 }
 
 type Medium struct {
@@ -179,6 +184,11 @@ type Rsvp struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
 	EditTokenVersion int32      `json:"edit_token_version"`
+	Registration     bool       `json:"registration"`
+	CheckedInAt      *time.Time `json:"checked_in_at"`
+	CheckedInCount   int32      `json:"checked_in_count"`
+	CheckedInBy      *uuid.UUID `json:"checked_in_by"`
+	ConfirmedAt      *time.Time `json:"confirmed_at"`
 }
 
 type Session struct {

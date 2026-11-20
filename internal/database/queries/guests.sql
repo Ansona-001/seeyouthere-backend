@@ -1,18 +1,21 @@
 -- name: ListGuests :many
 -- Any member. Oldest first (the order hosts entered them). pattern is NULL or an ILIKE pattern
 -- built in Go with %, _ and \ escaped, e.g. '%ann%'. The RSVP join is at most one row per guest
--- (rsvps_event_guest_key).
+-- (rsvps_event_guest_key). match_email is false for viewers, who never see contact details, so a
+-- search cannot be used to probe which emails are on the list.
 -- The page is cut before the join so only its rows are joined.
 SELECT g.id, g.name, g.email, g.phone, g.household_size, g.token_version, g.invited_at, g.created_at,
+       g.checked_in_at, g.checked_in_count,
        r.attending AS rsvp_attending, r.count AS rsvp_count, r.updated_at AS rsvp_updated_at
 FROM (
-    SELECT x.id, x.event_id, x.name, x.email, x.phone, x.household_size, x.token_version, x.invited_at, x.created_at
+    SELECT x.id, x.event_id, x.name, x.email, x.phone, x.household_size, x.token_version, x.invited_at, x.created_at,
+           x.checked_in_at, x.checked_in_count
     FROM guests x
     WHERE x.event_id = @event_id::uuid
       AND event_role(@event_id::uuid, @user_id::uuid) IS NOT NULL
       AND (sqlc.narg(pattern)::text IS NULL
            OR x.name ILIKE sqlc.narg(pattern)::text
-           OR x.email ILIKE sqlc.narg(pattern)::text)
+           OR (@match_email::bool AND x.email ILIKE sqlc.narg(pattern)::text))
       AND (x.created_at, x.id) > (@cursor_created_at::timestamptz, @cursor_id::uuid)
     ORDER BY x.created_at, x.id
     LIMIT sqlc.arg(lim)::int
@@ -33,12 +36,14 @@ RETURNING id, name, email, phone, household_size, token_version, invited_at, cre
 -- name: InsertGuestsBatch :many
 -- CSV import, after LockEventForEditor in the same tx. Arrays are parallel; an empty string in
 -- emails/phones means none. Rows whose email is already invited (or repeated in the batch) are
--- skipped; the returned ids are the inserted rows.
+-- skipped, as are emails that already hold a registration on the event (hosted events); the
+-- returned ids are the inserted rows.
 INSERT INTO guests (id, event_id, name, email, phone, household_size)
 SELECT b.id, @event_id::uuid, b.name, nullif(b.email, ''), nullif(b.phone, ''), b.household_size
 FROM (SELECT unnest(@ids::uuid[]) AS id, unnest(@names::text[]) AS name, unnest(@emails::text[]) AS email,
              unnest(@phones::text[]) AS phone, unnest(@household_sizes::int[]) AS household_size) b
 WHERE event_role(@event_id::uuid, @user_id::uuid) IN ('owner', 'editor')
+  AND NOT EXISTS (SELECT 1 FROM rsvps r WHERE r.event_id = @event_id::uuid AND r.registration AND r.email = b.email)
 ON CONFLICT (event_id, email) WHERE email IS NOT NULL DO NOTHING
 RETURNING id;
 
@@ -90,9 +95,17 @@ WHERE g.id IN (
   AND event_role(@event_id::uuid, @user_id::uuid) IN ('owner', 'editor')
 RETURNING g.id;
 
+-- name: GetGuestIDByEmail :one
+-- Public registration flow: the invited guest with this email (lower-cased by the caller, as every
+-- stored email is), via guests_event_email_key. The caller must not reveal the outcome to the
+-- requester.
+SELECT id FROM guests
+WHERE event_id = @event_id::uuid AND email = @email::text;
+
 -- name: GetGuestForToken :one
 -- Public; the caller has already verified the token MAC against token_version.
-SELECT g.id, g.event_id, g.name, g.household_size, g.token_version, e.slug AS event_slug, e.status AS event_status
+SELECT g.id, g.event_id, g.name, g.household_size, g.token_version, e.slug AS event_slug, e.status AS event_status,
+       e.kind AS event_kind, g.checked_in_at
 FROM guests g
 JOIN events e ON e.id = g.event_id
 WHERE g.id = @guest_id AND e.deleted_at IS NULL;
@@ -101,7 +114,7 @@ WHERE g.id = @guest_id AND e.deleted_at IS NULL;
 -- send_invite job. The job no-ops unless the event is published and the guest still has an email.
 SELECT g.id, g.name, g.email, g.token_version,
        e.id AS event_id, e.slug AS event_slug, e.title AS event_title, e.status AS event_status,
-       e.starts_at AS event_starts_at, u.name AS owner_name
+       e.starts_at AS event_starts_at, e.kind AS event_kind, e.entry_passes AS event_entry_passes, u.name AS owner_name
 FROM guests g
 JOIN events e ON e.id = g.event_id
 LEFT JOIN users u ON u.id = e.owner_id AND u.deleted_at IS NULL

@@ -12,6 +12,23 @@ import (
 	"github.com/google/uuid"
 )
 
+const confirmRegistration = `-- name: ConfirmRegistration :exec
+UPDATE rsvps SET confirmed_at = now()
+WHERE id = $1::uuid AND event_id = $2::uuid AND registration AND confirmed_at IS NULL
+`
+
+type ConfirmRegistrationParams struct {
+	ID      uuid.UUID `json:"id"`
+	EventID uuid.UUID `json:"event_id"`
+}
+
+// The emailed pass link was opened: the address belongs to someone who wanted the registration. The
+// first confirmation wins; later opens write nothing. No-op for a row that is not a registration.
+func (q *Queries) ConfirmRegistration(ctx context.Context, arg ConfirmRegistrationParams) error {
+	_, err := q.db.Exec(ctx, confirmRegistration, arg.ID, arg.EventID)
+	return err
+}
+
 const countRSVPs = `-- name: CountRSVPs :one
 SELECT count(*) FROM rsvps WHERE event_id = $1
 `
@@ -23,20 +40,36 @@ func (q *Queries) CountRSVPs(ctx context.Context, eventID uuid.UUID) (int64, err
 	return count, err
 }
 
+const countRegistrations = `-- name: CountRegistrations :one
+SELECT count(*) FROM rsvps
+WHERE event_id = $1::uuid AND registration
+  AND (confirmed_at IS NOT NULL OR created_at > now() - interval '24 hours')
+`
+
+// Hard bound on a hosted event's registrations, read under the event lock. Unconfirmed registrations
+// older than 24 hours do not count, as in SumYesHeads.
+func (q *Queries) CountRegistrations(ctx context.Context, eventID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countRegistrations, eventID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createOpenRSVP = `-- name: CreateOpenRSVP :one
-INSERT INTO rsvps (id, event_id, name, email, attending, count, answers)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO rsvps (id, event_id, name, email, attending, count, answers, registration)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id, event_id, guest_id, name, email, attending, count, answers, edit_token_version, created_at, updated_at
 `
 
 type CreateOpenRSVPParams struct {
-	ID        uuid.UUID `json:"id"`
-	EventID   uuid.UUID `json:"event_id"`
-	Name      string    `json:"name"`
-	Email     *string   `json:"email"`
-	Attending string    `json:"attending"`
-	Count     int32     `json:"count"`
-	Answers   []byte    `json:"answers"`
+	ID           uuid.UUID `json:"id"`
+	EventID      uuid.UUID `json:"event_id"`
+	Name         string    `json:"name"`
+	Email        *string   `json:"email"`
+	Attending    string    `json:"attending"`
+	Count        int32     `json:"count"`
+	Answers      []byte    `json:"answers"`
+	Registration bool      `json:"registration"`
 }
 
 type CreateOpenRSVPRow struct {
@@ -53,6 +86,8 @@ type CreateOpenRSVPRow struct {
 	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
+// registration is true for an open RSVP on a hosted event (it then needs an email); a second
+// registration with the same email raises 23505 on rsvps_event_registration_email_key.
 func (q *Queries) CreateOpenRSVP(ctx context.Context, arg CreateOpenRSVPParams) (CreateOpenRSVPRow, error) {
 	row := q.db.QueryRow(ctx, createOpenRSVP,
 		arg.ID,
@@ -62,6 +97,7 @@ func (q *Queries) CreateOpenRSVP(ctx context.Context, arg CreateOpenRSVPParams) 
 		arg.Attending,
 		arg.Count,
 		arg.Answers,
+		arg.Registration,
 	)
 	var i CreateOpenRSVPRow
 	err := row.Scan(
@@ -101,11 +137,34 @@ func (q *Queries) DeleteRSVP(ctx context.Context, arg DeleteRSVPParams) (int64, 
 	return result.RowsAffected(), nil
 }
 
+const deleteUnconfirmedRegistrations = `-- name: DeleteUnconfirmedRegistrations :execrows
+DELETE FROM rsvps
+WHERE id IN (
+    SELECT u.id FROM rsvps u
+    WHERE u.registration AND u.confirmed_at IS NULL AND u.checked_in_at IS NULL
+      AND u.created_at < now() - interval '48 hours'
+    ORDER BY u.created_at
+    LIMIT $1::int
+    FOR UPDATE SKIP LOCKED
+)
+`
+
+// Cleanup job: registrations whose link was never opened and that were never used at the door, 48
+// hours after sign-up. One bounded batch (oldest first, via rsvps_unconfirmed_registration_idx); a row
+// confirmed or checked in after the scan began is re-checked under the row lock and skipped.
+func (q *Queries) DeleteUnconfirmedRegistrations(ctx context.Context, lim int32) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUnconfirmedRegistrations, lim)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const exportRSVPsBatch = `-- name: ExportRSVPsBatch :many
 SELECT r.id, r.guest_id, r.name, r.email, r.attending, r.count, r.answers, r.created_at, r.updated_at
 FROM rsvps r
 WHERE r.event_id = $1::uuid
-  AND event_role($1::uuid, $2::uuid) IS NOT NULL
+  AND event_role($1::uuid, $2::uuid) IN ('owner', 'editor')
   AND (r.created_at, r.id) > ($3::timestamptz, $4::uuid)
 ORDER BY r.created_at, r.id
 LIMIT $5::int
@@ -211,10 +270,10 @@ func (q *Queries) GetGuestRSVP(ctx context.Context, arg GetGuestRSVPParams) (Get
 }
 
 const getRSVPForConfirmation = `-- name: GetRSVPForConfirmation :one
-SELECT r.id, r.name, r.email, r.attending, r.count, r.guest_id, r.edit_token_version,
+SELECT r.id, r.name, r.email, r.attending, r.count, r.guest_id, r.edit_token_version, r.registration,
        g.token_version AS guest_token_version,
        e.id AS event_id, e.slug AS event_slug, e.title AS event_title, e.status AS event_status,
-       e.starts_at AS event_starts_at, e.content AS event_content
+       e.starts_at AS event_starts_at, e.content AS event_content, e.entry_passes AS event_entry_passes
 FROM rsvps r
 JOIN events e ON e.id = r.event_id
 LEFT JOIN guests g ON g.id = r.guest_id
@@ -229,6 +288,7 @@ type GetRSVPForConfirmationRow struct {
 	Count             int32      `json:"count"`
 	GuestID           *uuid.UUID `json:"guest_id"`
 	EditTokenVersion  int32      `json:"edit_token_version"`
+	Registration      bool       `json:"registration"`
 	GuestTokenVersion *int32     `json:"guest_token_version"`
 	EventID           uuid.UUID  `json:"event_id"`
 	EventSlug         *string    `json:"event_slug"`
@@ -236,6 +296,7 @@ type GetRSVPForConfirmationRow struct {
 	EventStatus       string     `json:"event_status"`
 	EventStartsAt     *time.Time `json:"event_starts_at"`
 	EventContent      []byte     `json:"event_content"`
+	EventEntryPasses  bool       `json:"event_entry_passes"`
 }
 
 // send_rsvp_confirmation job. guest_token_version is set for guest RSVPs (the link is the invite link).
@@ -250,6 +311,7 @@ func (q *Queries) GetRSVPForConfirmation(ctx context.Context, id uuid.UUID) (Get
 		&i.Count,
 		&i.GuestID,
 		&i.EditTokenVersion,
+		&i.Registration,
 		&i.GuestTokenVersion,
 		&i.EventID,
 		&i.EventSlug,
@@ -257,12 +319,14 @@ func (q *Queries) GetRSVPForConfirmation(ctx context.Context, id uuid.UUID) (Get
 		&i.EventStatus,
 		&i.EventStartsAt,
 		&i.EventContent,
+		&i.EventEntryPasses,
 	)
 	return i, err
 }
 
 const getRSVPForEvent = `-- name: GetRSVPForEvent :one
-SELECT id, event_id, guest_id, name, email, attending, count, answers, edit_token_version, created_at, updated_at
+SELECT id, event_id, guest_id, name, email, attending, count, answers, edit_token_version, created_at, updated_at,
+       registration, checked_in_at, checked_in_count
 FROM rsvps
 WHERE id = $1 AND event_id = $2
 `
@@ -284,6 +348,9 @@ type GetRSVPForEventRow struct {
 	EditTokenVersion int32      `json:"edit_token_version"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
+	Registration     bool       `json:"registration"`
+	CheckedInAt      *time.Time `json:"checked_in_at"`
+	CheckedInCount   int32      `json:"checked_in_count"`
 }
 
 func (q *Queries) GetRSVPForEvent(ctx context.Context, arg GetRSVPForEventParams) (GetRSVPForEventRow, error) {
@@ -301,12 +368,15 @@ func (q *Queries) GetRSVPForEvent(ctx context.Context, arg GetRSVPForEventParams
 		&i.EditTokenVersion,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Registration,
+		&i.CheckedInAt,
+		&i.CheckedInCount,
 	)
 	return i, err
 }
 
 const getRSVPForToken = `-- name: GetRSVPForToken :one
-SELECT r.id, r.event_id, r.guest_id, r.edit_token_version, e.slug AS event_slug, e.status AS event_status
+SELECT r.id, r.event_id, r.guest_id, r.edit_token_version, r.registration, e.slug AS event_slug, e.status AS event_status
 FROM rsvps r
 JOIN events e ON e.id = r.event_id
 WHERE r.id = $1 AND e.deleted_at IS NULL
@@ -317,6 +387,7 @@ type GetRSVPForTokenRow struct {
 	EventID          uuid.UUID  `json:"event_id"`
 	GuestID          *uuid.UUID `json:"guest_id"`
 	EditTokenVersion int32      `json:"edit_token_version"`
+	Registration     bool       `json:"registration"`
 	EventSlug        *string    `json:"event_slug"`
 	EventStatus      string     `json:"event_status"`
 }
@@ -330,10 +401,30 @@ func (q *Queries) GetRSVPForToken(ctx context.Context, id uuid.UUID) (GetRSVPFor
 		&i.EventID,
 		&i.GuestID,
 		&i.EditTokenVersion,
+		&i.Registration,
 		&i.EventSlug,
 		&i.EventStatus,
 	)
 	return i, err
+}
+
+const getRegistrationIDByEmail = `-- name: GetRegistrationIDByEmail :one
+SELECT id FROM rsvps
+WHERE event_id = $1::uuid AND email = $2::text AND registration
+`
+
+type GetRegistrationIDByEmailParams struct {
+	EventID uuid.UUID `json:"event_id"`
+	Email   string    `json:"email"`
+}
+
+// Public registration flow: the event's registration for an email (lower-cased by the caller), via
+// rsvps_event_registration_email_key. The caller must not reveal the outcome to the requester.
+func (q *Queries) GetRegistrationIDByEmail(ctx context.Context, arg GetRegistrationIDByEmailParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getRegistrationIDByEmail, arg.EventID, arg.Email)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const listRSVPs = `-- name: ListRSVPs :many
@@ -546,6 +637,7 @@ const sumYesHeads = `-- name: SumYesHeads :one
 SELECT coalesce(sum(count), 0)::int AS heads
 FROM rsvps
 WHERE event_id = $1 AND attending = 'yes' AND id IS DISTINCT FROM $2::uuid
+  AND (NOT registration OR confirmed_at IS NOT NULL OR created_at > now() - interval '24 hours')
 `
 
 type SumYesHeadsParams struct {
@@ -553,7 +645,9 @@ type SumYesHeadsParams struct {
 	ExcludeID *uuid.UUID `json:"exclude_id"`
 }
 
-// Capacity check under the event lock. exclude_id leaves out the RSVP being edited.
+// Capacity check under the event lock. exclude_id leaves out the RSVP being edited. A registration
+// whose pass link was never opened stops counting 24 hours after sign-up (see
+// DeleteUnconfirmedRegistrations, which removes it after 48), so unverified addresses cannot hold spots.
 func (q *Queries) SumYesHeads(ctx context.Context, arg SumYesHeadsParams) (int32, error) {
 	row := q.db.QueryRow(ctx, sumYesHeads, arg.EventID, arg.ExcludeID)
 	var heads int32
@@ -566,6 +660,7 @@ UPDATE rsvps
 SET name = $1, email = $2, attending = $3, count = $4, answers = $5,
     updated_at = now()
 WHERE id = $6 AND event_id = $7 AND guest_id IS NULL AND edit_token_version = $8
+  AND checked_in_at IS NULL
 RETURNING id, event_id, guest_id, name, email, attending, count, answers, edit_token_version, created_at, updated_at
 `
 
@@ -595,7 +690,9 @@ type UpdateOpenRSVPRow struct {
 }
 
 // edit_token_version is the one the caller verified the token against; a concurrent rotation
-// makes this update no row.
+// makes this update no row, as does a concurrent check-in (checked_in_at set). registration and the check-in columns are never written here; on a
+// registration a NULL email raises 23514 (rsvps_registration_check) and another registered email
+// raises 23505 (rsvps_event_registration_email_key).
 func (q *Queries) UpdateOpenRSVP(ctx context.Context, arg UpdateOpenRSVPParams) (UpdateOpenRSVPRow, error) {
 	row := q.db.QueryRow(ctx, updateOpenRSVP,
 		arg.Name,

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -151,7 +152,7 @@ func newRSVPConfirmationFixture(t *testing.T, ctx context.Context) rsvpConfirmat
 
 	eventID := uuid.Must(uuid.NewV7())
 	event, err := q.CreateEvent(ctx, store.CreateEventParams{
-		ID: eventID, OwnerID: &ownerID, OccasionSlug: "birthday", Title: saved.Title,
+		ID: eventID, OwnerID: &ownerID, OccasionSlug: "birthday", Kind: "invite", Title: saved.Title,
 		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		TemplateID: tmpl.ID, TemplateVersion: tmpl.Version,
 	})
@@ -361,5 +362,70 @@ func TestSendRSVPConfirmationWorker_FailedSendRefundsRecipientRateLimit(t *testi
 	}
 	if msgs := okSender.messages(); len(msgs) != 1 {
 		t.Fatalf("got %d messages after recovery, want 1 (quota should not have been exhausted by prior failures)", len(msgs))
+	}
+}
+
+func TestSendRSVPConfirmationWorker_RegistrationCopy(t *testing.T) {
+	tests := []struct {
+		name         string
+		registration bool
+		attending    string
+		wantPass     bool
+		wantCopy     string
+	}{
+		{"registration yes gets the entry pass link", true, "yes", true, "Show it at the door"},
+		{"registration maybe gets the plain copy", true, "maybe", false, "We got your reply"},
+		{"registration no gets the plain copy", true, "no", false, "We got your reply"},
+		{"plain rsvp yes keeps the normal copy", false, "yes", false, "You can change your response any time"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newRSVPConfirmationFixture(t, ctx)
+			rdb := rdbClient(t)
+
+			email := "reg-copy-" + uuid.Must(uuid.NewV7()).String() + "@example.invalid"
+			count := int32(2)
+			if tc.attending == "no" {
+				count = 0
+			}
+			rsvp, err := f.q.CreateOpenRSVP(ctx, store.CreateOpenRSVPParams{
+				ID: uuid.Must(uuid.NewV7()), EventID: f.eventID, Name: "Reg Guest", Email: &email,
+				Attending: tc.attending, Count: count, Answers: []byte("{}"), Registration: tc.registration,
+			})
+			if err != nil {
+				t.Fatalf("create rsvp: %v", err)
+			}
+			t.Cleanup(func() { _, _ = f.pool.Exec(context.Background(), "DELETE FROM rsvps WHERE id = $1", rsvp.ID) })
+
+			sender := &recordingSender{}
+			calendarSender := &recordingSender{}
+			w := capWorker(t, f, rdb, sender, 1000)
+			w.CalendarSender = calendarSender
+			t.Cleanup(func() {
+				rdb.Del(context.Background(), "rl:"+RSVPConfirmEventKey(f.eventID, time.Now().UTC().Format("2006-01-02")))
+			})
+			if err := w.Work(ctx, jobFor(rsvp.ID, false, time.Now())); err != nil {
+				t.Fatalf("Work() error = %v", err)
+			}
+			msgs := append(sender.messages(), calendarSender.messages()...)
+			if len(msgs) != 1 {
+				t.Fatalf("got %d messages, want 1", len(msgs))
+			}
+			text := msgs[0].Text
+			link := "https://seeyouthere.at/" + f.slug + "/rsvp#"
+			if got := strings.Contains(text, "Your entry pass: "+link); got != tc.wantPass {
+				t.Errorf("entry pass line present = %v, want %v:\n%s", got, tc.wantPass, text)
+			}
+			if !strings.Contains(text, link) {
+				t.Errorf("edit link missing:\n%s", text)
+			}
+			if !strings.Contains(text, tc.wantCopy) {
+				t.Errorf("copy %q missing:\n%s", tc.wantCopy, text)
+			}
+			if tc.registration && tc.wantPass == strings.Contains(text, "Only a Yes gets an entry pass") {
+				t.Errorf("only-a-yes line wrong for attending %q:\n%s", tc.attending, text)
+			}
+		})
 	}
 }

@@ -124,6 +124,7 @@ func (s *Server) Routes() http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(requireUser)
 			r.Get("/me", s.handleMe)
+			r.Post("/check-ins", s.handleCheckIn)
 			r.Patch("/me", s.handlePatchMe)
 			r.Delete("/me", s.handleDeleteAccount)
 			r.Route("/me/sessions", func(r chi.Router) {
@@ -187,8 +188,12 @@ func (s *Server) Routes() http.Handler {
 						r.Patch("/", s.handleUpdateGuest)
 						r.Delete("/", s.handleDeleteGuest)
 						r.Post("/rotate-link", s.handleRotateGuestToken)
+						r.Put("/check-in", s.handleSetGuestCheckIn)
 					})
 				})
+
+				r.Get("/check-ins/summary", s.handleCheckInSummary)
+				r.Get("/registrations", s.handleListRegistrations)
 
 				r.Route("/members", func(r chi.Router) {
 					r.Get("/", s.handleListMembers)
@@ -206,6 +211,7 @@ func (s *Server) Routes() http.Handler {
 					r.Get("/", s.handleListRSVPs)
 					r.Get("/summary", s.handleRSVPSummary)
 					r.Delete("/{rsvpID}", s.handleDeleteRSVP)
+					r.Put("/{rsvpID}/check-in", s.handleSetRSVPCheckIn)
 				})
 			})
 		})

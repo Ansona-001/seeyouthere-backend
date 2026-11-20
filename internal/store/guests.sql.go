@@ -101,7 +101,7 @@ func (q *Queries) DeleteGuest(ctx context.Context, arg DeleteGuestParams) (int64
 const getGuestForInviteEmail = `-- name: GetGuestForInviteEmail :one
 SELECT g.id, g.name, g.email, g.token_version,
        e.id AS event_id, e.slug AS event_slug, e.title AS event_title, e.status AS event_status,
-       e.starts_at AS event_starts_at, u.name AS owner_name
+       e.starts_at AS event_starts_at, e.kind AS event_kind, e.entry_passes AS event_entry_passes, u.name AS owner_name
 FROM guests g
 JOIN events e ON e.id = g.event_id
 LEFT JOIN users u ON u.id = e.owner_id AND u.deleted_at IS NULL
@@ -109,16 +109,18 @@ WHERE g.id = $1 AND e.deleted_at IS NULL
 `
 
 type GetGuestForInviteEmailRow struct {
-	ID            uuid.UUID  `json:"id"`
-	Name          string     `json:"name"`
-	Email         *string    `json:"email"`
-	TokenVersion  int32      `json:"token_version"`
-	EventID       uuid.UUID  `json:"event_id"`
-	EventSlug     *string    `json:"event_slug"`
-	EventTitle    string     `json:"event_title"`
-	EventStatus   string     `json:"event_status"`
-	EventStartsAt *time.Time `json:"event_starts_at"`
-	OwnerName     *string    `json:"owner_name"`
+	ID               uuid.UUID  `json:"id"`
+	Name             string     `json:"name"`
+	Email            *string    `json:"email"`
+	TokenVersion     int32      `json:"token_version"`
+	EventID          uuid.UUID  `json:"event_id"`
+	EventSlug        *string    `json:"event_slug"`
+	EventTitle       string     `json:"event_title"`
+	EventStatus      string     `json:"event_status"`
+	EventStartsAt    *time.Time `json:"event_starts_at"`
+	EventKind        string     `json:"event_kind"`
+	EventEntryPasses bool       `json:"event_entry_passes"`
+	OwnerName        *string    `json:"owner_name"`
 }
 
 // send_invite job. The job no-ops unless the event is published and the guest still has an email.
@@ -135,26 +137,31 @@ func (q *Queries) GetGuestForInviteEmail(ctx context.Context, guestID uuid.UUID)
 		&i.EventTitle,
 		&i.EventStatus,
 		&i.EventStartsAt,
+		&i.EventKind,
+		&i.EventEntryPasses,
 		&i.OwnerName,
 	)
 	return i, err
 }
 
 const getGuestForToken = `-- name: GetGuestForToken :one
-SELECT g.id, g.event_id, g.name, g.household_size, g.token_version, e.slug AS event_slug, e.status AS event_status
+SELECT g.id, g.event_id, g.name, g.household_size, g.token_version, e.slug AS event_slug, e.status AS event_status,
+       e.kind AS event_kind, g.checked_in_at
 FROM guests g
 JOIN events e ON e.id = g.event_id
 WHERE g.id = $1 AND e.deleted_at IS NULL
 `
 
 type GetGuestForTokenRow struct {
-	ID            uuid.UUID `json:"id"`
-	EventID       uuid.UUID `json:"event_id"`
-	Name          string    `json:"name"`
-	HouseholdSize int32     `json:"household_size"`
-	TokenVersion  int32     `json:"token_version"`
-	EventSlug     *string   `json:"event_slug"`
-	EventStatus   string    `json:"event_status"`
+	ID            uuid.UUID  `json:"id"`
+	EventID       uuid.UUID  `json:"event_id"`
+	Name          string     `json:"name"`
+	HouseholdSize int32      `json:"household_size"`
+	TokenVersion  int32      `json:"token_version"`
+	EventSlug     *string    `json:"event_slug"`
+	EventStatus   string     `json:"event_status"`
+	EventKind     string     `json:"event_kind"`
+	CheckedInAt   *time.Time `json:"checked_in_at"`
 }
 
 // Public; the caller has already verified the token MAC against token_version.
@@ -169,8 +176,30 @@ func (q *Queries) GetGuestForToken(ctx context.Context, guestID uuid.UUID) (GetG
 		&i.TokenVersion,
 		&i.EventSlug,
 		&i.EventStatus,
+		&i.EventKind,
+		&i.CheckedInAt,
 	)
 	return i, err
+}
+
+const getGuestIDByEmail = `-- name: GetGuestIDByEmail :one
+SELECT id FROM guests
+WHERE event_id = $1::uuid AND email = $2::text
+`
+
+type GetGuestIDByEmailParams struct {
+	EventID uuid.UUID `json:"event_id"`
+	Email   string    `json:"email"`
+}
+
+// Public registration flow: the invited guest with this email (lower-cased by the caller, as every
+// stored email is), via guests_event_email_key. The caller must not reveal the outcome to the
+// requester.
+func (q *Queries) GetGuestIDByEmail(ctx context.Context, arg GetGuestIDByEmailParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getGuestIDByEmail, arg.EventID, arg.Email)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const insertGuestsBatch = `-- name: InsertGuestsBatch :many
@@ -179,6 +208,7 @@ SELECT b.id, $1::uuid, b.name, nullif(b.email, ''), nullif(b.phone, ''), b.house
 FROM (SELECT unnest($2::uuid[]) AS id, unnest($3::text[]) AS name, unnest($4::text[]) AS email,
              unnest($5::text[]) AS phone, unnest($6::int[]) AS household_size) b
 WHERE event_role($1::uuid, $7::uuid) IN ('owner', 'editor')
+  AND NOT EXISTS (SELECT 1 FROM rsvps r WHERE r.event_id = $1::uuid AND r.registration AND r.email = b.email)
 ON CONFLICT (event_id, email) WHERE email IS NOT NULL DO NOTHING
 RETURNING id
 `
@@ -195,7 +225,8 @@ type InsertGuestsBatchParams struct {
 
 // CSV import, after LockEventForEditor in the same tx. Arrays are parallel; an empty string in
 // emails/phones means none. Rows whose email is already invited (or repeated in the batch) are
-// skipped; the returned ids are the inserted rows.
+// skipped, as are emails that already hold a registration on the event (hosted events); the
+// returned ids are the inserted rows.
 func (q *Queries) InsertGuestsBatch(ctx context.Context, arg InsertGuestsBatchParams) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, insertGuestsBatch,
 		arg.EventID,
@@ -226,18 +257,20 @@ func (q *Queries) InsertGuestsBatch(ctx context.Context, arg InsertGuestsBatchPa
 
 const listGuests = `-- name: ListGuests :many
 SELECT g.id, g.name, g.email, g.phone, g.household_size, g.token_version, g.invited_at, g.created_at,
+       g.checked_in_at, g.checked_in_count,
        r.attending AS rsvp_attending, r.count AS rsvp_count, r.updated_at AS rsvp_updated_at
 FROM (
-    SELECT x.id, x.event_id, x.name, x.email, x.phone, x.household_size, x.token_version, x.invited_at, x.created_at
+    SELECT x.id, x.event_id, x.name, x.email, x.phone, x.household_size, x.token_version, x.invited_at, x.created_at,
+           x.checked_in_at, x.checked_in_count
     FROM guests x
     WHERE x.event_id = $1::uuid
       AND event_role($1::uuid, $2::uuid) IS NOT NULL
       AND ($3::text IS NULL
            OR x.name ILIKE $3::text
-           OR x.email ILIKE $3::text)
-      AND (x.created_at, x.id) > ($4::timestamptz, $5::uuid)
+           OR ($4::bool AND x.email ILIKE $3::text))
+      AND (x.created_at, x.id) > ($5::timestamptz, $6::uuid)
     ORDER BY x.created_at, x.id
-    LIMIT $6::int
+    LIMIT $7::int
 ) g
 LEFT JOIN rsvps r ON r.event_id = g.event_id AND r.guest_id = g.id
 ORDER BY g.created_at, g.id
@@ -247,34 +280,39 @@ type ListGuestsParams struct {
 	EventID         uuid.UUID `json:"event_id"`
 	UserID          uuid.UUID `json:"user_id"`
 	Pattern         *string   `json:"pattern"`
+	MatchEmail      bool      `json:"match_email"`
 	CursorCreatedAt time.Time `json:"cursor_created_at"`
 	CursorID        uuid.UUID `json:"cursor_id"`
 	Lim             int32     `json:"lim"`
 }
 
 type ListGuestsRow struct {
-	ID            uuid.UUID  `json:"id"`
-	Name          string     `json:"name"`
-	Email         *string    `json:"email"`
-	Phone         *string    `json:"phone"`
-	HouseholdSize int32      `json:"household_size"`
-	TokenVersion  int32      `json:"token_version"`
-	InvitedAt     *time.Time `json:"invited_at"`
-	CreatedAt     time.Time  `json:"created_at"`
-	RsvpAttending *string    `json:"rsvp_attending"`
-	RsvpCount     *int32     `json:"rsvp_count"`
-	RsvpUpdatedAt *time.Time `json:"rsvp_updated_at"`
+	ID             uuid.UUID  `json:"id"`
+	Name           string     `json:"name"`
+	Email          *string    `json:"email"`
+	Phone          *string    `json:"phone"`
+	HouseholdSize  int32      `json:"household_size"`
+	TokenVersion   int32      `json:"token_version"`
+	InvitedAt      *time.Time `json:"invited_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	CheckedInAt    *time.Time `json:"checked_in_at"`
+	CheckedInCount int32      `json:"checked_in_count"`
+	RsvpAttending  *string    `json:"rsvp_attending"`
+	RsvpCount      *int32     `json:"rsvp_count"`
+	RsvpUpdatedAt  *time.Time `json:"rsvp_updated_at"`
 }
 
 // Any member. Oldest first (the order hosts entered them). pattern is NULL or an ILIKE pattern
 // built in Go with %, _ and \ escaped, e.g. '%ann%'. The RSVP join is at most one row per guest
-// (rsvps_event_guest_key).
+// (rsvps_event_guest_key). match_email is false for viewers, who never see contact details, so a
+// search cannot be used to probe which emails are on the list.
 // The page is cut before the join so only its rows are joined.
 func (q *Queries) ListGuests(ctx context.Context, arg ListGuestsParams) ([]ListGuestsRow, error) {
 	rows, err := q.db.Query(ctx, listGuests,
 		arg.EventID,
 		arg.UserID,
 		arg.Pattern,
+		arg.MatchEmail,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.Lim,
@@ -295,6 +333,8 @@ func (q *Queries) ListGuests(ctx context.Context, arg ListGuestsParams) ([]ListG
 			&i.TokenVersion,
 			&i.InvitedAt,
 			&i.CreatedAt,
+			&i.CheckedInAt,
+			&i.CheckedInCount,
 			&i.RsvpAttending,
 			&i.RsvpCount,
 			&i.RsvpUpdatedAt,

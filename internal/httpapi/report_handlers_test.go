@@ -16,7 +16,7 @@ import (
 func (f *publicEventFixture) withJobs(t *testing.T) {
 	t.Helper()
 	mediaStore := newTestMediaStore(t)
-	jobClient, err := jobs.NewClient(f.s.pool, noopSender{}, noopSender{}, f.s.q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes)
+	jobClient, err := jobs.NewClient(f.s.pool, noopSender{}, noopSender{}, f.s.q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes, 1000)
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}

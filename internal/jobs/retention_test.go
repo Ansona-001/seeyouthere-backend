@@ -93,7 +93,7 @@ func newRetentionFixture(t *testing.T) retentionFixture {
 	deleter := &fakeDeleter{pool: pool}
 	// A real, never-started client: InsertManyTx needs it to know the
 	// retention_reminder kind and to apply the args' InsertOpts.
-	client, err := NewClient(pool, sender, sender, q, nil, nil, nil, "", "https://seeyouthere.at", 0)
+	client, err := NewClient(pool, sender, sender, q, nil, nil, nil, "", "https://seeyouthere.at", 0, 1000)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -146,7 +146,7 @@ func (f retentionFixture) newEvent(t *testing.T, e retentionEvent) uuid.UUID {
 	starts := e.endsAt.Add(-2 * time.Hour)
 	id := uuid.Must(uuid.NewV7())
 	if _, err := f.q.CreateEvent(ctx, store.CreateEventParams{
-		ID: id, OwnerID: e.owner, OccasionSlug: "birthday", Title: e.title, Content: content,
+		ID: id, OwnerID: e.owner, OccasionSlug: "birthday", Kind: "invite", Title: e.title, Content: content,
 		Overrides: []byte("{}"), StartsAt: &starts, EndsAt: &e.endsAt,
 		TemplateID: tmpl.ID, TemplateVersion: tmpl.Version,
 	}); err != nil {

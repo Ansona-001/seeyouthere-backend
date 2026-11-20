@@ -124,7 +124,7 @@ func runServer(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) error
 	if cfg.RSVPMailFrom != "" {
 		calendarSender = &mail.SMTPSender{Addr: cfg.RSVPSMTPAddr, User: cfg.RSVPSMTPUser, Pass: cfg.RSVPSMTPPass, From: cfg.RSVPMailFrom}
 	}
-	jobClient, err := jobs.NewClient(pool, sender, calendarSender, store.New(pool), mediaStore, tokens, ratelimit.New(rdb), cfg.AdminAlertEmail, cfg.SiteURL, cfg.MediaTotalQuotaBytes)
+	jobClient, err := jobs.NewClient(pool, sender, calendarSender, store.New(pool), mediaStore, tokens, ratelimit.New(rdb), cfg.AdminAlertEmail, cfg.SiteURL, cfg.MediaTotalQuotaBytes, int64(cfg.MailDailyRegistrationCap))
 	if err != nil {
 		return fmt.Errorf("river client: %w", err)
 	}

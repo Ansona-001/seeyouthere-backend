@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -441,4 +442,99 @@ func TestHandleListPublicPhotos_OnlyApprovedAreServed(t *testing.T) {
 	if containsAll(body, pendingID.String()) {
 		t.Errorf("body = %s, pending photo %s must never be publicly listed", body, pendingID)
 	}
+}
+
+// --- GET /v1/public/events/{slug}: invite_only RSVP config ---
+
+type publicRsvpConfigBody struct {
+	Event struct {
+		RSVP struct {
+			Enabled      bool    `json:"enabled"`
+			Open         bool    `json:"open"`
+			ClosedReason *string `json:"closed_reason"`
+			Fields       []any   `json:"fields"`
+		} `json:"rsvp"`
+	} `json:"event"`
+}
+
+func getPublicRsvpConfig(t *testing.T, f *publicEventFixture, inviteCookie string) (publicRsvpConfigBody, http.Header) {
+	t.Helper()
+	req := withSlugParam(requestWithIP(http.MethodGet, "/", nextTestIP(), nil), f.slug)
+	if inviteCookie != "" {
+		req.AddCookie(&http.Cookie{Name: eventCookieName(inviteCookiePrefix, f.eventID), Value: inviteCookie})
+	}
+	rec := httptest.NewRecorder()
+	secureHeaders(http.HandlerFunc(f.s.handleGetPublicEvent)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out publicRsvpConfigBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return out, rec.Header()
+}
+
+func TestHandleGetPublicEvent_InviteOnlyRsvpConfig(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+
+	wantInviteOnly := func(t *testing.T, out publicRsvpConfigBody) {
+		t.Helper()
+		r := out.Event.RSVP
+		if !r.Enabled || r.Open || r.ClosedReason == nil || *r.ClosedReason != "invite_only" {
+			t.Errorf("rsvp = %+v, want enabled, closed, reason invite_only", r)
+		}
+		if len(r.Fields) == 0 {
+			t.Errorf("fields dropped from closed config")
+		}
+	}
+
+	t.Run("no cookie is closed invite_only and uncacheable", func(t *testing.T) {
+		f := newPublicEventFixture(t, pool, rdb, publicEventOpts{rsvpMode: "invite_only"})
+		out, h := getPublicRsvpConfig(t, f, "")
+		wantInviteOnly(t, out)
+		if got := h.Get("Cache-Control"); got != "no-store" {
+			t.Errorf("Cache-Control = %q, want no-store", got)
+		}
+	})
+
+	t.Run("valid invite cookie sees the open config", func(t *testing.T) {
+		f := newPublicEventFixture(t, pool, rdb, publicEventOpts{rsvpMode: "invite_only"})
+		_, inv := f.testGuest(t, "Priya", 2)
+		out, _ := getPublicRsvpConfig(t, f, inv)
+		if r := out.Event.RSVP; !r.Enabled || !r.Open || r.ClosedReason != nil {
+			t.Errorf("rsvp = %+v, want enabled and open", r)
+		}
+	})
+
+	t.Run("open-mode event is unaffected", func(t *testing.T) {
+		f := newPublicEventFixture(t, pool, rdb, publicEventOpts{})
+		out, _ := getPublicRsvpConfig(t, f, "")
+		if r := out.Event.RSVP; !r.Enabled || !r.Open || r.ClosedReason != nil {
+			t.Errorf("rsvp = %+v, want enabled and open", r)
+		}
+	})
+
+	t.Run("rotated invite cookie is closed invite_only", func(t *testing.T) {
+		f := newPublicEventFixture(t, pool, rdb, publicEventOpts{rsvpMode: "invite_only"})
+		gid, inv := f.testGuest(t, "Priya", 2)
+		if _, err := f.s.q.RotateGuestToken(context.Background(), store.RotateGuestTokenParams{GuestID: gid, EventID: f.eventID, UserID: f.ownerID}); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		out, _ := getPublicRsvpConfig(t, f, inv)
+		wantInviteOnly(t, out)
+	})
+
+	t.Run("invite_only wins over a passed deadline without an invite", func(t *testing.T) {
+		f := newPublicEventFixture(t, pool, rdb, publicEventOpts{rsvpMode: "invite_only"})
+		f.setRSVPContent(t, nil, "2020-01-01T00:00", 4, 4)
+		out, _ := getPublicRsvpConfig(t, f, "")
+		wantInviteOnly(t, out)
+		_, inv := f.testGuest(t, "Priya", 2)
+		out, _ = getPublicRsvpConfig(t, f, inv)
+		if r := out.Event.RSVP; r.Open || r.ClosedReason == nil || *r.ClosedReason != "deadline" {
+			t.Errorf("with invite: rsvp = %+v, want closed deadline", r)
+		}
+	})
 }

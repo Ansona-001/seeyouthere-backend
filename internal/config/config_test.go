@@ -229,3 +229,39 @@ func TestLoad_MediaMinFree(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_MailDailyRegistrationCap(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		want    int
+		wantErr bool
+	}{
+		{"default", "", 1000, false},
+		{"explicit", "250", 250, false},
+		{"zero", "0", 0, true},
+		{"too large", "100001", 0, true},
+		{"not a number", "lots", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			if tc.value != "" {
+				t.Setenv("MAIL_DAILY_REGISTRATION_CAP", tc.value)
+			}
+			c, err := Load()
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "MAIL_DAILY_REGISTRATION_CAP") {
+					t.Fatalf("Load() error = %v, want one naming MAIL_DAILY_REGISTRATION_CAP", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if c.MailDailyRegistrationCap != tc.want {
+				t.Errorf("MailDailyRegistrationCap = %d, want %d", c.MailDailyRegistrationCap, tc.want)
+			}
+		})
+	}
+}

@@ -28,7 +28,7 @@ func withGuestFixtureJobs(t *testing.T, f eventTestFixture, pool *pgxpool.Pool) 
 	f.s.tokens = keys
 
 	mediaStore := newTestMediaStore(t)
-	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, f.s.q, mediaStore, keys, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes)
+	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, f.s.q, mediaStore, keys, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes, 1000)
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}

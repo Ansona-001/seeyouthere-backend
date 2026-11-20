@@ -36,6 +36,10 @@ const (
 
 var validVisibilities = map[string]bool{"unlisted": true, "password": true, "invite_only": true, "public": true}
 var validRsvpModes = map[string]bool{"open": true, "invite_only": true}
+var validEventKinds = map[string]bool{"invite": true, "hosted": true}
+
+// hostedOccasionSlug is the only occasion that can be hosted (entry passes + door check-in): the "On stage" one.
+const hostedOccasionSlug = "function"
 
 var (
 	errTooManyEvents   = errors.New("too many live events")
@@ -264,12 +268,15 @@ type eventResp struct {
 	Slug           *string    `json:"slug"`
 	Title          string     `json:"title"`
 	OccasionSlug   string     `json:"occasion_slug"`
+	Kind           string     `json:"kind"`
 	Status         string     `json:"status"`
 	Visibility     string     `json:"visibility"`
 	HasPassword    bool       `json:"has_password"`
 	RsvpMode       string     `json:"rsvp_mode"`
 	RemoveBranding bool       `json:"remove_branding"`
 	NotifyRsvps    bool       `json:"notify_rsvps"`
+	// EntryPasses: a hosted event shows and mails entry passes (QR codes); false = registration only.
+	EntryPasses bool       `json:"entry_passes"`
 	StartsAt       *time.Time `json:"starts_at"`
 	// EndsAt is derived from the content's datetime block end_local (nil if
 	// absent or the block is invalid), so the frontend's add-to-calendar
@@ -442,9 +449,9 @@ func (s *Server) buildEventResponse(ctx context.Context, q *store.Queries, row e
 	}
 
 	return eventResp{
-		ID: e.ID, Slug: e.Slug, Title: e.Title, OccasionSlug: e.OccasionSlug, Status: e.Status,
+		ID: e.ID, Slug: e.Slug, Title: e.Title, OccasionSlug: e.OccasionSlug, Kind: e.Kind, Status: e.Status,
 		Visibility: e.Visibility, HasPassword: e.PasswordHash != nil, RsvpMode: e.RsvpMode,
-		RemoveBranding: e.RemoveBranding, NotifyRsvps: e.NotifyRsvps, StartsAt: e.StartsAt,
+		RemoveBranding: e.RemoveBranding, NotifyRsvps: e.NotifyRsvps, EntryPasses: e.EntryPasses, StartsAt: e.StartsAt,
 		EndsAt:      saved.EndsAt,
 		PublishedAt: e.PublishedAt, CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt, Version: e.Version,
 		Role: row.Role,
@@ -472,6 +479,7 @@ type eventSummaryResp struct {
 	Slug         *string        `json:"slug"`
 	Title        string         `json:"title"`
 	OccasionSlug string         `json:"occasion_slug"`
+	Kind         string         `json:"kind"`
 	Status       string         `json:"status"`
 	StartsAt     *time.Time     `json:"starts_at"`
 	Role         string         `json:"role"`
@@ -535,8 +543,17 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		OccasionSlug string            `json:"occasion_slug"`
 		TemplateSlug string            `json:"template_slug"`
 		Answers      map[string]string `json:"answers"`
+		Kind         string            `json:"kind"`
 	}
 	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.Kind == "" {
+		body.Kind = "invite"
+	}
+	if !validEventKinds[body.Kind] {
+		writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the highlighted fields.",
+			[]content.Issue{{Path: "kind", Code: "invalid", Message: "Must be invite or hosted."}})
 		return
 	}
 
@@ -557,6 +574,11 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	occasionSlug := strings.TrimSpace(body.OccasionSlug)
+	if body.Kind == "hosted" && occasionSlug != hostedOccasionSlug {
+		writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the highlighted fields.",
+			[]content.Issue{{Path: "kind", Code: "invalid", Message: "Only stage events can be hosted."}})
+		return
+	}
 	occRow, err := s.q.GetOccasion(ctx, occasionSlug)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusBadRequest, "unknown_occasion", "Unknown occasion.")
@@ -570,6 +592,9 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		serverError(w, r, fmt.Errorf("parse occasion %s: %w", occasionSlug, err))
 		return
+	}
+	if body.Kind == "hosted" {
+		occ = content.HostedOccasion(occ)
 	}
 
 	templateSlug := strings.TrimSpace(body.TemplateSlug)
@@ -598,7 +623,7 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	createParams := store.CreateEventParams{
-		ID: uuid.Must(uuid.NewV7()), OccasionSlug: occasionSlug, Title: saved.Title,
+		ID: uuid.Must(uuid.NewV7()), OccasionSlug: occasionSlug, Kind: body.Kind, Title: saved.Title,
 		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		TemplateID: tmpl.ID, TemplateVersion: tmpl.Version,
 	}
@@ -733,9 +758,19 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 		cursorCreatedAt, cursorID = t, id
 	}
 
+	// Optional ?kind=invite|hosted; anything else is rejected rather than silently ignored.
+	var kind *string
+	if k := r.URL.Query().Get("kind"); k != "" {
+		if k != "invite" && k != "hosted" {
+			writeError(w, http.StatusBadRequest, "invalid_kind", "Invalid kind.")
+			return
+		}
+		kind = &k
+	}
+
 	ctx := r.Context()
 	rows, err := s.q.ListEventsForUser(ctx, store.ListEventsForUserParams{
-		UserID: userID, CursorCreatedAt: cursorCreatedAt, CursorID: cursorID, Lim: int32(limit),
+		UserID: userID, CursorCreatedAt: cursorCreatedAt, CursorID: cursorID, Kind: kind, Lim: int32(limit),
 	})
 	if err != nil {
 		serverError(w, r, fmt.Errorf("list events: %w", err))
@@ -762,7 +797,7 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	for i, row := range rows {
 		c := counts[row.ID]
 		summaries[i] = eventSummaryResp{
-			ID: row.ID, Slug: row.Slug, Title: row.Title, OccasionSlug: row.OccasionSlug,
+			ID: row.ID, Slug: row.Slug, Title: row.Title, OccasionSlug: row.OccasionSlug, Kind: row.Kind,
 			Status: row.Status, StartsAt: row.StartsAt, Role: row.Role, CreatedAt: row.CreatedAt,
 			RSVP: rsvpCountsResp{Yes: c.Yes, No: c.No, Maybe: c.Maybe, YesHeads: c.YesHeads},
 		}
@@ -1274,6 +1309,7 @@ func (s *Server) handleUpdateEventSettings(w http.ResponseWriter, r *http.Reques
 		Password    *string `json:"password"`
 		RsvpMode    *string `json:"rsvp_mode"`
 		NotifyRsvps *bool   `json:"notify_rsvps"`
+		EntryPasses *bool   `json:"entry_passes"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -1364,6 +1400,11 @@ func (s *Server) handleUpdateEventSettings(w http.ResponseWriter, r *http.Reques
 		}
 		passwordHash = &hash
 	}
+	if body.EntryPasses != nil && row.Event.Kind != "hosted" {
+		writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Only hosted events have entry passes.",
+			[]content.Issue{{Path: "entry_passes", Code: "invalid", Message: "Only hosted events have entry passes."}})
+		return
+	}
 	if newVisibility == "password" && passwordHash == nil && row.Event.PasswordHash == nil {
 		writeError(w, http.StatusBadRequest, "password_required", "Set a password for this event.")
 		return
@@ -1371,7 +1412,7 @@ func (s *Server) handleUpdateEventSettings(w http.ResponseWriter, r *http.Reques
 
 	_, err = s.q.UpdateEventSettings(ctx, store.UpdateEventSettingsParams{
 		Slug: normalizedSlug, Visibility: body.Visibility, PasswordHash: passwordHash,
-		RsvpMode: body.RsvpMode, NotifyRsvps: body.NotifyRsvps,
+		RsvpMode: body.RsvpMode, NotifyRsvps: body.NotifyRsvps, EntryPasses: body.EntryPasses,
 		EventID: eventID, UserID: userID, Version: body.Version,
 	})
 	if err != nil {

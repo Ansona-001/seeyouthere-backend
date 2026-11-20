@@ -74,6 +74,11 @@ type Config struct {
 	AdminAlertEmail string
 	// MailDailyInviteCap is the global daily cap on send_invite jobs.
 	MailDailyInviteCap int
+	// MailDailyRegistrationCap is the global daily cap on registration confirmation emails (hosted
+	// events' open sign-ups). It has its own counter so a sign-up flood cannot starve invites and
+	// other mail, and should stay under the SMTP provider's daily sending limit. Over the cap, mails
+	// are deferred to the next UTC day, not dropped.
+	MailDailyRegistrationCap int
 	// AdminMFATTL is how long an admin session's step-up verification lasts.
 	AdminMFATTL time.Duration
 }
@@ -220,6 +225,13 @@ func Load() (Config, error) {
 		errs = append(errs, errors.New("MAIL_DAILY_INVITE_CAP must be an integer between 1 and 100000"))
 	} else {
 		c.MailDailyInviteCap = inviteCap
+	}
+
+	regCap, err := strconv.Atoi(env("MAIL_DAILY_REGISTRATION_CAP", "1000"))
+	if err != nil || regCap < 1 || regCap > 100000 {
+		errs = append(errs, errors.New("MAIL_DAILY_REGISTRATION_CAP must be an integer between 1 and 100000"))
+	} else {
+		c.MailDailyRegistrationCap = regCap
 	}
 
 	if c.AdminMFATTL, err = time.ParseDuration(env("ADMIN_MFA_TTL", "12h")); err != nil {

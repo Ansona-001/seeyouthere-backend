@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -30,13 +31,43 @@ import (
 // endpoint to spam a third party via repeated new open RSVPs.
 const maxRSVPConfirmationsPerRecipientPerDay = 5
 
+const (
+	// MaxRegistrationConfirmationsPerEventPerDay bounds registration confirmations per event per UTC
+	// day: the shared public link of a hosted event can otherwise be used to mail arbitrary addresses
+	// at volume. It sits above the expected sign-up volume of one day (an event holds at most 5000
+	// registrations in total) so legitimate sign-ups are not starved. Over it the mail is deferred to
+	// the next UTC day, not dropped.
+	MaxRegistrationConfirmationsPerEventPerDay = 2000
+
+	// registrationConfirmationMaxAge is how long a registration confirmation may stay deferred by the
+	// daily caps. A job older than this is dropped (logged) instead of snoozed again, so a permanently
+	// saturated cap cannot keep jobs alive forever. River does not count a snooze as an attempt, so
+	// MaxAttempts cannot bound this; the job's age does.
+	registrationConfirmationMaxAge = 3 * 24 * time.Hour
+	// snoozeJitter spreads the jobs deferred by a cap over the minutes after midnight, so they do not
+	// all wake at the same instant.
+	snoozeJitter = 10 * time.Minute
+)
+
+// RSVPConfirmEventKey is the limiter key for the per-event daily count of RSVP confirmation emails.
+func RSVPConfirmEventKey(eventID uuid.UUID, day string) string {
+	return "rsvp_confirm:event:" + eventID.String() + ":" + day
+}
+
+// RegistrationConfirmGlobalKey is the limiter key for the global daily count of registration
+// confirmations. It is separate from the invite / RSVP confirmation counter so sign-up volume cannot
+// starve other mail.
+func RegistrationConfirmGlobalKey(day string) string { return "rsvp_confirm:reg:global:" + day }
+
 // SendRSVPConfirmationArgs emails whoever just submitted an RSVP a link back
 // to it: the guest's invite link for a guest RSVP, or the open RSVP's own
 // edit link otherwise. Enqueued on create, and on update only if the email
 // changed (§4.4); never carries a raw token (decision 1), the same rule as
-// send_invite.
+// send_invite. Resend marks a duplicate-registration link re-send, which skips the
+// per-event cap (recovery must still work once an event is flooded with sign-ups).
 type SendRSVPConfirmationArgs struct {
 	RSVPID uuid.UUID `json:"rsvp_id"`
+	Resend bool      `json:"resend,omitempty"`
 }
 
 func (SendRSVPConfirmationArgs) Kind() string { return "send_rsvp_confirmation" }
@@ -57,6 +88,9 @@ type SendRSVPConfirmationWorker struct {
 	Tokens         *token.Keys
 	Limiter        *ratelimit.Limiter
 	SiteURL        string
+	// RegistrationDailyCap is the global daily cap on registration confirmations
+	// (config.MailDailyRegistrationCap).
+	RegistrationDailyCap int64
 }
 
 func (w *SendRSVPConfirmationWorker) Timeout(*river.Job[SendRSVPConfirmationArgs]) time.Duration {
@@ -67,6 +101,13 @@ func (w *SendRSVPConfirmationWorker) Timeout(*river.Job[SendRSVPConfirmationArgs
 // any of them may have changed between the write and this job running (the
 // RSVP deleted, the event unpublished or taken down). Every such case is a
 // silent no-op, matching send_invite.
+//
+// A registration's mail is counted here, not at enqueue, so a cap can defer it: over the per-event
+// daily cap or the global registration cap the job snoozes to just after the next UTC midnight
+// (River does not count a snooze as an attempt) and is dropped only once it is
+// registrationConfirmationMaxAge old. The per-recipient cap is the anti-bombing limit and drops the
+// mail: retrying later would only mail the same third party again. Every counter taken for a mail
+// that is not sent is refunded.
 func (w *SendRSVPConfirmationWorker) Work(ctx context.Context, job *river.Job[SendRSVPConfirmationArgs]) error {
 	r, err := w.Queries.GetRSVPForConfirmation(ctx, job.Args.RSVPID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -82,17 +123,53 @@ func (w *SendRSVPConfirmationWorker) Work(ctx context.Context, job *river.Job[Se
 		return nil
 	}
 
+	// Counters taken so far, refunded if the mail does not go out.
+	var held []string
+	refund := func(ctx context.Context) {
+		for _, k := range held {
+			w.Limiter.Uncount(ctx, k, 1)
+		}
+	}
+	if r.Registration {
+		today := time.Now().UTC().Format("2006-01-02")
+		if !job.Args.Resend {
+			eventKey := RSVPConfirmEventKey(r.EventID, today)
+			ok, err := w.Limiter.AllowN(ctx, eventKey, 1, MaxRegistrationConfirmationsPerEventPerDay, 24*time.Hour)
+			if err != nil {
+				return fmt.Errorf("send_rsvp_confirmation: event rate limit: %w", err)
+			}
+			if !ok {
+				return deferRegistrationConfirmation(ctx, job, r.ID, r.EventID, "event")
+			}
+			held = append(held, eventKey)
+		}
+		globalKey := RegistrationConfirmGlobalKey(today)
+		ok, err := w.Limiter.AllowN(ctx, globalKey, 1, w.RegistrationDailyCap, 48*time.Hour)
+		if err != nil {
+			refund(ctx)
+			return fmt.Errorf("send_rsvp_confirmation: global rate limit: %w", err)
+		}
+		if !ok {
+			refund(ctx)
+			return deferRegistrationConfirmation(ctx, job, r.ID, r.EventID, "global")
+		}
+		held = append(held, globalKey)
+	}
+
 	recipient := strings.ToLower(strings.TrimSpace(*r.Email))
 	sum := sha256.Sum256([]byte(recipient))
 	rcptKey := "rsvp_confirm:rcpt:" + hex.EncodeToString(sum[:])
 	allowed, err := w.Limiter.AllowN(ctx, rcptKey, 1, maxRSVPConfirmationsPerRecipientPerDay, 24*time.Hour)
 	if err != nil {
+		refund(ctx)
 		return fmt.Errorf("send_rsvp_confirmation: rate limit: %w", err)
 	}
 	if !allowed {
-		slog.InfoContext(ctx, "send_rsvp_confirmation: recipient rate limited", "rsvp_id", r.ID)
+		refund(ctx)
+		slog.InfoContext(ctx, "send_rsvp_confirmation: recipient rate limited, dropping", "rsvp_id", r.ID)
 		return nil
 	}
+	held = append(held, rcptKey)
 
 	var editURL string
 	if r.GuestID != nil && r.GuestTokenVersion != nil {
@@ -119,13 +196,22 @@ func (w *SendRSVPConfirmationWorker) Work(ctx context.Context, job *river.Job[Se
 	if r.Attending != "no" {
 		fmt.Fprintf(&b, " (%d attending)", r.Count)
 	}
-	fmt.Fprintf(&b, "\n\nYou can change your response any time:\n%s\n\n", editURL)
+	if r.Registration && r.EventEntryPasses && r.Attending == "yes" {
+		// The link opens the registration page, which shows the entry pass as a QR code. Anyone with
+		// the link holds the pass, so the email says so.
+		fmt.Fprintf(&b, "\n\nYour entry pass: %s\n\nShow it at the door. Keep this email to yourself: anyone with the link can use your pass. You can also change your response from that page.\n\n", editURL)
+	} else if r.Registration && r.EventEntryPasses {
+		// Only a Yes holds an entry pass; a maybe or no registration gets the same link to change its reply.
+		fmt.Fprintf(&b, "\n\nWe got your reply. You can change it any time:\n%s\n\nOnly a Yes gets an entry pass. If you change your reply to Yes, your pass will be on that page. Keep this email to yourself: anyone with the link can change your reply.\n\n", editURL)
+	} else {
+		fmt.Fprintf(&b, "\n\nYou can change your response any time:\n%s\n\n", editURL)
+	}
 
-	// A failed send must not burn the recipient's daily quota: MaxAttempts
-	// retries the same job up to 5 times, and without refunding here a
-	// misconfigured Sender would consume all 5 of a recipient's slots
-	// without ever delivering anything, blocking their other confirmation
-	// emails for 24h.
+	// A failed send must not burn the daily quotas: MaxAttempts retries the
+	// same job up to 5 times, and without refunding here a misconfigured
+	// Sender would consume all 5 of a recipient's slots (and the event and
+	// global counters) without ever delivering anything, blocking their
+	// other confirmation emails for 24h.
 	if r.Attending != "yes" {
 		fmt.Fprintf(&b, "Report this page: %s\n", reportURL)
 		if err := w.Sender.Send(ctx, mail.Message{
@@ -133,7 +219,7 @@ func (w *SendRSVPConfirmationWorker) Work(ctx context.Context, job *river.Job[Se
 			Subject: fmt.Sprintf("Your RSVP for %s", title),
 			Text:    b.String(),
 		}); err != nil {
-			w.Limiter.Uncount(ctx, rcptKey, 1)
+			refund(ctx)
 			return err
 		}
 		return nil
@@ -169,7 +255,7 @@ func (w *SendRSVPConfirmationWorker) Work(ctx context.Context, job *river.Job[Se
 		sender = w.Sender
 	}
 	if err := sender.Send(ctx, msg); err != nil {
-		w.Limiter.Uncount(ctx, rcptKey, 1)
+		refund(ctx)
 		return err
 	}
 	return nil
@@ -278,4 +364,26 @@ func (w *NotifyRSVPsWorker) Work(ctx context.Context, job *river.Job[NotifyRSVPs
 		Subject: fmt.Sprintf("New RSVPs for %s", title),
 		Text:    b.String(),
 	})
+}
+
+// deferRegistrationConfirmation snoozes a registration confirmation that hit a daily cap to just
+// after the next UTC midnight, when the day-keyed counters restart. A job that has already waited
+// registrationConfirmationMaxAge is dropped instead. which names the cap ("event" or "global").
+func deferRegistrationConfirmation(ctx context.Context, job *river.Job[SendRSVPConfirmationArgs], rsvpID, eventID uuid.UUID, which string) error {
+	now := time.Now()
+	if now.Sub(job.CreatedAt) >= registrationConfirmationMaxAge {
+		slog.WarnContext(ctx, "send_rsvp_confirmation: registration mail deferred too long, dropping",
+			"rsvp_id", rsvpID, "event_id", eventID, "cap", which)
+		return nil
+	}
+	d := untilNextUTCDay(now) + time.Minute + rand.N(snoozeJitter)
+	slog.InfoContext(ctx, "send_rsvp_confirmation: daily mail cap reached, deferring to next UTC day",
+		"rsvp_id", rsvpID, "event_id", eventID, "cap", which, "snooze", d.Round(time.Second).String())
+	return river.JobSnooze(d)
+}
+
+// untilNextUTCDay is the time from now to the next 00:00 UTC.
+func untilNextUTCDay(now time.Time) time.Duration {
+	n := now.UTC()
+	return time.Date(n.Year(), n.Month(), n.Day()+1, 0, 0, 0, 0, time.UTC).Sub(n)
 }

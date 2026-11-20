@@ -11,9 +11,12 @@
 -- No row when the template pin is not selectable; the caller maps pgx.ErrNoRows to a validation error.
 -- retention_from is the retention clock: greatest(ends_at, now()), so a past end starts a full
 -- retention window now (greatest ignores NULL, hence the CASE).
-INSERT INTO events (id, owner_id, occasion_slug, title, content, template_id, template_version, overrides,
-                    starts_at, ends_at, retention_from)
-SELECT @id::uuid, sqlc.narg(owner_id)::uuid, @occasion_slug::text, @title::text, @content::jsonb,
+-- kind is 'invite' or 'hosted'. Every event starts with open RSVPs (on a hosted event, open
+-- registration); the owner can switch to invite-only in settings.
+INSERT INTO events (id, owner_id, occasion_slug, kind, rsvp_mode, title, content, template_id, template_version,
+                    overrides, starts_at, ends_at, retention_from)
+SELECT @id::uuid, sqlc.narg(owner_id)::uuid, @occasion_slug::text, @kind::text, 'open',
+       @title::text, @content::jsonb,
        t.id, tv.version, @overrides::jsonb, sqlc.narg(starts_at)::timestamptz, sqlc.narg(ends_at)::timestamptz,
        CASE WHEN sqlc.narg(ends_at)::timestamptz IS NOT NULL THEN greatest(sqlc.narg(ends_at)::timestamptz, now()) END
 FROM templates t
@@ -77,23 +80,25 @@ WHERE e.id = @event_id
               WHERE a.event_id = e.id AND a.cookie_hash = @cookie_hash AND a.expires_at > now());
 
 -- name: ListEventsForUser :many
--- Owned and co-hosted events, newest first. Each branch is limited on its own index before the merge.
-SELECT x.id, x.slug, x.title, x.occasion_slug, x.status, x.starts_at, x.created_at, x.role
+-- Owned and co-hosted events, newest first, optionally only one kind (invite/hosted). Each branch is limited on its own index before the merge.
+SELECT x.id, x.slug, x.title, x.occasion_slug, x.kind, x.status, x.starts_at, x.created_at, x.role
 FROM (
-    (SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.starts_at, e.created_at, 'owner'::text AS role
+    (SELECT e.id, e.slug, e.title, e.occasion_slug, e.kind, e.status, e.starts_at, e.created_at, 'owner'::text AS role
      FROM events e
      WHERE e.owner_id = @user_id::uuid
        AND e.deleted_at IS NULL
        AND (e.created_at, e.id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
+       AND (sqlc.narg(kind)::text IS NULL OR e.kind = sqlc.narg(kind)::text)
      ORDER BY e.created_at DESC, e.id DESC
      LIMIT sqlc.arg(lim)::int)
     UNION ALL
-    (SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.starts_at, e.created_at, m.role
+    (SELECT e.id, e.slug, e.title, e.occasion_slug, e.kind, e.status, e.starts_at, e.created_at, m.role
      FROM event_members m
      JOIN events e ON e.id = m.event_id
      WHERE m.user_id = @user_id::uuid
        AND e.deleted_at IS NULL
        AND (e.created_at, e.id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
+       AND (sqlc.narg(kind)::text IS NULL OR e.kind = sqlc.narg(kind)::text)
      ORDER BY e.created_at DESC, e.id DESC
      LIMIT sqlc.arg(lim)::int)
 ) x
@@ -246,6 +251,7 @@ SET slug = coalesce(sqlc.narg(slug), e.slug),
     END,
     rsvp_mode = coalesce(sqlc.narg(rsvp_mode), e.rsvp_mode),
     notify_rsvps = coalesce(sqlc.narg(notify_rsvps), e.notify_rsvps),
+    entry_passes = coalesce(sqlc.narg(entry_passes), e.entry_passes),
     version = e.version + 1,
     updated_at = now()
 WHERE e.id = @event_id
@@ -333,8 +339,8 @@ WHERE event_id = ANY(@event_ids::uuid[]) AND owner_id IS NULL;
 
 -- name: GetPublicEventBySlug :one
 -- Public page. password_hash is only for the Go-side gate and must never be serialised.
-SELECT e.id, e.slug, e.title, e.occasion_slug, e.content, e.overrides, e.visibility, e.password_hash,
-       e.rsvp_mode, e.remove_branding, e.starts_at, e.template_id, e.template_version,
+SELECT e.id, e.slug, e.title, e.occasion_slug, e.kind, e.content, e.overrides, e.visibility, e.password_hash,
+       e.rsvp_mode, e.entry_passes, e.remove_branding, e.starts_at, e.template_id, e.template_version,
        e.share_image, e.share_media_id, e.music_source, a.id AS audio_id,
        tv.manifest, tv.assets_path,
        sqlc.embed(o)
@@ -347,7 +353,7 @@ WHERE e.slug = @slug AND e.status = 'published' AND e.deleted_at IS NULL;
 -- name: LockEventForRSVP :one
 -- First statement of an RSVP or guest-photo write: serialises capacity and quota checks per event.
 -- FOR NO KEY UPDATE does not block the FK checks of concurrent inserts into child tables.
-SELECT e.id, e.slug, e.title, e.occasion_slug, e.content, e.rsvp_mode, e.visibility, e.notify_rsvps, e.owner_id
+SELECT e.id, e.slug, e.title, e.occasion_slug, e.kind, e.content, e.rsvp_mode, e.visibility, e.notify_rsvps, e.owner_id
 FROM events e
 WHERE e.id = @event_id AND e.status = 'published' AND e.deleted_at IS NULL
 FOR NO KEY UPDATE;

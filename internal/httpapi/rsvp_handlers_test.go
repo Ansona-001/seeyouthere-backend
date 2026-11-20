@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -511,6 +512,61 @@ func TestHandleListRSVPsAndSummary_IDORMatrix(t *testing.T) {
 	}
 }
 
+func TestHandleListRSVPs_ContactVisibility(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	f := newEventTestFixture(t, pool, rdb)
+
+	email := "guest@example.com"
+	if _, err := f.s.q.CreateOpenRSVP(context.Background(), store.CreateOpenRSVPParams{
+		ID: uuid.Must(uuid.NewV7()), EventID: f.eventID, Name: "Guest", Email: &email, Attending: "yes", Count: 1,
+		Answers: []byte(`{"diet":"vegan"}`),
+	}); err != nil {
+		t.Fatalf("create open rsvp: %v", err)
+	}
+
+	cases := []struct {
+		name         string
+		userID       uuid.UUID
+		wantContacts bool
+	}{
+		{"owner", f.ownerID, true},
+		{"editor", f.editorID, true},
+		{"viewer", f.viewerID, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			f.s.handleListRSVPs(rec, withRouteID(requestAs(http.MethodGet, "/", c.userID), f.eventID))
+			wantStatusCode(t, rec, http.StatusOK, "")
+			var out struct {
+				RSVPs []struct {
+					Name    string          `json:"name"`
+					Email   *string         `json:"email"`
+					Answers json.RawMessage `json:"answers"`
+				} `json:"rsvps"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.RSVPs) != 1 {
+				t.Fatalf("decode %q: %v", rec.Body.String(), err)
+			}
+			got := out.RSVPs[0]
+			if got.Name != "Guest" {
+				t.Errorf("name = %q, want Guest", got.Name)
+			}
+			if c.wantContacts {
+				if got.Email == nil || *got.Email != email || !strings.Contains(string(got.Answers), "vegan") {
+					t.Errorf("email = %v, answers = %s, want both visible", got.Email, got.Answers)
+				}
+			} else if got.Email != nil || (len(got.Answers) != 0 && string(got.Answers) != "null") {
+				t.Errorf("viewer sees contact data: email = %v, answers = %s", got.Email, got.Answers)
+			}
+			if !c.wantContacts && strings.Contains(rec.Body.String(), "example.com") {
+				t.Errorf("viewer body leaks email: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestHandleDeleteRSVP_IDORMatrix(t *testing.T) {
 	pool := dbTestPool(t)
 	rdb := dbTestRedis(t)
@@ -675,7 +731,8 @@ func TestHandleExportRSVPsCSV_IDORMatrix(t *testing.T) {
 		wantStatus int
 	}{
 		{"owner", f.ownerID, http.StatusOK},
-		{"viewer", f.viewerID, http.StatusOK},
+		{"editor", f.editorID, http.StatusOK},
+		{"viewer", f.viewerID, http.StatusForbidden},
 		{"stranger", f.strangerID, http.StatusNotFound},
 	}
 	for _, c := range cases {

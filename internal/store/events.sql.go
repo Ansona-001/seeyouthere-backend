@@ -221,24 +221,26 @@ func (q *Queries) CreateAnonDraft(ctx context.Context, arg CreateAnonDraftParams
 const createEvent = `-- name: CreateEvent :one
 
 
-INSERT INTO events (id, owner_id, occasion_slug, title, content, template_id, template_version, overrides,
-                    starts_at, ends_at, retention_from)
-SELECT $1::uuid, $2::uuid, $3::text, $4::text, $5::jsonb,
-       t.id, tv.version, $6::jsonb, $7::timestamptz, $8::timestamptz,
-       CASE WHEN $8::timestamptz IS NOT NULL THEN greatest($8::timestamptz, now()) END
+INSERT INTO events (id, owner_id, occasion_slug, kind, rsvp_mode, title, content, template_id, template_version,
+                    overrides, starts_at, ends_at, retention_from)
+SELECT $1::uuid, $2::uuid, $3::text, $4::text, 'open',
+       $5::text, $6::jsonb,
+       t.id, tv.version, $7::jsonb, $8::timestamptz, $9::timestamptz,
+       CASE WHEN $9::timestamptz IS NOT NULL THEN greatest($9::timestamptz, now()) END
 FROM templates t
 JOIN template_versions tv ON tv.template_id = t.id
-WHERE t.id = $9::uuid
-  AND tv.version = $10::int
+WHERE t.id = $10::uuid
+  AND tv.version = $11::int
   AND tv.published_at IS NOT NULL
   AND t.status = 'published'
-RETURNING id, owner_id, occasion_slug, slug, title, content, template_id, template_version, overrides, visibility, password_hash, rsvp_mode, status, remove_branding, starts_at, published_at, created_at, updated_at, deleted_at, version, notify_rsvps, rsvp_notified_at, ends_at, retention_from, retention_reminded_at, retention_reminder_sent_at, share_image, share_media_id, music_source
+RETURNING id, owner_id, occasion_slug, slug, title, content, template_id, template_version, overrides, visibility, password_hash, rsvp_mode, status, remove_branding, starts_at, published_at, created_at, updated_at, deleted_at, version, notify_rsvps, rsvp_notified_at, ends_at, retention_from, retention_reminded_at, retention_reminder_sent_at, share_image, share_media_id, music_source, kind, entry_passes
 `
 
 type CreateEventParams struct {
 	ID              uuid.UUID  `json:"id"`
 	OwnerID         *uuid.UUID `json:"owner_id"`
 	OccasionSlug    string     `json:"occasion_slug"`
+	Kind            string     `json:"kind"`
 	Title           string     `json:"title"`
 	Content         []byte     `json:"content"`
 	Overrides       []byte     `json:"overrides"`
@@ -258,11 +260,14 @@ type CreateEventParams struct {
 // No row when the template pin is not selectable; the caller maps pgx.ErrNoRows to a validation error.
 // retention_from is the retention clock: greatest(ends_at, now()), so a past end starts a full
 // retention window now (greatest ignores NULL, hence the CASE).
+// kind is 'invite' or 'hosted'. Every event starts with open RSVPs (on a hosted event, open
+// registration); the owner can switch to invite-only in settings.
 func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error) {
 	row := q.db.QueryRow(ctx, createEvent,
 		arg.ID,
 		arg.OwnerID,
 		arg.OccasionSlug,
+		arg.Kind,
 		arg.Title,
 		arg.Content,
 		arg.Overrides,
@@ -302,6 +307,8 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 		&i.ShareImage,
 		&i.ShareMediaID,
 		&i.MusicSource,
+		&i.Kind,
+		&i.EntryPasses,
 	)
 	return i, err
 }
@@ -435,7 +442,7 @@ func (q *Queries) FilterLockedPurgeable(ctx context.Context, eventIds []uuid.UUI
 }
 
 const getAnonDraftEvent = `-- name: GetAnonDraftEvent :one
-SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source, 'anon'::text AS role,
+SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source, e.kind, e.entry_passes, 'anon'::text AS role,
        t.slug AS template_slug, t.name AS template_name,
        t.is_premium AS template_is_premium, t.price_paise AS template_price_paise,
        EXISTS (SELECT 1 FROM event_payments p
@@ -507,6 +514,8 @@ func (q *Queries) GetAnonDraftEvent(ctx context.Context, arg GetAnonDraftEventPa
 		&i.Event.ShareImage,
 		&i.Event.ShareMediaID,
 		&i.Event.MusicSource,
+		&i.Event.Kind,
+		&i.Event.EntryPasses,
 		&i.Role,
 		&i.TemplateSlug,
 		&i.TemplateName,
@@ -548,7 +557,7 @@ func (q *Queries) GetAnonDraftWriteState(ctx context.Context, arg GetAnonDraftWr
 }
 
 const getEventAdmin = `-- name: GetEventAdmin :one
-SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source,
+SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source, e.kind, e.entry_passes,
        u.email AS owner_email,
        t.slug AS template_slug, t.name AS template_name, tv.manifest, tv.assets_path,
        (SELECT count(*) FROM rsvps r WHERE r.event_id = e.id) AS rsvp_count,
@@ -608,6 +617,8 @@ func (q *Queries) GetEventAdmin(ctx context.Context, eventID uuid.UUID) (GetEven
 		&i.Event.ShareImage,
 		&i.Event.ShareMediaID,
 		&i.Event.MusicSource,
+		&i.Event.Kind,
+		&i.Event.EntryPasses,
 		&i.OwnerEmail,
 		&i.TemplateSlug,
 		&i.TemplateName,
@@ -704,7 +715,7 @@ func (q *Queries) GetEventForRetentionReminder(ctx context.Context, arg GetEvent
 }
 
 const getEventForUser = `-- name: GetEventForUser :one
-SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source, r.role::text AS role,
+SELECT e.id, e.owner_id, e.occasion_slug, e.slug, e.title, e.content, e.template_id, e.template_version, e.overrides, e.visibility, e.password_hash, e.rsvp_mode, e.status, e.remove_branding, e.starts_at, e.published_at, e.created_at, e.updated_at, e.deleted_at, e.version, e.notify_rsvps, e.rsvp_notified_at, e.ends_at, e.retention_from, e.retention_reminded_at, e.retention_reminder_sent_at, e.share_image, e.share_media_id, e.music_source, e.kind, e.entry_passes, r.role::text AS role,
        t.slug AS template_slug, t.name AS template_name,
        t.is_premium AS template_is_premium, t.price_paise AS template_price_paise,
        EXISTS (SELECT 1 FROM event_payments p
@@ -774,6 +785,8 @@ func (q *Queries) GetEventForUser(ctx context.Context, arg GetEventForUserParams
 		&i.Event.ShareImage,
 		&i.Event.ShareMediaID,
 		&i.Event.MusicSource,
+		&i.Event.Kind,
+		&i.Event.EntryPasses,
 		&i.Role,
 		&i.TemplateSlug,
 		&i.TemplateName,
@@ -832,8 +845,8 @@ func (q *Queries) GetEventWriteState(ctx context.Context, arg GetEventWriteState
 }
 
 const getPublicEventBySlug = `-- name: GetPublicEventBySlug :one
-SELECT e.id, e.slug, e.title, e.occasion_slug, e.content, e.overrides, e.visibility, e.password_hash,
-       e.rsvp_mode, e.remove_branding, e.starts_at, e.template_id, e.template_version,
+SELECT e.id, e.slug, e.title, e.occasion_slug, e.kind, e.content, e.overrides, e.visibility, e.password_hash,
+       e.rsvp_mode, e.entry_passes, e.remove_branding, e.starts_at, e.template_id, e.template_version,
        e.share_image, e.share_media_id, e.music_source, a.id AS audio_id,
        tv.manifest, tv.assets_path,
        o.slug, o.name, o.default_blocks, o.optional_blocks, o.rsvp_fields, o.copy, o.setup_questions, o.sort_order, o.is_active, o.created_at, o.updated_at
@@ -849,11 +862,13 @@ type GetPublicEventBySlugRow struct {
 	Slug            *string    `json:"slug"`
 	Title           string     `json:"title"`
 	OccasionSlug    string     `json:"occasion_slug"`
+	Kind            string     `json:"kind"`
 	Content         []byte     `json:"content"`
 	Overrides       []byte     `json:"overrides"`
 	Visibility      string     `json:"visibility"`
 	PasswordHash    *string    `json:"password_hash"`
 	RsvpMode        string     `json:"rsvp_mode"`
+	EntryPasses     bool       `json:"entry_passes"`
 	RemoveBranding  bool       `json:"remove_branding"`
 	StartsAt        *time.Time `json:"starts_at"`
 	TemplateID      uuid.UUID  `json:"template_id"`
@@ -876,11 +891,13 @@ func (q *Queries) GetPublicEventBySlug(ctx context.Context, slug *string) (GetPu
 		&i.Slug,
 		&i.Title,
 		&i.OccasionSlug,
+		&i.Kind,
 		&i.Content,
 		&i.Overrides,
 		&i.Visibility,
 		&i.PasswordHash,
 		&i.RsvpMode,
+		&i.EntryPasses,
 		&i.RemoveBranding,
 		&i.StartsAt,
 		&i.TemplateID,
@@ -907,33 +924,36 @@ func (q *Queries) GetPublicEventBySlug(ctx context.Context, slug *string) (GetPu
 }
 
 const listEventsForUser = `-- name: ListEventsForUser :many
-SELECT x.id, x.slug, x.title, x.occasion_slug, x.status, x.starts_at, x.created_at, x.role
+SELECT x.id, x.slug, x.title, x.occasion_slug, x.kind, x.status, x.starts_at, x.created_at, x.role
 FROM (
-    (SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.starts_at, e.created_at, 'owner'::text AS role
+    (SELECT e.id, e.slug, e.title, e.occasion_slug, e.kind, e.status, e.starts_at, e.created_at, 'owner'::text AS role
      FROM events e
      WHERE e.owner_id = $1::uuid
        AND e.deleted_at IS NULL
        AND (e.created_at, e.id) < ($2::timestamptz, $3::uuid)
+       AND ($4::text IS NULL OR e.kind = $4::text)
      ORDER BY e.created_at DESC, e.id DESC
-     LIMIT $4::int)
+     LIMIT $5::int)
     UNION ALL
-    (SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.starts_at, e.created_at, m.role
+    (SELECT e.id, e.slug, e.title, e.occasion_slug, e.kind, e.status, e.starts_at, e.created_at, m.role
      FROM event_members m
      JOIN events e ON e.id = m.event_id
      WHERE m.user_id = $1::uuid
        AND e.deleted_at IS NULL
        AND (e.created_at, e.id) < ($2::timestamptz, $3::uuid)
+       AND ($4::text IS NULL OR e.kind = $4::text)
      ORDER BY e.created_at DESC, e.id DESC
-     LIMIT $4::int)
+     LIMIT $5::int)
 ) x
 ORDER BY x.created_at DESC, x.id DESC
-LIMIT $4::int
+LIMIT $5::int
 `
 
 type ListEventsForUserParams struct {
 	UserID          uuid.UUID `json:"user_id"`
 	CursorCreatedAt time.Time `json:"cursor_created_at"`
 	CursorID        uuid.UUID `json:"cursor_id"`
+	Kind            *string   `json:"kind"`
 	Lim             int32     `json:"lim"`
 }
 
@@ -942,18 +962,20 @@ type ListEventsForUserRow struct {
 	Slug         *string    `json:"slug"`
 	Title        string     `json:"title"`
 	OccasionSlug string     `json:"occasion_slug"`
+	Kind         string     `json:"kind"`
 	Status       string     `json:"status"`
 	StartsAt     *time.Time `json:"starts_at"`
 	CreatedAt    time.Time  `json:"created_at"`
 	Role         string     `json:"role"`
 }
 
-// Owned and co-hosted events, newest first. Each branch is limited on its own index before the merge.
+// Owned and co-hosted events, newest first, optionally only one kind (invite/hosted). Each branch is limited on its own index before the merge.
 func (q *Queries) ListEventsForUser(ctx context.Context, arg ListEventsForUserParams) ([]ListEventsForUserRow, error) {
 	rows, err := q.db.Query(ctx, listEventsForUser,
 		arg.UserID,
 		arg.CursorCreatedAt,
 		arg.CursorID,
+		arg.Kind,
 		arg.Lim,
 	)
 	if err != nil {
@@ -968,6 +990,7 @@ func (q *Queries) ListEventsForUser(ctx context.Context, arg ListEventsForUserPa
 			&i.Slug,
 			&i.Title,
 			&i.OccasionSlug,
+			&i.Kind,
 			&i.Status,
 			&i.StartsAt,
 			&i.CreatedAt,
@@ -1181,7 +1204,7 @@ func (q *Queries) LockEventForEditor(ctx context.Context, arg LockEventForEditor
 }
 
 const lockEventForRSVP = `-- name: LockEventForRSVP :one
-SELECT e.id, e.slug, e.title, e.occasion_slug, e.content, e.rsvp_mode, e.visibility, e.notify_rsvps, e.owner_id
+SELECT e.id, e.slug, e.title, e.occasion_slug, e.kind, e.content, e.rsvp_mode, e.visibility, e.notify_rsvps, e.owner_id
 FROM events e
 WHERE e.id = $1 AND e.status = 'published' AND e.deleted_at IS NULL
 FOR NO KEY UPDATE
@@ -1192,6 +1215,7 @@ type LockEventForRSVPRow struct {
 	Slug         *string    `json:"slug"`
 	Title        string     `json:"title"`
 	OccasionSlug string     `json:"occasion_slug"`
+	Kind         string     `json:"kind"`
 	Content      []byte     `json:"content"`
 	RsvpMode     string     `json:"rsvp_mode"`
 	Visibility   string     `json:"visibility"`
@@ -1209,6 +1233,7 @@ func (q *Queries) LockEventForRSVP(ctx context.Context, eventID uuid.UUID) (Lock
 		&i.Slug,
 		&i.Title,
 		&i.OccasionSlug,
+		&i.Kind,
 		&i.Content,
 		&i.RsvpMode,
 		&i.Visibility,
@@ -2101,12 +2126,13 @@ SET slug = coalesce($1, e.slug),
     END,
     rsvp_mode = coalesce($4, e.rsvp_mode),
     notify_rsvps = coalesce($5, e.notify_rsvps),
+    entry_passes = coalesce($6, e.entry_passes),
     version = e.version + 1,
     updated_at = now()
-WHERE e.id = $6
-  AND e.owner_id = $7::uuid
+WHERE e.id = $7
+  AND e.owner_id = $8::uuid
   AND e.deleted_at IS NULL
-  AND e.version = $8
+  AND e.version = $9
   AND e.status <> 'taken_down'
 RETURNING e.version, e.updated_at
 `
@@ -2117,6 +2143,7 @@ type UpdateEventSettingsParams struct {
 	PasswordHash *string   `json:"password_hash"`
 	RsvpMode     *string   `json:"rsvp_mode"`
 	NotifyRsvps  *bool     `json:"notify_rsvps"`
+	EntryPasses  *bool     `json:"entry_passes"`
 	EventID      uuid.UUID `json:"event_id"`
 	UserID       uuid.UUID `json:"user_id"`
 	Version      int32     `json:"version"`
@@ -2137,6 +2164,7 @@ func (q *Queries) UpdateEventSettings(ctx context.Context, arg UpdateEventSettin
 		arg.PasswordHash,
 		arg.RsvpMode,
 		arg.NotifyRsvps,
+		arg.EntryPasses,
 		arg.EventID,
 		arg.UserID,
 		arg.Version,

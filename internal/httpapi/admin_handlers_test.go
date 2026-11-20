@@ -128,7 +128,7 @@ func newAdminHandlerFixture(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client)
 		t.Fatalf("new token keys: %v", err)
 	}
 	limiter := ratelimit.New(rdb)
-	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, tokens, limiter, "", "https://seeyouthere.at", testTotalQuotaBytes)
+	jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, tokens, limiter, "", "https://seeyouthere.at", testTotalQuotaBytes, 1000)
 	if err != nil {
 		t.Fatalf("jobs.NewClient: %v", err)
 	}

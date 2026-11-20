@@ -237,3 +237,110 @@ func TestHashIP_DeterministicAndKeyed(t *testing.T) {
 		t.Error("an IPv4-mapped IPv6 address should hash the same as its IPv4 form")
 	}
 }
+
+func TestPassToken(t *testing.T) {
+	k := testKeys(t)
+	id := uuid.Must(uuid.NewV7())
+	tok := k.PassToken(id, 2)
+	if len(tok) != 43 {
+		t.Fatalf("pass token length = %d, want 43", len(tok))
+	}
+	gotID, mac, err := Split(tok)
+	if err != nil || gotID != id {
+		t.Fatalf("Split = %v, %v", gotID, err)
+	}
+
+	tests := []struct {
+		name    string
+		id      uuid.UUID
+		version int32
+		mac     []byte
+		want    bool
+	}{
+		{"current version", id, 2, mac, true},
+		{"rotated version", id, 3, mac, false},
+		{"other guest", uuid.Must(uuid.NewV7()), 2, mac, false},
+		{"short mac", id, 2, mac[:8], false},
+		{"empty mac", id, 2, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := k.CheckPass(tt.id, tt.version, tt.mac); got != tt.want {
+				t.Fatalf("CheckPass = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// Pass and invite tokens use different subkeys: neither verifies as the other.
+	_, guestMAC, _ := Split(k.GuestToken(id, 2))
+	if k.CheckPass(id, 2, guestMAC) {
+		t.Fatal("invite token MAC accepted as a pass")
+	}
+	if k.CheckGuest(id, 2, mac) {
+		t.Fatal("pass MAC accepted as an invite token")
+	}
+}
+
+func TestRSVPPassToken(t *testing.T) {
+	k := testKeys(t)
+	id := uuid.Must(uuid.NewV7())
+	tok := k.RSVPPassToken(id, 2)
+	if len(tok) != 43 {
+		t.Fatalf("rsvp pass token length = %d, want 43", len(tok))
+	}
+	gotID, mac, err := Split(tok)
+	if err != nil || gotID != id {
+		t.Fatalf("Split = %v, %v", gotID, err)
+	}
+
+	tampered := append([]byte(nil), mac...)
+	tampered[0] ^= 0x01
+
+	tests := []struct {
+		name    string
+		id      uuid.UUID
+		version int32
+		mac     []byte
+		want    bool
+	}{
+		{"current version", id, 2, mac, true},
+		{"wrong version", id, 3, mac, false},
+		{"other id", uuid.Must(uuid.NewV7()), 2, mac, false},
+		{"tampered mac", id, 2, tampered, false},
+		{"short mac", id, 2, mac[:8], false},
+		{"empty mac", id, 2, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := k.CheckRSVPPass(tt.id, tt.version, tt.mac); got != tt.want {
+				t.Fatalf("CheckRSVPPass = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// Every other token purpose uses a different subkey: none verifies as an
+	// RSVP pass, and an RSVP pass verifies as none of them.
+	others := []struct {
+		name  string
+		token string
+		check func(uuid.UUID, int32, []byte) bool
+	}{
+		{"guest pass", k.PassToken(id, 2), k.CheckPass},
+		{"guest invite", k.GuestToken(id, 2), k.CheckGuest},
+		{"rsvp edit", k.RSVPToken(id, 2), k.CheckRSVP},
+	}
+	for _, o := range others {
+		t.Run(o.name, func(t *testing.T) {
+			_, otherMAC, err := Split(o.token)
+			if err != nil {
+				t.Fatalf("Split: %v", err)
+			}
+			if k.CheckRSVPPass(id, 2, otherMAC) {
+				t.Fatalf("%s MAC accepted as an RSVP pass", o.name)
+			}
+			if o.check(id, 2, mac) {
+				t.Fatalf("RSVP pass MAC accepted as %s", o.name)
+			}
+		})
+	}
+}

@@ -70,7 +70,7 @@ Domains: `seeyouthere.at` (site), `api.seeyouthere.at` (API). Limits were raised
 
 ## Environment variables (names only; values in `deploy/.env`)
 
-`SITE_DOMAIN`, `ACME_EMAIL`, `POSTGRES_PASSWORD`, `AUTH_SECRET`, `SMTP_ADDR`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM`, `TOTP_KEY`, `ADMIN_ALERT_EMAIL`, `MAIL_DAILY_INVITE_CAP`, `MEDIA_USER_QUOTA_MB`, `MEDIA_TOTAL_QUOTA_MB`, `MEDIA_MIN_FREE_MB`, `R2_*` (four). Email goes through Zoho Mail SMTP. See `deploy/.env.example` for the full list and comments. **Back up `deploy/.env` separately** (password manager); it is not in git or in the DB dumps.
+`SITE_DOMAIN`, `ACME_EMAIL`, `POSTGRES_PASSWORD`, `AUTH_SECRET`, `SMTP_ADDR`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM`, `TOTP_KEY`, `ADMIN_ALERT_EMAIL`, `MAIL_DAILY_INVITE_CAP`, `MAIL_DAILY_REGISTRATION_CAP`, `MEDIA_USER_QUOTA_MB`, `MEDIA_TOTAL_QUOTA_MB`, `MEDIA_MIN_FREE_MB`, `R2_*` (four). Email goes through Zoho Mail SMTP. See `deploy/.env.example` for the full list and comments. **Back up `deploy/.env` separately** (password manager); it is not in git or in the DB dumps.
 
 ## Backups — none (deliberate)
 

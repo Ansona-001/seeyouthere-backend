@@ -356,7 +356,7 @@ func TestHandleDeleteAccount(t *testing.T) {
 		}
 
 		mediaStore := newTestMediaStore(t)
-		jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes)
+		jobClient, err := jobs.NewClient(pool, noopSender{}, noopSender{}, q, mediaStore, f.s.tokens, f.s.limiter, "", f.s.cfg.SiteURL, testTotalQuotaBytes, 1000)
 		if err != nil {
 			t.Fatalf("jobs.NewClient: %v", err)
 		}

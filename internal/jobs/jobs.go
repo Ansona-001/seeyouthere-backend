@@ -89,6 +89,14 @@ const maxAnonDraftBatchesPerRun = 20
 const mediaCleanupBatchSize = 500
 const mediaCleanupBatchesPerRun = 10
 
+// unconfirmedRegistrationBatchSize rows are deleted per statement, at most
+// unconfirmedRegistrationBatchesPerRun statements per cleanup run (5000 rows, the size of a full
+// event's registrations); the remainder is picked up on the next hourly run.
+const (
+	unconfirmedRegistrationBatchSize     = 500
+	unconfirmedRegistrationBatchesPerRun = 10
+)
+
 type CleanupWorker struct {
 	river.WorkerDefaults[CleanupArgs]
 	Queries *store.Queries
@@ -171,6 +179,23 @@ func (w *CleanupWorker) Work(ctx context.Context, _ *river.Job[CleanupArgs]) err
 		}
 	}
 	slog.InfoContext(ctx, "cleanup", "rejected_media_rows", totalRejected)
+
+	// Registrations on hosted events whose pass link was never opened (so the address was never
+	// shown to be real) and that were never used at the door: deleted 48 hours after sign-up. They
+	// stopped counting toward capacity after 24 hours (see SumYesHeads). Counts only in the log: the
+	// rows hold names and emails.
+	var totalUnconfirmed int64
+	for i := 0; i < unconfirmedRegistrationBatchesPerRun; i++ {
+		n, err := w.Queries.DeleteUnconfirmedRegistrations(ctx, unconfirmedRegistrationBatchSize)
+		if err != nil {
+			return fmt.Errorf("delete unconfirmed registrations: %w", err)
+		}
+		totalUnconfirmed += n
+		if n < unconfirmedRegistrationBatchSize {
+			break
+		}
+	}
+	slog.InfoContext(ctx, "cleanup", "unconfirmed_registrations", totalUnconfirmed)
 
 	// Event retention, on events.retention_from (the end, but never earlier
 	// than the last edit that moved it): remind owners retentionAfterEnd -
@@ -416,7 +441,7 @@ func (w *NotifyReportWorker) Timeout(*river.Job[NotifyReportArgs]) time.Duration
 // calendarSender sends the calendar-invite variant of send_rsvp_confirmation
 // (an attending="yes" response); pass the same value as sender to reuse the
 // primary SMTP identity.
-func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *store.Queries, mediaStore *media.Store, tokens *token.Keys, limiter *ratelimit.Limiter, adminAlertEmail, siteURL string, mediaTotalQuotaBytes int64) (*Client, error) {
+func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *store.Queries, mediaStore *media.Store, tokens *token.Keys, limiter *ratelimit.Limiter, adminAlertEmail, siteURL string, mediaTotalQuotaBytes int64, registrationDailyCap int64) (*Client, error) {
 	workers := river.NewWorkers()
 	cleanup := &CleanupWorker{Queries: queries, Pool: pool, Media: mediaStore}
 	river.AddWorker(workers, &SendEmailWorker{Sender: sender})
@@ -428,7 +453,7 @@ func NewClient(pool *pgxpool.Pool, sender, calendarSender mail.Sender, queries *
 	river.AddWorker(workers, &SendInviteWorker{Queries: queries, Sender: sender, Tokens: tokens, Limiter: limiter, SiteURL: siteURL})
 	river.AddWorker(workers, &NotifyCohostAddedWorker{Queries: queries, Sender: sender, SiteURL: siteURL})
 	river.AddWorker(workers, &NotifyTakedownWorker{Queries: queries, Sender: sender, SiteURL: siteURL})
-	river.AddWorker(workers, &SendRSVPConfirmationWorker{Queries: queries, Sender: sender, CalendarSender: calendarSender, Tokens: tokens, Limiter: limiter, SiteURL: siteURL})
+	river.AddWorker(workers, &SendRSVPConfirmationWorker{Queries: queries, Sender: sender, CalendarSender: calendarSender, Tokens: tokens, Limiter: limiter, SiteURL: siteURL, RegistrationDailyCap: registrationDailyCap})
 	river.AddWorker(workers, &NotifyRSVPsWorker{Queries: queries, Sender: sender, SiteURL: siteURL})
 	river.AddWorker(workers, &AdminPurgeEventWorker{Pool: pool, Queries: queries, Media: mediaStore})
 
