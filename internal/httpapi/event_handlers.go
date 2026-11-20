@@ -264,20 +264,20 @@ type mediaItemResp struct {
 }
 
 type eventResp struct {
-	ID             uuid.UUID  `json:"id"`
-	Slug           *string    `json:"slug"`
-	Title          string     `json:"title"`
-	OccasionSlug   string     `json:"occasion_slug"`
-	Kind           string     `json:"kind"`
-	Status         string     `json:"status"`
-	Visibility     string     `json:"visibility"`
-	HasPassword    bool       `json:"has_password"`
-	RsvpMode       string     `json:"rsvp_mode"`
-	RemoveBranding bool       `json:"remove_branding"`
-	NotifyRsvps    bool       `json:"notify_rsvps"`
+	ID             uuid.UUID `json:"id"`
+	Slug           *string   `json:"slug"`
+	Title          string    `json:"title"`
+	OccasionSlug   string    `json:"occasion_slug"`
+	Kind           string    `json:"kind"`
+	Status         string    `json:"status"`
+	Visibility     string    `json:"visibility"`
+	HasPassword    bool      `json:"has_password"`
+	RsvpMode       string    `json:"rsvp_mode"`
+	RemoveBranding bool      `json:"remove_branding"`
+	NotifyRsvps    bool      `json:"notify_rsvps"`
 	// EntryPasses: a hosted event shows and mails entry passes (QR codes); false = registration only.
 	EntryPasses bool       `json:"entry_passes"`
-	StartsAt       *time.Time `json:"starts_at"`
+	StartsAt    *time.Time `json:"starts_at"`
 	// EndsAt is derived from the content's datetime block end_local (nil if
 	// absent or the block is invalid), so the frontend's add-to-calendar
 	// needs no timezone maths.

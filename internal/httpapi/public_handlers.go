@@ -70,16 +70,16 @@ type publicRsvpConfigResp struct {
 }
 
 type publicEventResp struct {
-	ID           uuid.UUID  `json:"id"`
-	Slug         string     `json:"slug"`
-	Title        string     `json:"title"`
-	OccasionSlug string     `json:"occasion_slug"`
-	Visibility   string     `json:"visibility"`
-	RsvpMode     string     `json:"rsvp_mode"`
-	Kind         string     `json:"kind"`
+	ID           uuid.UUID `json:"id"`
+	Slug         string    `json:"slug"`
+	Title        string    `json:"title"`
+	OccasionSlug string    `json:"occasion_slug"`
+	Visibility   string    `json:"visibility"`
+	RsvpMode     string    `json:"rsvp_mode"`
+	Kind         string    `json:"kind"`
 	// EntryPasses mirrors the event setting; when false, viewer.pass is always null.
-	EntryPasses bool `json:"entry_passes"`
-	StartsAt     *time.Time `json:"starts_at"`
+	EntryPasses bool       `json:"entry_passes"`
+	StartsAt    *time.Time `json:"starts_at"`
 	// EndsAt mirrors eventResp.EndsAt (event_handlers.go): derived from the
 	// content's datetime block, nil if absent or invalid.
 	EndsAt         *time.Time               `json:"ends_at"`
