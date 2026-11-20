@@ -221,16 +221,17 @@ func (q *Queries) CreateAnonDraft(ctx context.Context, arg CreateAnonDraftParams
 const createEvent = `-- name: CreateEvent :one
 
 
-INSERT INTO events (id, owner_id, occasion_slug, kind, rsvp_mode, title, content, template_id, template_version,
-                    overrides, starts_at, ends_at, retention_from)
+INSERT INTO events (id, owner_id, occasion_slug, kind, rsvp_mode, entry_passes, title, content, template_id,
+                    template_version, overrides, starts_at, ends_at, retention_from)
 SELECT $1::uuid, $2::uuid, $3::text, $4::text, 'open',
-       $5::text, $6::jsonb,
-       t.id, tv.version, $7::jsonb, $8::timestamptz, $9::timestamptz,
-       CASE WHEN $9::timestamptz IS NOT NULL THEN greatest($9::timestamptz, now()) END
+       coalesce($5::boolean, true),
+       $6::text, $7::jsonb,
+       t.id, tv.version, $8::jsonb, $9::timestamptz, $10::timestamptz,
+       CASE WHEN $10::timestamptz IS NOT NULL THEN greatest($10::timestamptz, now()) END
 FROM templates t
 JOIN template_versions tv ON tv.template_id = t.id
-WHERE t.id = $10::uuid
-  AND tv.version = $11::int
+WHERE t.id = $11::uuid
+  AND tv.version = $12::int
   AND tv.published_at IS NOT NULL
   AND t.status = 'published'
 RETURNING id, owner_id, occasion_slug, slug, title, content, template_id, template_version, overrides, visibility, password_hash, rsvp_mode, status, remove_branding, starts_at, published_at, created_at, updated_at, deleted_at, version, notify_rsvps, rsvp_notified_at, ends_at, retention_from, retention_reminded_at, retention_reminder_sent_at, share_image, share_media_id, music_source, kind, entry_passes
@@ -241,6 +242,7 @@ type CreateEventParams struct {
 	OwnerID         *uuid.UUID `json:"owner_id"`
 	OccasionSlug    string     `json:"occasion_slug"`
 	Kind            string     `json:"kind"`
+	EntryPasses     *bool      `json:"entry_passes"`
 	Title           string     `json:"title"`
 	Content         []byte     `json:"content"`
 	Overrides       []byte     `json:"overrides"`
@@ -262,12 +264,14 @@ type CreateEventParams struct {
 // retention window now (greatest ignores NULL, hence the CASE).
 // kind is 'invite' or 'hosted'. Every event starts with open RSVPs (on a hosted event, open
 // registration); the owner can switch to invite-only in settings.
+// entry_passes (hosted events: show and mail QR passes) defaults to true when the caller leaves it NULL.
 func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error) {
 	row := q.db.QueryRow(ctx, createEvent,
 		arg.ID,
 		arg.OwnerID,
 		arg.OccasionSlug,
 		arg.Kind,
+		arg.EntryPasses,
 		arg.Title,
 		arg.Content,
 		arg.Overrides,

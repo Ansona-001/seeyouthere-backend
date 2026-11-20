@@ -13,9 +13,11 @@
 -- retention window now (greatest ignores NULL, hence the CASE).
 -- kind is 'invite' or 'hosted'. Every event starts with open RSVPs (on a hosted event, open
 -- registration); the owner can switch to invite-only in settings.
-INSERT INTO events (id, owner_id, occasion_slug, kind, rsvp_mode, title, content, template_id, template_version,
-                    overrides, starts_at, ends_at, retention_from)
+-- entry_passes (hosted events: show and mail QR passes) defaults to true when the caller leaves it NULL.
+INSERT INTO events (id, owner_id, occasion_slug, kind, rsvp_mode, entry_passes, title, content, template_id,
+                    template_version, overrides, starts_at, ends_at, retention_from)
 SELECT @id::uuid, sqlc.narg(owner_id)::uuid, @occasion_slug::text, @kind::text, 'open',
+       coalesce(sqlc.narg(entry_passes)::boolean, true),
        @title::text, @content::jsonb,
        t.id, tv.version, @overrides::jsonb, sqlc.narg(starts_at)::timestamptz, sqlc.narg(ends_at)::timestamptz,
        CASE WHEN sqlc.narg(ends_at)::timestamptz IS NOT NULL THEN greatest(sqlc.narg(ends_at)::timestamptz, now()) END

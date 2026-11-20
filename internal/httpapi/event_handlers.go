@@ -544,6 +544,8 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		TemplateSlug string            `json:"template_slug"`
 		Answers      map[string]string `json:"answers"`
 		Kind         string            `json:"kind"`
+		// EntryPasses is for hosted events only; nil keeps the default (on).
+		EntryPasses *bool `json:"entry_passes"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -554,6 +556,11 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	if !validEventKinds[body.Kind] {
 		writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the highlighted fields.",
 			[]content.Issue{{Path: "kind", Code: "invalid", Message: "Must be invite or hosted."}})
+		return
+	}
+	if body.EntryPasses != nil && body.Kind != "hosted" {
+		writeErrorDetails(w, http.StatusBadRequest, "validation_failed", "Check the highlighted fields.",
+			[]content.Issue{{Path: "entry_passes", Code: "invalid", Message: "Only hosted events have entry passes."}})
 		return
 	}
 
@@ -623,7 +630,7 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	createParams := store.CreateEventParams{
-		ID: uuid.Must(uuid.NewV7()), OccasionSlug: occasionSlug, Kind: body.Kind, Title: saved.Title,
+		ID: uuid.Must(uuid.NewV7()), OccasionSlug: occasionSlug, Kind: body.Kind, EntryPasses: body.EntryPasses, Title: saved.Title,
 		Content: saved.JSON, Overrides: []byte("{}"), StartsAt: saved.StartsAt, EndsAt: saved.EffectiveEnd(),
 		TemplateID: tmpl.ID, TemplateVersion: tmpl.Version,
 	}

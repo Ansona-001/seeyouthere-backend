@@ -136,6 +136,45 @@ func TestHandleListEvents_KindFilter(t *testing.T) {
 	}
 }
 
+func TestHandleCreateEvent_EntryPasses(t *testing.T) {
+	pool := dbTestPool(t)
+	rdb := dbTestRedis(t)
+	f := newEventTestFixture(t, pool, rdb)
+
+	create := func(occasion, kindField string) (int, eventResp) {
+		id := newDisposableUser(t, pool, "create-passes")
+		rec := httptest.NewRecorder()
+		f.s.handleCreateEvent(rec, createKindRequestFor(id, occasion, kindField))
+		var out struct {
+			Event eventResp `json:"event"`
+		}
+		if rec.Code == http.StatusCreated {
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("decode %s: %v", rec.Body.String(), err)
+			}
+		}
+		return rec.Code, out.Event
+	}
+
+	t.Run("hosted defaults to passes on", func(t *testing.T) {
+		code, ev := create(hostedOccasionSlug, `,"kind":"hosted"`)
+		if code != http.StatusCreated || !ev.EntryPasses {
+			t.Fatalf("status = %d, entry_passes = %v, want 201 and true", code, ev.EntryPasses)
+		}
+	})
+	t.Run("hosted can start with passes off", func(t *testing.T) {
+		code, ev := create(hostedOccasionSlug, `,"kind":"hosted","entry_passes":false`)
+		if code != http.StatusCreated || ev.EntryPasses {
+			t.Fatalf("status = %d, entry_passes = %v, want 201 and false", code, ev.EntryPasses)
+		}
+	})
+	t.Run("invites cannot set it", func(t *testing.T) {
+		if code, _ := create("birthday", `,"entry_passes":false`); code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", code)
+		}
+	})
+}
+
 func TestHostedEvent_DBInvariants(t *testing.T) {
 	h := newHostedFixture(t)
 	ctx := context.Background()
