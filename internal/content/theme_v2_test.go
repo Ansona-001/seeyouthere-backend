@@ -430,6 +430,8 @@ func TestResolveThemeV2_Intro(t *testing.T) {
 	}{
 		{"wisteria", "wisteria"},
 		{"temple-pond", ""},
+		{"lotus-velvet", ""},
+		{"ganesha-mandapam", ""},
 		{"olive-grove", ""},
 	}
 	for _, tc := range tests {

@@ -2634,3 +2634,140 @@ func TestMigration00051_TemplePondTemplate(t *testing.T) {
 	}
 	checkSeeded()
 }
+
+// TestMigration00052_LotusVelvetGaneshaMandapamTemplates applies migrations up to 52 and checks the Lotus Velvet and Ganesha Mandapam draft templates:
+// id, name, status, sort_order, free and tags, one published v1 whose stored manifest validates, equals its
+// testdata file and carries the music field (no intro), and that it stays out of the host picker. It then
+// runs 00052's Down (both rows go, the immutable trigger is re-enabled) and applies Up again.
+func TestMigration00052_LotusVelvetGaneshaMandapamTemplates(t *testing.T) {
+	ctx, pool, provider := scratchMigrator(t)
+	if _, err := provider.UpTo(ctx, 51); err != nil {
+		t.Fatalf("migrate to 51: %v", err)
+	}
+	var before int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates").Scan(&before); err != nil {
+		t.Fatalf("count templates: %v", err)
+	}
+	if _, err := provider.UpTo(ctx, 52); err != nil {
+		t.Fatalf("migrate to 52: %v", err)
+	}
+
+	cases := []struct {
+		slug, id, name, tags string
+		sortOrder            int32
+	}{
+		{"lotus-velvet", "01926a00-0000-7000-8000-000000000024", "Lotus Velvet", `{"occasions": ["wedding", "engagement"]}`, 21},
+		{"ganesha-mandapam", "01926a00-0000-7000-8000-000000000025", "Ganesha Mandapam", `{"occasions": ["wedding", "engagement"]}`, 22},
+	}
+	checkSeeded := func() {
+		t.Helper()
+		for _, c := range cases {
+			var (
+				id, name, status, tags string
+				sortOrder              int32
+				premium                bool
+			)
+			err := pool.QueryRow(ctx, `SELECT id::text, name, status, tags::text, sort_order, is_premium
+				FROM templates WHERE slug = $1`, c.slug).Scan(&id, &name, &status, &tags, &sortOrder, &premium)
+			if err != nil {
+				t.Errorf("%s: read template: %v", c.slug, err)
+				continue
+			}
+			if id != c.id || name != c.name || status != "draft" || sortOrder != c.sortOrder || premium || tags != c.tags {
+				t.Errorf("%s: id=%s name=%q status=%s sort_order=%d premium=%v tags=%s, want id=%s name=%q draft sort_order=%d not premium tags=%s",
+					c.slug, id, name, status, sortOrder, premium, tags, c.id, c.name, c.sortOrder, c.tags)
+			}
+
+			var (
+				manifest  []byte
+				version   int
+				published bool
+				assets    string
+				size      int
+			)
+			err = pool.QueryRow(ctx, `SELECT version, manifest, published_at IS NOT NULL, assets_path, pg_column_size(manifest)
+				FROM template_versions WHERE template_id = $1`, id).Scan(&version, &manifest, &published, &assets, &size)
+			if err != nil { // also fails if there is more than one version
+				t.Errorf("%s: read version: %v", c.slug, err)
+				continue
+			}
+			if version != 1 || !published || assets != "" || size > 32768 {
+				t.Errorf("%s: version=%d published=%v assets_path=%q manifest size=%d, want v1 published, no assets, <= 32768", c.slug, version, published, assets, size)
+			}
+			m, err := content.ValidateManifest(manifest)
+			if err != nil {
+				t.Errorf("%s: ValidateManifest: %v", c.slug, err)
+				continue
+			}
+			if m.Schema != 2 || len(m.Palettes) == 0 || len(m.Fonts) == 0 {
+				t.Errorf("%s: manifest schema=%d palettes=%d fonts=%d, want schema 2 with palettes and fonts", c.slug, m.Schema, len(m.Palettes), len(m.Fonts))
+			}
+			if m.Intro != "" || m.Music != "music_box" {
+				t.Errorf("%s: intro=%q music=%q, want no intro and music_box", c.slug, m.Intro, m.Music)
+			}
+			for _, p := range m.Palettes {
+				for _, f := range m.Fonts {
+					overrides := fmt.Sprintf(`{"palette":%q,"font":%q}`, p.ID, f.ID)
+					th := content.ResolveTheme(m, []byte(overrides), "")
+					if th.Engine != 2 || th.Palette != p.Colors || th.Fonts.Heading != f.Heading || th.Fonts.Body != f.Body {
+						t.Errorf("%s: ResolveTheme(%s, %s) = engine %d %+v, want engine 2 with that palette and font pair", c.slug, p.ID, f.ID, th.Engine, th)
+					}
+				}
+			}
+
+			want, err := os.ReadFile("../content/testdata/themes_v2/" + c.slug + ".json")
+			if err != nil {
+				t.Errorf("%s: read testdata: %v", c.slug, err)
+				continue
+			}
+			var gotJSON, wantJSON any
+			if err := json.Unmarshal(manifest, &gotJSON); err != nil {
+				t.Errorf("%s: decode stored manifest: %v", c.slug, err)
+			} else if err := json.Unmarshal(want, &wantJSON); err != nil {
+				t.Errorf("%s: decode testdata: %v", c.slug, err)
+			} else if !reflect.DeepEqual(gotJSON, wantJSON) {
+				t.Errorf("%s: stored manifest differs from testdata/themes_v2/%s.json", c.slug, c.slug)
+			}
+		}
+
+		var templates int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates").Scan(&templates); err != nil || templates != before+len(cases) {
+			t.Errorf("templates = %d (err %v), want %d", templates, err, before+len(cases))
+		}
+		// Drafts stay out of the public catalog.
+		for _, slug := range pickerSlugs(ctx, t, pool) {
+			for _, c := range cases {
+				if slug == c.slug {
+					t.Errorf("draft template %s is listed in the public picker", slug)
+				}
+			}
+		}
+	}
+	checkSeeded()
+
+	if _, err := provider.DownTo(ctx, 51); err != nil {
+		t.Fatalf("down to 51: %v", err)
+	}
+	for _, c := range cases {
+		var left int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates WHERE id = $1 OR slug = $2", c.id, c.slug).Scan(&left); err != nil || left != 0 {
+			t.Errorf("%s templates after Down = %d (err %v), want 0", c.slug, left, err)
+		}
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM template_versions WHERE template_id = $1", c.id).Scan(&left); err != nil || left != 0 {
+			t.Errorf("%s versions after Down = %d (err %v), want 0", c.slug, left, err)
+		}
+	}
+	var left int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM templates").Scan(&left); err != nil || left != before {
+		t.Errorf("templates after Down = %d (err %v), want %d", left, err, before)
+	}
+	var triggerEnabled string
+	if err := pool.QueryRow(ctx, "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'template_versions_immutable'").Scan(&triggerEnabled); err != nil || triggerEnabled != "O" {
+		t.Errorf("immutable trigger state after Down = %q (err %v), want enabled (O)", triggerEnabled, err)
+	}
+
+	if _, err := provider.UpTo(ctx, 52); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	checkSeeded()
+}
