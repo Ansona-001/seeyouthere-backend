@@ -8,7 +8,9 @@ package content
 
 // maxArtKeys is a hard cap on the art registry; theme_registry_test.go
 // enforces it so the frontend bundle of art components stays bounded.
-const maxArtKeys = 36
+// Raster keys (a constant image path each) cost almost nothing in the bundle,
+// so the cap grows by the pair a raster theme adds.
+const maxArtKeys = 38
 
 // artSpec describes what one art registry key accepts.
 type artSpec struct {
@@ -50,6 +52,8 @@ var artRegistry = map[string]artSpec{
 	"wildflower_page":  {0, 0, false, false, placements("page")},
 	"glitterball":      {0, 0, false, false, placements("top")},
 	"glitterball_page": {0, 0, false, false, placements("page")},
+	"temple_pond":      {0, 0, false, false, placements("top")},
+	"temple_pond_page": {0, 0, false, false, placements("page")},
 	"daisies":          {2, 3, false, true, placements("corners", "edges")},
 	"doodles":          {2, 4, false, true, placements("scatter", "edges")},
 	"clothesline":      {3, 5, false, false, placements("top")},

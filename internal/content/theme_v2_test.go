@@ -429,6 +429,7 @@ func TestResolveThemeV2_Intro(t *testing.T) {
 		slug, want string
 	}{
 		{"wisteria", "wisteria"},
+		{"temple-pond", ""},
 		{"olive-grove", ""},
 	}
 	for _, tc := range tests {

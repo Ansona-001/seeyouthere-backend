@@ -1347,6 +1347,8 @@ func TestAdv_ArtRegistryMatrix(t *testing.T) {
 		"wildflower_page":  {0, 0, false, false, []string{"page"}},
 		"glitterball":      {0, 0, false, false, []string{"top"}},
 		"glitterball_page": {0, 0, false, false, []string{"page"}},
+		"temple_pond":      {0, 0, false, false, []string{"top"}},
+		"temple_pond_page": {0, 0, false, false, []string{"page"}},
 	}
 	if len(spec) != len(artRegistry) {
 		t.Fatalf("registry has %d keys, spec table %d", len(artRegistry), len(spec))
@@ -2205,12 +2207,12 @@ func TestAdv_AllowlistsMatchSpec(t *testing.T) {
 		}
 	})
 	t.Run("fonts", func(t *testing.T) {
-		for _, f := range []string{"bodoni_moda", "pinyon_script", "bagel_fat_one", "limelight", "josefin_sans"} {
+		for _, f := range []string{"bodoni_moda", "pinyon_script", "bagel_fat_one", "limelight", "josefin_sans", "cinzel"} {
 			if !allowedFonts[f] {
 				t.Errorf("%s not allowed", f)
 			}
 		}
-		for _, f := range []string{"pinyon_script", "bagel_fat_one", "limelight", "great_vibes", "birthstone"} {
+		for _, f := range []string{"pinyon_script", "bagel_fat_one", "limelight", "great_vibes", "birthstone", "cinzel"} {
 			if !headingOnlyFonts[f] {
 				t.Errorf("%s should be heading-only", f)
 			}

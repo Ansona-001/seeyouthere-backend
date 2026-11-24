@@ -796,7 +796,7 @@ func TestManifestV2_NewFonts(t *testing.T) {
 			})
 		}
 	}
-	for _, f := range []string{"pinyon_script", "bagel_fat_one", "limelight"} {
+	for _, f := range []string{"pinyon_script", "bagel_fat_one", "limelight", "cinzel"} {
 		t.Run(f+"/heading_accent_ok", func(t *testing.T) {
 			m := validManifestMap()
 			m["fonts"] = []obj{{"id": "classic", "name": "Classic", "heading": f, "body": "lora", "accent": f}}
@@ -826,8 +826,8 @@ func TestArtRegistry(t *testing.T) {
 	if n := len(artRegistry); n > maxArtKeys {
 		t.Fatalf("art registry has %d keys, hard cap is %d", n, maxArtKeys)
 	}
-	if len(artRegistry) != 35 {
-		t.Errorf("art registry has %d keys, spec lists 35", len(artRegistry))
+	if len(artRegistry) != 37 {
+		t.Errorf("art registry has %d keys, spec lists 37", len(artRegistry))
 	}
 	for key, spec := range artRegistry {
 		t.Run(key, func(t *testing.T) {
