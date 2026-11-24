@@ -5,3 +5,6 @@ deploy/.env
 
 # graphify code graph (local)
 graphify-out/
+
+# recipient lists for cmd/sendtips (real email addresses)
+/drafts.txt

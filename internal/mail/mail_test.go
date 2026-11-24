@@ -196,3 +196,41 @@ func TestSend_InvalidRecipientDoesNotEchoInput(t *testing.T) {
 		t.Errorf("error %q echoes the recipient input", err)
 	}
 }
+
+func TestBuild_HTMLAlternativeAndListUnsubscribe(t *testing.T) {
+	from := addr(t, "See You There <hello@seeyouthere.at>")
+	to := addr(t, "Guest <guest@example.com>")
+	long := strings.Repeat("a", 3000)
+	m := Message{
+		To: to.Address, Subject: "Hi", Text: "plain ü",
+		HTML:            "<p>" + long + " ü</p>",
+		ListUnsubscribe: "<mailto:u@example.com>\r\nBcc: evil@example.com",
+	}
+	s := string(build(from, to, m))
+
+	if !strings.Contains(s, "Content-Type: multipart/alternative;") {
+		t.Errorf("want multipart/alternative:\n%s", s)
+	}
+	if strings.Contains(s, "\r\nBcc:") {
+		t.Errorf("List-Unsubscribe allowed header injection:\n%s", s)
+	}
+	if !strings.Contains(s, "List-Unsubscribe: <mailto:u@example.com>Bcc: evil@example.com\r\n") {
+		t.Errorf("List-Unsubscribe header missing or unsanitised:\n%s", s)
+	}
+	for _, l := range strings.Split(s, "\r\n") {
+		if len(l) > 998 {
+			t.Fatalf("line of %d octets exceeds SMTP limit", len(l))
+		}
+	}
+	if !strings.Contains(s, "text/plain; charset=utf-8") || !strings.Contains(s, "text/html; charset=utf-8") {
+		t.Errorf("missing text or html part:\n%s", s)
+	}
+}
+
+func TestSend_HTMLWithAttachmentsRejected(t *testing.T) {
+	s := &SMTPSender{Addr: "127.0.0.1:1", From: "a@b.c"}
+	err := s.Send(context.Background(), Message{To: "x@y.z", HTML: "<p>x</p>", Attachments: []Attachment{{Filename: "a"}}})
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Errorf("want combine error, got %v", err)
+	}
+}

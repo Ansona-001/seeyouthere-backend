@@ -12,6 +12,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/mail"
 	"net/smtp"
@@ -31,6 +32,12 @@ type Message struct {
 	To      string `json:"to"`
 	Subject string `json:"subject"`
 	Text    string `json:"text"`
+	// HTML is optional; when set the message is multipart/alternative with Text
+	// as the fallback part. It cannot be combined with Attachments.
+	HTML string `json:"html,omitempty"`
+	// ListUnsubscribe is an optional List-Unsubscribe header value, e.g.
+	// "<mailto:hello@example.com?subject=unsubscribe>". Marketing mail only.
+	ListUnsubscribe string `json:"list_unsubscribe,omitempty"`
 	// Attachments is optional; when empty the message is sent as a single
 	// text/plain part, unchanged from before this field existed.
 	Attachments []Attachment `json:"attachments,omitempty"`
@@ -56,6 +63,10 @@ func (s *SMTPSender) Send(ctx context.Context, m Message) error {
 	if err != nil {
 		// The parser's error can quote the input, which is a user's address.
 		return errors.New("parse to address: invalid address")
+	}
+
+	if m.HTML != "" && len(m.Attachments) > 0 {
+		return errors.New("html and attachments cannot be combined")
 	}
 
 	var auth smtp.Auth
@@ -100,6 +111,30 @@ func build(from, to *mail.Address, m Message) []byte {
 	fmt.Fprintf(&b, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
 	fmt.Fprintf(&b, "Message-ID: <%s@%s>\r\n", hex.EncodeToString(id), domain)
 	b.WriteString("MIME-Version: 1.0\r\n")
+	if m.ListUnsubscribe != "" {
+		fmt.Fprintf(&b, "List-Unsubscribe: %s\r\n", stripCRLF(m.ListUnsubscribe))
+	}
+
+	if m.HTML != "" {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		if pw, err := mw.CreatePart(textproto.MIMEHeader{
+			"Content-Type":              {"text/plain; charset=utf-8"},
+			"Content-Transfer-Encoding": {"quoted-printable"},
+		}); err == nil {
+			writeQP(pw, m.Text)
+		}
+		if pw, err := mw.CreatePart(textproto.MIMEHeader{
+			"Content-Type":              {"text/html; charset=utf-8"},
+			"Content-Transfer-Encoding": {"quoted-printable"},
+		}); err == nil {
+			writeQP(pw, m.HTML)
+		}
+		mw.Close()
+		fmt.Fprintf(&b, "Content-Type: multipart/alternative; boundary=\"%s\"\r\n\r\n", mw.Boundary())
+		b.Write(body.Bytes())
+		return b.Bytes()
+	}
 
 	if len(m.Attachments) == 0 {
 		b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
@@ -138,6 +173,19 @@ func build(from, to *mail.Address, m Message) []byte {
 	fmt.Fprintf(&b, "Content-Type: multipart/mixed; boundary=\"%s\"\r\n\r\n", mw.Boundary())
 	b.Write(body.Bytes())
 	return b.Bytes()
+}
+
+// writeQP writes s quoted-printable encoded, which keeps long HTML lines under
+// the 998-octet SMTP limit.
+func writeQP(w io.Writer, s string) {
+	qw := quotedprintable.NewWriter(w)
+	_, _ = qw.Write([]byte(strings.ReplaceAll(s, "\r\n", "\n")))
+	_ = qw.Close()
+}
+
+// stripCRLF removes line breaks so a header value cannot inject extra headers.
+func stripCRLF(s string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
 }
 
 // base64LineLen is RFC 2045 §6.8's recommended maximum encoded line length.
