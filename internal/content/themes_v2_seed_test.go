@@ -19,7 +19,7 @@ var v2SeedSlugs = []string{
 	"olive-grove", "letterpress", "velvet-foil", "sunlit", "sprinkles", "risograph",
 	"cloud-nine", "gingham", "open-door", "terrazzo", "gilt-noir", "mirror-ball", "mimosa", "harvest", "marigold", "wildflower",
 	"clothesline", "welcome-home", "lovebirds", "fizz", "glitterball",
-	"nocturne", "silk-knot", "candlelight", "lullaby", "lit-window", "afterglow", "wisteria", "temple-pond", "lotus-velvet", "ganesha-mandapam",
+	"nocturne", "silk-knot", "candlelight", "lullaby", "lit-window", "afterglow", "wisteria", "temple-pond", "lotus-velvet", "ganesha-mandapam", "noor", "grace",
 }
 
 // resolvedHexRe is the only colour form a resolved theme may carry: the

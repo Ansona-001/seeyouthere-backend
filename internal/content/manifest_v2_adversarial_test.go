@@ -1351,6 +1351,8 @@ func TestAdv_ArtRegistryMatrix(t *testing.T) {
 		"temple_pond_page": {0, 0, false, false, []string{"page"}},
 		"lotus_velvet":     {0, 0, false, false, []string{"page"}},
 		"ganesha_mandapam": {0, 0, false, false, []string{"page"}},
+		"noor":             {0, 0, false, false, []string{"page"}},
+		"grace":            {0, 0, false, false, []string{"page"}},
 	}
 	if len(spec) != len(artRegistry) {
 		t.Fatalf("registry has %d keys, spec table %d", len(artRegistry), len(spec))
