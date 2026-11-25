@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ansonarose/seeyouthere-backend/internal/content"
+	"github.com/ansonarose/seeyouthere-backend/internal/store"
 )
 
 // occasionResp is the catalog shape for one occasion (§4.2). name comes from
@@ -56,13 +57,15 @@ func (s *Server) handleListOccasions(w http.ResponseWriter, r *http.Request) {
 }
 
 // templateCatalogResp is the host-picker shape for one template (§4.2). tags
-// passes the stored jsonb through as-is ({"occasions": [...]}).
+// passes the stored jsonb through as-is ({"occasions": [...]}). prices lists a
+// premium template's offered prices (India first) and is absent for free ones.
 type templateCatalogResp struct {
 	ID         uuid.UUID                `json:"id"`
 	Slug       string                   `json:"slug"`
 	Name       string                   `json:"name"`
 	Tags       json.RawMessage          `json:"tags"`
 	IsPremium  bool                     `json:"is_premium"`
+	Prices     []priceResp              `json:"prices,omitempty"`
 	Version    int32                    `json:"version"`
 	Defaults   content.ManifestDefaults `json:"defaults"`
 	Palettes   []content.Palette        `json:"palettes"`
@@ -85,6 +88,25 @@ func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One round-trip for the regional prices of every premium template in the list (at most 100).
+	premiumIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		if row.IsPremium {
+			premiumIDs = append(premiumIDs, row.ID)
+		}
+	}
+	regional := make(map[uuid.UUID][]store.TemplatePrice, len(premiumIDs))
+	if len(premiumIDs) > 0 {
+		priceRows, err := s.q.ListTemplatePrices(r.Context(), premiumIDs)
+		if err != nil {
+			serverError(w, r, fmt.Errorf("list template prices: %w", err))
+			return
+		}
+		for _, p := range priceRows {
+			regional[p.TemplateID] = append(regional[p.TemplateID], p)
+		}
+	}
+
 	templates := make([]templateCatalogResp, 0, len(rows))
 	for _, row := range rows {
 		m, err := content.ValidateStoredManifest(row.Manifest)
@@ -102,12 +124,17 @@ func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request) {
 		if len(tags) == 0 {
 			tags = json.RawMessage("{}")
 		}
+		var prices []priceResp
+		if row.IsPremium {
+			prices = templatePrices(row.PricePaise, regional[row.ID])
+		}
 		templates = append(templates, templateCatalogResp{
 			ID:         row.ID,
 			Slug:       row.Slug,
 			Name:       row.Name,
 			Tags:       tags,
 			IsPremium:  row.IsPremium,
+			Prices:     prices,
 			Version:    row.Version,
 			Defaults:   m.Defaults,
 			Palettes:   m.Palettes,

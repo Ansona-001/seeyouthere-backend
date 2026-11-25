@@ -361,7 +361,7 @@ func wantIssues(t *testing.T, rec *httptest.ResponseRecorder, codes map[string]s
 
 // --- catalog ---
 
-func TestPremium_CatalogListsFlagWithoutPrice(t *testing.T) {
+func TestPremium_CatalogListsFlagAndPrices(t *testing.T) {
 	e := newPremiumEnv(t)
 	rec := e.a.do(http.MethodGet, "/v1/templates?occasion="+e.tag, "", "")
 	if rec.Code != http.StatusOK {
@@ -390,7 +390,23 @@ func TestPremium_CatalogListsFlagWithoutPrice(t *testing.T) {
 		if string(got["is_premium"]) != fmt.Sprint(premium) {
 			t.Errorf("%s: is_premium = %s, want %v", slug, got["is_premium"], premium)
 		}
-		for _, k := range []string{"price_paise", "price", "prices", "amount_minor", "regional_prices", "premium"} {
+		// Premium templates list their offered prices (India first); free ones carry none.
+		_, hasPrices := got["prices"]
+		if hasPrices != premium {
+			t.Errorf("%s: has prices = %v, want %v", slug, hasPrices, premium)
+		}
+		if premium {
+			var prices []struct {
+				Region   string `json:"region"`
+				Currency string `json:"currency"`
+				Amount   int32  `json:"amount_minor"`
+			}
+			if err := json.Unmarshal(got["prices"], &prices); err != nil || len(prices) == 0 || prices[0].Region != "IN" || prices[0].Currency != "INR" || prices[0].Amount <= 0 {
+				t.Errorf("%s: prices = %s, want India first with a positive INR amount", slug, got["prices"])
+			}
+		}
+		// The raw column names and admin shapes stay out of the public catalog.
+		for _, k := range []string{"price_paise", "price", "amount_minor", "regional_prices", "premium"} {
 			if _, ok := got[k]; ok {
 				t.Errorf("%s: public catalog leaks %q", slug, k)
 			}
