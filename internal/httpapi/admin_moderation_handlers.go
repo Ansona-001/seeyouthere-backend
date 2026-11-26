@@ -148,15 +148,17 @@ var errAdminReportNotFound = errors.New("admin: report not found")
 var validAdminEventStatuses = map[string]bool{"draft": true, "published": true, "hidden": true, "taken_down": true}
 
 type adminEventSummaryResp struct {
-	ID           uuid.UUID  `json:"id"`
-	Slug         *string    `json:"slug"`
-	Title        string     `json:"title"`
-	OccasionSlug string     `json:"occasion_slug"`
-	Status       string     `json:"status"`
-	CreatedAt    time.Time  `json:"created_at"`
-	PublishedAt  *time.Time `json:"published_at"`
-	DeletedAt    *time.Time `json:"deleted_at"`
-	OwnerEmail   string     `json:"owner_email"`
+	ID           uuid.UUID `json:"id"`
+	Slug         *string   `json:"slug"`
+	Title        string    `json:"title"`
+	OccasionSlug string    `json:"occasion_slug"`
+	Status       string    `json:"status"`
+	CreatedAt    time.Time `json:"created_at"`
+	// ContentUpdatedAt is when the invitation itself last changed (edit, settings, publish).
+	ContentUpdatedAt time.Time  `json:"content_updated_at"`
+	PublishedAt      *time.Time `json:"published_at"`
+	DeletedAt        *time.Time `json:"deleted_at"`
+	OwnerEmail       string     `json:"owner_email"`
 }
 
 // GET /v1/admin/events?q&status&cursor&limit
@@ -197,7 +199,7 @@ func (s *Server) handleListAdminEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, row := range rows {
 			items = append(items, adminEventSummaryResp{
-				row.ID, row.Slug, row.Title, row.OccasionSlug, row.Status, row.CreatedAt, row.PublishedAt, row.DeletedAt,
+				row.ID, row.Slug, row.Title, row.OccasionSlug, row.Status, row.CreatedAt, row.ContentUpdatedAt, row.PublishedAt, row.DeletedAt,
 				derefOrEmpty(row.OwnerEmail),
 			})
 		}
@@ -220,7 +222,7 @@ func (s *Server) handleListAdminEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, row := range rows {
 			items = append(items, adminEventSummaryResp{
-				row.ID, row.Slug, row.Title, row.OccasionSlug, row.Status, row.CreatedAt, row.PublishedAt, row.DeletedAt,
+				row.ID, row.Slug, row.Title, row.OccasionSlug, row.Status, row.CreatedAt, row.ContentUpdatedAt, row.PublishedAt, row.DeletedAt,
 				derefOrEmpty(row.OwnerEmail),
 			})
 		}
@@ -241,7 +243,7 @@ func (s *Server) handleListAdminEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, row := range rows {
 			items = append(items, adminEventSummaryResp{
-				row.ID, row.Slug, row.Title, row.OccasionSlug, row.Status, row.CreatedAt, row.PublishedAt, row.DeletedAt,
+				row.ID, row.Slug, row.Title, row.OccasionSlug, row.Status, row.CreatedAt, row.ContentUpdatedAt, row.PublishedAt, row.DeletedAt,
 				derefOrEmpty(row.OwnerEmail),
 			})
 		}
@@ -258,7 +260,8 @@ func (s *Server) handleListAdminEvents(w http.ResponseWriter, r *http.Request) {
 // the admin event detail response.
 type adminEventResp struct {
 	eventResp
-	OwnerEmail *string `json:"owner_email"`
+	OwnerEmail       *string   `json:"owner_email"`
+	ContentUpdatedAt time.Time `json:"content_updated_at"`
 }
 
 // buildAdminEventResponse renders GetEventAdmin's row through the same
@@ -289,7 +292,7 @@ func (s *Server) buildAdminEventResponse(ctx context.Context, q *store.Queries, 
 	if err != nil {
 		return adminEventResp{}, err
 	}
-	return adminEventResp{eventResp: base, OwnerEmail: row.OwnerEmail}, nil
+	return adminEventResp{eventResp: base, OwnerEmail: row.OwnerEmail, ContentUpdatedAt: row.Event.ContentUpdatedAt}, nil
 }
 
 // adminEventReportResp is the report shape embedded in the admin event

@@ -65,6 +65,7 @@ type Event struct {
 	MusicSource             string     `json:"music_source"`
 	Kind                    string     `json:"kind"`
 	EntryPasses             bool       `json:"entry_passes"`
+	ContentUpdatedAt        time.Time  `json:"content_updated_at"`
 }
 
 type EventAudio struct {

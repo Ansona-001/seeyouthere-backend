@@ -160,7 +160,8 @@ SET content = coalesce(sqlc.narg(content), e.content),
     share_media_id = CASE WHEN sqlc.narg(share_image)::text IS NULL THEN e.share_media_id ELSE sqlc.narg(share_media_id)::uuid END,
     music_source = coalesce(sqlc.narg(music_source)::text, e.music_source),
     version = e.version + 1,
-    updated_at = now()
+    updated_at = now(),
+    content_updated_at = now()
 WHERE e.id = @event_id
   AND e.deleted_at IS NULL
   AND e.version = @version
@@ -208,7 +209,8 @@ SET content = coalesce(sqlc.narg(content), e.content),
     share_media_id = CASE WHEN sqlc.narg(share_image)::text IS NULL THEN e.share_media_id ELSE sqlc.narg(share_media_id)::uuid END,
     music_source = coalesce(sqlc.narg(music_source)::text, e.music_source),
     version = e.version + 1,
-    updated_at = now()
+    updated_at = now(),
+    content_updated_at = now()
 WHERE e.id = @event_id
   AND e.deleted_at IS NULL
   AND e.version = @version
@@ -255,7 +257,8 @@ SET slug = coalesce(sqlc.narg(slug), e.slug),
     notify_rsvps = coalesce(sqlc.narg(notify_rsvps), e.notify_rsvps),
     entry_passes = coalesce(sqlc.narg(entry_passes), e.entry_passes),
     version = e.version + 1,
-    updated_at = now()
+    updated_at = now(),
+    content_updated_at = now()
 WHERE e.id = @event_id
   AND e.owner_id = @user_id::uuid
   AND e.deleted_at IS NULL
@@ -271,7 +274,8 @@ UPDATE events e
 SET status = 'published',
     published_at = coalesce(e.published_at, now()),
     version = e.version + 1,
-    updated_at = now()
+    updated_at = now(),
+    content_updated_at = now()
 WHERE e.id = @event_id
   AND e.owner_id = @user_id::uuid
   AND e.deleted_at IS NULL
@@ -286,7 +290,7 @@ RETURNING e.version, e.updated_at, e.published_at;
 
 -- name: UnpublishEvent :one
 UPDATE events e
-SET status = 'hidden', version = e.version + 1, updated_at = now()
+SET status = 'hidden', version = e.version + 1, updated_at = now(), content_updated_at = now()
 WHERE e.id = @event_id
   AND e.owner_id = @user_id::uuid
   AND e.deleted_at IS NULL
@@ -588,7 +592,7 @@ SELECT id, status, deleted_at FROM events WHERE id = @event_id;
 
 -- name: SearchEventsAdmin :many
 -- Admin browse, newest first, deleted events included (events_admin_created_idx).
-SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.created_at, e.published_at, e.deleted_at,
+SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.created_at, e.content_updated_at, e.published_at, e.deleted_at,
        e.owner_id, u.email AS owner_email
 FROM events e
 LEFT JOIN users u ON u.id = e.owner_id
@@ -598,7 +602,7 @@ LIMIT sqlc.arg(lim)::int;
 
 -- name: SearchEventsAdminByStatus :many
 -- As SearchEventsAdmin, one status only (events_admin_status_idx).
-SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.created_at, e.published_at, e.deleted_at,
+SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.created_at, e.content_updated_at, e.published_at, e.deleted_at,
        e.owner_id, u.email AS owner_email
 FROM events e
 LEFT JOIN users u ON u.id = e.owner_id
@@ -610,7 +614,7 @@ LIMIT sqlc.arg(lim)::int;
 -- name: SearchEventsAdminText :many
 -- Prefix search over slug and title (events_search_idx); prefix_query built in Go as for users.
 -- status NULL = any.
-SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.created_at, e.published_at, e.deleted_at,
+SELECT e.id, e.slug, e.title, e.occasion_slug, e.status, e.created_at, e.content_updated_at, e.published_at, e.deleted_at,
        e.owner_id, u.email AS owner_email
 FROM events e
 LEFT JOIN users u ON u.id = e.owner_id
