@@ -1665,6 +1665,11 @@ func TestMigration00037_RegionalPrices(t *testing.T) {
 		t.Errorf("ListEventPayments after re-grant = %+v (err %v), want one INT row", l, err)
 	}
 
+	// The generated queries target the latest schema (PublishEvent writes events.content_updated_at, added in 54),
+	// so finish migrating before exercising them.
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
 	// The PublishEvent gate ignores a revoked grant.
 	pub := insertEvent(prem, "draft")
 	publish := func() error {
